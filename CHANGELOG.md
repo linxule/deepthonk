@@ -2,14 +2,26 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
-## [Unreleased]
+## [0.1.2] — 2026-05-19
 
 ### Added
 
 - CLI profile registry CRUD: `deepthonk profile list`, `deepthonk profile show <name>`, `deepthonk profile save <name>`, and `deepthonk profile delete <name>`.
 - MCP profile registry CRUD tools: `deepthonk.profile_list`, `deepthonk.profile_show`, `deepthonk.profile_save`, and `deepthonk.profile_delete`.
-- Real resume replay. `deepthonk resume <run-dir> --continue` replays an interrupted run from the last durable phase boundary; MCP `deepthonk.resume` gains optional `continue: boolean`. Phase recovery is driven by new `phase.completed` events written at each phase boundary inside `runDeepThonk`. Cross-version and provider-mismatch refusals are explicit (`resume.version_mismatch`, `resume.provider_mismatch`). Default behavior unchanged — without `--continue`, resume only reports trace state.
-- MCP Sampling provider. It is MCP-only, requires a sampling-capable client, treats model hints as preferences rather than enforcement, records missing token usage as unavailable, and caps sampling concurrency at 4.
+- Real resume replay. `deepthonk resume <run-dir> --continue` replays an interrupted run from the last durable phase boundary; MCP `deepthonk.resume` gains optional `continue: boolean`. Phase recovery is driven by new `phase.completed` events written at each phase boundary inside `runDeepThonk`. Cross-version (`resume.version_mismatch`, now semver-tolerant on same major.minor) and per-role provider mismatch refusals are explicit; pruning is crash-safe via a `.prune-in-progress` sentinel and rewrites both artifact JSONL files AND `events.jsonl`. A `claimRunLock` prevents concurrent resume races. Resume refuses to start when `config.json` lacks `output.*` fields rather than silently defaulting them.
+- MCP Sampling provider. It is MCP-only, requires a sampling-capable client, treats model hints as preferences rather than enforcement, caps sampling concurrency at 4. Driver enforces `requestTimeoutMs` via `Promise.race` / `AbortController` and throws `provider.sampling_timeout` (non-retryable) on expiry. JSON extraction has a 128 KiB cap (`MAX_EXTRACTION_BYTES`) to defend against hostile or buggy hosts returning oversized responses. Host refusals surface as non-retryable `ProviderError` with an honest fix message pointing at `deepthonk resume --continue`. MCP `deepthonk.resume continue: true` of a sampling-based run threads `samplingContext` through and re-runs the capability check before constructing the driver.
+
+### Changed
+
+- `BudgetTracker` refuses to accept `maxInputTokens`, `maxOutputTokens`, or `maxUsd` when `provider == "sampling"` since MCP Sampling responses do not report token usage. The check fires at construction time before any provider call.
+- Persistent invalid-JSON from the judge after retries exhausted now throws `judge.persistent_invalid_json` instead of synthesizing a tie. Eliminates a silent wrong-ranking pollution path under hostile or buggy judges.
+- CLI `--provider sampling` (including via `--profile-name <sampling-profile>`) now throws a clean `provider.sampling_requires_mcp` ConfigError early instead of failing deep in the driver-construction path.
+
+### Security
+
+- `loadNamedProfile` raw-`api_key` rejection is now recursive across all nested fields (not just top-level + `providers.*`), matching the save side. Save path additionally rejects all secret-shaped keys (`token`, `secret`, `password`, `authorization`, `bearer`, `cookie`, `credential`) recursively at any depth; CLI `--from-config` benefits from the same rejection.
+- MCP `profile_save` arg schema is `.strict()` instead of `.passthrough()` so misspelled keys produce a clear validation error rather than landing in the profile YAML as silent metadata.
+- Profile-save validation runs in-memory via `validateNamedProfileBundle` instead of writing a temporary profile into `~/.config/deepthonk/profiles/`; eliminates the crash-leaves-pollution failure mode.
 
 ## [0.1.1] — 2026-05-18
 
