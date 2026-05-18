@@ -1,0 +1,29 @@
+import { describe, expect, it } from "vitest";
+import { mutateCandidate, rankCandidates } from "@deepthonk/core";
+import { FakeDriver } from "@deepthonk/providers";
+
+describe("core services", () => {
+  it("ranks user-supplied candidates through a shared ModelDriver service", async () => {
+    const result = await rankCandidates({
+      task: "pick the best",
+      candidates: ["FAKE_QUALITY:1", "FAKE_QUALITY:9"],
+      driver: new FakeDriver(),
+      judgeModel: "fake-model"
+    });
+
+    expect(result.comparisons).toHaveLength(1);
+    expect(result.scores[0]?.candidateId).toBe("candidate-2");
+  });
+
+  it("mutates one user-supplied candidate through a shared ModelDriver service", async () => {
+    const result = await mutateCandidate({
+      task: "improve",
+      candidate: "FAKE_QUALITY:1",
+      critique: "raise quality",
+      driver: new FakeDriver(),
+      mutatorModel: "fake-model"
+    });
+
+    expect(result.mutated).toContain("FAKE_QUALITY:8");
+  });
+});

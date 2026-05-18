@@ -1,0 +1,2 @@
+Find the smallest positive integer divisible by 3, 4, and 5. Return the answer with one sentence of justification.
+

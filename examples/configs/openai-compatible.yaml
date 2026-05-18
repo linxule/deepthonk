@@ -1,0 +1,16 @@
+profile: balanced
+provider: openai-compatible
+base_url: http://localhost:4000/v1
+api_key_env: DEEPTHONK_API_KEY
+models:
+  generator: provider/model-small
+  mutator: provider/model-small
+  judge: provider/model-large
+concurrency:
+  generate: 8
+  judge: 12
+  mutate: 6
+retry:
+  httpRetries: 2
+  invalidJsonRetries: 1
+

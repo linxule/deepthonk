@@ -1,0 +1,9 @@
+.DS_Store
+DEEPTHONK_CODEX_BUILD_BRIEF.md
+node_modules/
+dist/
+packages/*/dist/
+runs/
+coverage/
+*.log
+notes/

@@ -1,0 +1,27 @@
+profile: balanced
+provider: openrouter
+api_key_env: OPENROUTER_API_KEY
+providers:
+  generator:
+    provider: openrouter
+    api_key_env: OPENROUTER_API_KEY
+    model: openrouter/auto
+  mutator:
+    provider: openrouter
+    api_key_env: OPENROUTER_API_KEY
+    model: openrouter/auto
+  judge:
+    provider: deepseek
+    api_key_env: DEEPSEEK_API_KEY
+    model: deepseek-v4-pro
+models:
+  generator: openrouter/auto
+  mutator: openrouter/auto
+  judge: deepseek-v4-pro
+concurrency:
+  generate: 8
+  judge: 12
+  mutate: 6
+retry:
+  httpRetries: 2
+  invalidJsonRetries: 1

@@ -1,0 +1,14 @@
+profile: balanced
+provider: openrouter
+api_key_env: OPENROUTER_API_KEY
+models:
+  generator: openrouter/auto
+  mutator: openrouter/auto
+  judge: openrouter/auto
+concurrency:
+  generate: 8
+  judge: 12
+  mutate: 6
+retry:
+  httpRetries: 2
+  invalidJsonRetries: 1

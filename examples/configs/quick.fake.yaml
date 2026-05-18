@@ -1,0 +1,17 @@
+profile: quick
+provider: fake
+models:
+  generator: fake-model
+  mutator: fake-model
+  judge: fake-model
+concurrency:
+  generate: 4
+  judge: 4
+  mutate: 3
+retry:
+  httpRetries: 0
+  invalidJsonRetries: 1
+output:
+  includeRawModelOutputs: false
+  includePrompts: false
+

@@ -1,0 +1,19 @@
+profile: paper
+prompt_style: paper-programming
+provider: deepseek
+base_url: https://api.deepseek.com/v1
+api_key_env: DEEPSEEK_API_KEY
+models:
+  generator: deepseek-v4-flash
+  mutator: deepseek-v4-flash
+  judge: deepseek-v4-pro
+concurrency:
+  generate: 20
+  judge: 40
+  mutate: 15
+retry:
+  httpRetries: 2
+  invalidJsonRetries: 1
+output:
+  includeRawModelOutputs: false
+  includePrompts: false
