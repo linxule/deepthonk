@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zodToJsonSchema } from "zod-to-json-schema";
@@ -140,17 +140,18 @@ describe("MCP helpers", () => {
   });
 
   it("shows named profiles with secret-shaped values redacted", async () => {
-    await withProfilesDir(async () => {
-      await deepthonkProfileSave({
-        ...validMcpProfileArgs("with-redaction"),
-        providers: {
-          judge: {
-            provider: "fake",
-            model: "fake-model",
-            authorization: "Bearer raw-secret"
-          }
-        }
-      });
+    await withProfilesDir(async (profilesDir) => {
+      await writeFile(
+        join(profilesDir, "with-redaction.yaml"),
+        [
+          validMcpProfileYaml(),
+          "providers:",
+          "  judge:",
+          "    provider: fake",
+          "    model: fake-model",
+          "    authorization: Bearer raw-secret"
+        ].join("\n")
+      );
       const shown = await deepthonkProfileShow({ name: "with-redaction" });
       expect((shown.profile as { api_key_env?: string }).api_key_env).toBe("DEEPTHONK_API_KEY");
       expect((shown.profile as { providers: { judge: { authorization: string } } }).providers.judge.authorization).toBe("[redacted]");
@@ -166,6 +167,67 @@ describe("MCP helpers", () => {
           api_key: "raw-secret"
         })
       ).rejects.toMatchObject({ code: "config.profile_raw_api_key" });
+    });
+  });
+
+  it("rejects unknown top-level profile_save arguments", async () => {
+    await withProfilesDir(async () => {
+      await expect(
+        deepthonkProfileSave({
+          ...validMcpProfileArgs("unknown-field"),
+          mystery_field: "x"
+        })
+      ).rejects.toMatchObject({
+        code: "mcp.invalid_arguments",
+        message: expect.stringContaining("mystery_field")
+      });
+    });
+  });
+
+  it("rejects secret-shaped fields in profile_save payloads", async () => {
+    await withProfilesDir(async () => {
+      await expect(
+        deepthonkProfileSave({
+          ...validMcpProfileArgs("prompt-password"),
+          prompts: {
+            generate: {
+              system: "s",
+              password: "x"
+            }
+          }
+        })
+      ).rejects.toMatchObject({ code: "config.profile_raw_secret" });
+
+      for (const key of ["authorization", "token", "secret", "password", "bearer", "cookie", "credential"]) {
+        await expect(
+          deepthonkProfileSave({
+            ...validMcpProfileArgs(`bad-${key}`),
+            algorithm: { [key]: "raw-secret" }
+          })
+        ).rejects.toMatchObject({
+          code: "config.profile_raw_secret",
+          message: expect.stringContaining(key)
+        });
+      }
+    });
+  });
+
+  it("does not leave validation temp files when profile_save validation fails", async () => {
+    await withProfilesDir(async (profilesDir) => {
+      await expect(
+        deepthonkProfileSave({
+          name: "invalid",
+          profile: "quick",
+          prompt_style: "general",
+          models: {
+            generator: "fake-model",
+            mutator: "fake-model",
+            judge: "fake-model"
+          }
+        })
+      ).rejects.toMatchObject({ code: "config.profile_missing_fields" });
+
+      expect(await readdir(profilesDir)).toEqual([]);
     });
   });
 

@@ -4,10 +4,10 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
 import { ConfigError } from "@deepthonk/core";
+import { rejectRawApiKeyFields, validateNamedProfileBundle } from "@deepthonk/providers";
 import { resolveCliPath } from "../../config.js";
-import { loadNamedProfile, NAMED_PROFILE_NAME_RE, profilePath, profilesDir, type NamedProfileBundle } from "../../profileRegistry.js";
-
-const RAW_API_KEY_RE = /^api[_-]?key$/i;
+import { NAMED_PROFILE_NAME_RE, profilePath, profilesDir, type NamedProfileBundle } from "../../profileRegistry.js";
+import { rejectAllSecretShapedFields } from "../../redaction.js";
 
 export interface ProfileSaveOptions {
   force?: boolean;
@@ -64,7 +64,10 @@ export async function readProfileBundleFromConfig(path: string): Promise<NamedPr
       fix: `Fix YAML syntax in ${resolved}.`
     });
   }
-  return parsed as NamedProfileBundle;
+  const bundle = parsed as NamedProfileBundle;
+  rejectRawApiKeyFields(bundle);
+  rejectAllSecretShapedFields(bundle);
+  return bundle;
 }
 
 export function profileBundleFromFlags(options: ProfileSaveFlagOptions): NamedProfileBundle {
@@ -101,12 +104,15 @@ export function profileBundleFromFlags(options: ProfileSaveFlagOptions): NamedPr
   };
   const definedAlgorithm = Object.fromEntries(Object.entries(algorithm).filter(([, value]) => value !== undefined));
   if (Object.keys(definedAlgorithm).length > 0) bundle.algorithm = definedAlgorithm;
+  rejectAllSecretShapedFields(bundle);
   return bundle;
 }
 
 export async function saveProfileBundle(name: string, bundle: NamedProfileBundle, options: ProfileSaveOptions = {}): Promise<string> {
   assertProfileName(name);
   rejectRawApiKeyFields(bundle, name);
+  rejectAllSecretShapedFields(bundle, name);
+  validateNamedProfileBundle(bundle, name);
   const dir = profilesDir();
   const target = profilePath(name);
   await mkdir(dir, { recursive: true });
@@ -119,7 +125,6 @@ export async function saveProfileBundle(name: string, bundle: NamedProfileBundle
   }
 
   const yaml = YAML.stringify(bundle);
-  await validateWithLoadNamedProfile(yaml);
   if (options.force) {
     await writeProfileOverwrite(target, yaml, name);
   } else {
@@ -136,31 +141,6 @@ export function rejectRawApiKeyFlag(options: { apiKey?: string }): void {
       fix: "Use --api-key-env to store the environment variable name instead."
     });
   }
-}
-
-export function rejectRawApiKeyFields(value: unknown, name: string): void {
-  const seen = new WeakSet<object>();
-  const visit = (current: unknown, path: string): void => {
-    if (!current || typeof current !== "object") return;
-    if (seen.has(current)) return;
-    seen.add(current);
-    if (Array.isArray(current)) {
-      current.forEach((item, index) => visit(item, `${path}[${index}]`));
-      return;
-    }
-    for (const [key, inner] of Object.entries(current as Record<string, unknown>)) {
-      const childPath = path ? `${path}.${key}` : key;
-      if (RAW_API_KEY_RE.test(key)) {
-        throw new ConfigError(`Named profile '${name}' must not contain a raw '${key}' value at ${childPath}.`, {
-          code: "config.profile_raw_api_key",
-          retryable: false,
-          fix: "Use api_key_env to reference an environment variable name instead. Raw secrets must not be written to profile files."
-        });
-      }
-      visit(inner, childPath);
-    }
-  };
-  visit(value, "");
 }
 
 export function assertProfileName(name: string): void {
@@ -208,17 +188,6 @@ function numberOption(value: unknown, flag: string, constraints: { integer?: boo
 function stringOption(value: unknown): string | undefined {
   if (value === undefined || value === null || value === "") return undefined;
   return String(value);
-}
-
-async function validateWithLoadNamedProfile(yaml: string): Promise<void> {
-  const tempName = `ProfileValidate${randomUUID().replaceAll("-", "").slice(0, 32)}`;
-  const tempPath = profilePath(tempName);
-  await writeFile(tempPath, yaml, { encoding: "utf8", flag: "wx" });
-  try {
-    await loadNamedProfile(tempName);
-  } finally {
-    await unlink(tempPath).catch(() => undefined);
-  }
 }
 
 async function writeProfileCreate(target: string, yaml: string, name: string): Promise<void> {

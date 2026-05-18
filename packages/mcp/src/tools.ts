@@ -36,11 +36,15 @@ import {
   NAMED_PROFILE_NAME_RE,
   profilePath,
   profilesDir,
+  rejectAllSecretShapedFields,
+  rejectRawApiKeyFields,
   resolveProviderConfig,
   resolveProviderModels,
+  SECRET_KEY_RE,
   type NamedProfileBundle,
   type ProviderConfig,
-  type SamplingTransport
+  type SamplingTransport,
+  validateNamedProfileBundle
 } from "@deepthonk/providers";
 import { recordRunResource } from "./resources.js";
 
@@ -853,7 +857,7 @@ export const profileSaveArgsSchema = z.object({
   concurrency: z.unknown().optional(),
   retry: z.unknown().optional(),
   output: z.unknown().optional()
-}).passthrough();
+}).strict();
 
 export const profileListOutputSchema = z.object({
   profiles: z.array(z.string())
@@ -879,7 +883,9 @@ export async function deepthonkProfileShow(argsInput: unknown): Promise<Record<s
 }
 
 export async function deepthonkProfileSave(argsInput: unknown): Promise<Record<string, unknown>> {
-  const args = profileSaveArgsSchema.parse(argsInput);
+  rejectRawApiKeyFields(argsInput, "profile_save");
+  rejectAllSecretShapedFields(argsInput, "profile_save");
+  const args = parseProfileSaveArgs(argsInput);
   const { name, force, ...profile } = args;
   const path = await saveMcpProfileBundle(name, stripUndefined(profile) as NamedProfileBundle, Boolean(force));
   return { path };
@@ -893,12 +899,30 @@ export async function deepthonkProfileDelete(argsInput: unknown): Promise<Record
   return { deleted: path };
 }
 
-const MCP_SECRET_KEY_RE = /^(api[_-]?key|token|secret|password|authorization|bearer|cookie|credential)$/i;
-const MCP_RAW_API_KEY_RE = /^api[_-]?key$/i;
+type ProfileSaveArgs = z.infer<typeof profileSaveArgsSchema>;
+
+function parseProfileSaveArgs(argsInput: unknown): ProfileSaveArgs {
+  try {
+    return profileSaveArgsSchema.parse(argsInput);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      throw new ConfigError(formatZodIssues(error), {
+        code: "mcp.invalid_arguments",
+        retryable: false,
+        fix: "Fix the tool arguments and retry."
+      });
+    }
+    throw error;
+  }
+}
+
+function formatZodIssues(error: z.ZodError): string {
+  return error.issues.map((issue) => (issue.path.length > 0 ? `${issue.path.join(".")}: ${issue.message}` : issue.message)).join("; ");
+}
 
 function redactedProfile(value: unknown): unknown {
   const serialized = JSON.stringify(value, (key, inner) => {
-    if (MCP_SECRET_KEY_RE.test(key) && inner) return "[redacted]";
+    if (SECRET_KEY_RE.test(key) && inner) return "[redacted]";
     return inner;
   });
   return serialized === undefined ? undefined : JSON.parse(serialized);
@@ -906,7 +930,9 @@ function redactedProfile(value: unknown): unknown {
 
 async function saveMcpProfileBundle(name: string, bundle: NamedProfileBundle, force: boolean): Promise<string> {
   assertMcpProfileName(name);
-  rejectMcpRawApiKeyFields(bundle, name);
+  rejectRawApiKeyFields(bundle, name);
+  rejectAllSecretShapedFields(bundle, name);
+  validateNamedProfileBundle(bundle, name);
   const dir = profilesDir();
   const target = profilePath(name);
   await mkdir(dir, { recursive: true });
@@ -919,7 +945,6 @@ async function saveMcpProfileBundle(name: string, bundle: NamedProfileBundle, fo
   }
 
   const yaml = YAML.stringify(bundle);
-  await validateMcpProfileWithLoadNamedProfile(yaml);
   if (force) {
     await writeMcpProfileOverwrite(target, yaml, name);
   } else {
@@ -935,42 +960,6 @@ function assertMcpProfileName(name: string): void {
       retryable: false,
       fix: "Rename the profile to match /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/."
     });
-  }
-}
-
-function rejectMcpRawApiKeyFields(value: unknown, name: string): void {
-  const seen = new WeakSet<object>();
-  const visit = (current: unknown, path: string): void => {
-    if (!current || typeof current !== "object") return;
-    if (seen.has(current)) return;
-    seen.add(current);
-    if (Array.isArray(current)) {
-      current.forEach((item, index) => visit(item, `${path}[${index}]`));
-      return;
-    }
-    for (const [key, inner] of Object.entries(current as Record<string, unknown>)) {
-      const childPath = path ? `${path}.${key}` : key;
-      if (MCP_RAW_API_KEY_RE.test(key)) {
-        throw new ConfigError(`Named profile '${name}' must not contain a raw '${key}' value at ${childPath}.`, {
-          code: "config.profile_raw_api_key",
-          retryable: false,
-          fix: "Use api_key_env to reference an environment variable name instead. Raw secrets must not be written to profile files."
-        });
-      }
-      visit(inner, childPath);
-    }
-  };
-  visit(value, "");
-}
-
-async function validateMcpProfileWithLoadNamedProfile(yaml: string): Promise<void> {
-  const tempName = `ProfileValidate${randomUUID().replaceAll("-", "").slice(0, 32)}`;
-  const tempPath = profilePath(tempName);
-  await writeFile(tempPath, yaml, { encoding: "utf8", flag: "wx" });
-  try {
-    await loadNamedProfile(tempName);
-  } finally {
-    await unlink(tempPath).catch(() => undefined);
   }
 }
 

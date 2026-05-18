@@ -6,6 +6,11 @@ import { ConfigError } from "@deepthonk/core";
 import { defaultConfigPath } from "./env.js";
 
 export const NAMED_PROFILE_NAME_RE = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
+export const RAW_API_KEY_RE = /^api[_-]?key$/i;
+export const SECRET_KEY_RE = /^(api[_-]?key|token|secret|password|authorization|bearer|cookie|credential)$/i;
+
+const SECRET_KEY_FIX =
+  "Remove raw secret fields from the profile. Rejected key shapes: api_key/api-key, token, secret, password, authorization, bearer, cookie, credential. Use api_key_env to reference an environment variable name instead.";
 
 export interface NamedProfileBundle {
   profile?: "quick" | "balanced" | "paper";
@@ -64,17 +69,12 @@ export async function loadNamedProfile(name: string): Promise<NamedProfileBundle
       fix: `Fix YAML syntax in ${path}.`
     });
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new ConfigError(`Named profile '${name}' must be a YAML mapping at the top level.`, {
-      code: "config.profile_invalid_shape",
-      retryable: false,
-      fix: `Top-level YAML should have keys like provider, prompt_style, models, algorithm.`
-    });
-  }
-  const config = parsed as NamedProfileBundle;
-  rejectRawApiKey(config, name);
-  validateRequiredFields(config, name);
+  const config = validateNamedProfileValue(parsed, name);
   return config;
+}
+
+export function validateNamedProfileBundle(bundle: NamedProfileBundle, name = "profile"): void {
+  validateNamedProfileValue(bundle, name);
 }
 
 function validateProfileName(name: string): void {
@@ -104,24 +104,61 @@ function validateRequiredFields(config: NamedProfileBundle, name: string): void 
   }
 }
 
-function rejectRawApiKey(config: Record<string, unknown>, name: string): void {
-  if ("api_key" in config) {
-    throw new ConfigError(`Named profile '${name}' must not contain a raw 'api_key' value.`, {
-      code: "config.profile_raw_api_key",
+function validateNamedProfileValue(value: unknown, name: string): NamedProfileBundle {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ConfigError(`Named profile '${name}' must be a YAML mapping at the top level.`, {
+      code: "config.profile_invalid_shape",
       retryable: false,
-      fix: "Use api_key_env to reference an environment variable name instead. Raw secrets in YAML on disk are a security risk."
+      fix: `Top-level YAML should have keys like provider, prompt_style, models, algorithm.`
     });
   }
-  const providers = config.providers as Record<string, unknown> | undefined;
-  if (providers && typeof providers === "object") {
-    for (const [role, rawValue] of Object.entries(providers)) {
-      if (rawValue && typeof rawValue === "object" && "api_key" in rawValue) {
-        throw new ConfigError(`Named profile '${name}' role provider '${role}' must not contain a raw 'api_key' value.`, {
-          code: "config.profile_raw_api_key",
+  const config = value as NamedProfileBundle;
+  rejectRawApiKeyFields(config, name);
+  validateRequiredFields(config, name);
+  return config;
+}
+
+export function rejectRawApiKeyFields(value: unknown, name = "profile"): void {
+  rejectMatchingProfileKeys(value, RAW_API_KEY_RE, "config.profile_raw_api_key", (key, path) => ({
+    message: `Named profile '${name}' must not contain a raw '${key}' value at ${path}.`,
+    fix: "Use api_key_env to reference an environment variable name instead. Raw secrets must not be written to profile files."
+  }));
+}
+
+export function rejectAllSecretShapedFields(value: unknown, name = "profile"): void {
+  rejectMatchingProfileKeys(value, SECRET_KEY_RE, "config.profile_raw_secret", (key, path) => ({
+    message: `Named profile '${name}' must not contain a raw secret-shaped '${key}' value at ${path}.`,
+    fix: SECRET_KEY_FIX
+  }));
+}
+
+function rejectMatchingProfileKeys(
+  value: unknown,
+  keyPattern: RegExp,
+  code: string,
+  describe: (key: string, path: string) => { message: string; fix: string }
+): void {
+  const seen = new WeakSet<object>();
+  const visit = (current: unknown, path: string): void => {
+    if (!current || typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      current.forEach((item, index) => visit(item, `${path}[${index}]`));
+      return;
+    }
+    for (const [key, inner] of Object.entries(current as Record<string, unknown>)) {
+      const childPath = path ? `${path}.${key}` : key;
+      if (keyPattern.test(key)) {
+        const description = describe(key, childPath);
+        throw new ConfigError(description.message, {
+          code,
           retryable: false,
-          fix: "Use api_key_env to reference an environment variable name instead."
+          fix: description.fix
         });
       }
+      visit(inner, childPath);
     }
-  }
+  };
+  visit(value, "");
 }

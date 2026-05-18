@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -131,6 +131,35 @@ describe("deepthonk profile CLI", () => {
     ).rejects.toMatchObject({ stderr: expect.stringContaining("Raw --api-key values are not allowed") });
   });
 
+  it("rejects secret-shaped fields from --from-config", async () => {
+    for (const key of ["authorization", "token", "secret", "password", "bearer", "cookie", "credential"]) {
+      const root = await mkdtemp(join(tmpdir(), `deepthonk-cli-profile-secret-${key}-`));
+      const profilesDir = join(root, "profiles");
+      const configPath = join(root, "config.yaml");
+      await writeFile(configPath, [validProfileYaml(), "algorithm:", `  ${key}: raw-secret`].join("\n"));
+
+      await expect(runCli(["--json-errors", "profile", "save", `bad-${key}`, "--from-config", configPath], profilesDir)).rejects.toMatchObject({
+        stderr: expect.stringContaining("config.profile_raw_secret")
+      });
+    }
+  });
+
+  it("does not leave validation temp files when save validation fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-cli-profile-validation-fail-"));
+    const profilesDir = join(root, "profiles");
+    const configPath = join(root, "config.yaml");
+    await writeFile(
+      configPath,
+      ["profile: quick", "prompt_style: general", "models:", "  generator: fake-model", "  mutator: fake-model", "  judge: fake-model"].join("\n")
+    );
+
+    await expect(runCli(["--json-errors", "profile", "save", "invalid", "--from-config", configPath], profilesDir)).rejects.toMatchObject({
+      stderr: expect.stringContaining("config.profile_missing_fields")
+    });
+    const entries = existsSync(profilesDir) ? await readdir(profilesDir) : [];
+    expect(entries).toEqual([]);
+  });
+
   it("deletes a profile with --yes", async () => {
     const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-cli-profile-delete-"));
     const path = join(profilesDir, "delete-me.yaml");
@@ -152,7 +181,11 @@ describe("deepthonk profile CLI", () => {
 });
 
 function runProfile(args: string[], profilesDir: string) {
-  return execFileAsync(process.execPath, ["--import", "tsx", cli, "profile", ...args], {
+  return runCli(["profile", ...args], profilesDir);
+}
+
+function runCli(args: string[], profilesDir: string) {
+  return execFileAsync(process.execPath, ["--import", "tsx", cli, ...args], {
     env: { ...process.env, DEEPTHONK_PROFILES_DIR: profilesDir }
   });
 }
