@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type { ClientCapabilities } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import YAML from "yaml";
 import {
@@ -19,6 +20,8 @@ import {
   rankCandidates,
   readRunStatus,
   requestRunCancel,
+  resumeDeepThonk,
+  runConfigSchema,
   runDeepThonk,
   TraceStore,
   type BuiltInProfileName,
@@ -36,7 +39,8 @@ import {
   resolveProviderConfig,
   resolveProviderModels,
   type NamedProfileBundle,
-  type ProviderConfig
+  type ProviderConfig,
+  type SamplingTransport
 } from "@deepthonk/providers";
 import { recordRunResource } from "./resources.js";
 
@@ -71,7 +75,6 @@ const providerNameSchema = z
   .string()
   .min(1)
   .describe("Provider label. Built-ins include fake, deepseek, openrouter, and openai-compatible; custom labels require base_url.")
-  .refine((provider) => provider !== "sampling", "MCP Sampling is deferred and is not a direct provider option.")
   .default("fake");
 
 export const runArgsSchema = z.object({
@@ -88,6 +91,10 @@ export const runArgsSchema = z.object({
   mutator_model: z.string().optional().describe("Model used for critique-guided mutation."),
   judge_model: z.string().optional().describe("Model used for pairwise judging."),
   finalizer_model: z.string().optional().describe("Optional model used to polish the winning candidate."),
+  sampling_model_hints: z.array(z.string()).optional().describe("Optional MCP Sampling model hints. Hints guide host model choice but do not enforce it."),
+  sampling_cost_priority: z.number().min(0).max(1).optional().describe("MCP Sampling model preference for lower cost, from 0 to 1."),
+  sampling_speed_priority: z.number().min(0).max(1).optional().describe("MCP Sampling model preference for speed, from 0 to 1."),
+  sampling_intelligence_priority: z.number().min(0).max(1).optional().describe("MCP Sampling model preference for intelligence, from 0 to 1."),
   seed: z.number().int().default(1).describe("Deterministic seed for pair ordering and IDs."),
   run_dir: z.string().optional().describe("Directory for trace files."),
   max_calls: z.number().int().optional().describe("Maximum completed provider calls before the run stops at a phase boundary."),
@@ -161,7 +168,8 @@ export const mutateArgsSchema = providerArgsSchema.extend({
 });
 
 export const resumeArgsSchema = z.object({
-  run_dir: z.string()
+  run_dir: z.string(),
+  continue: z.boolean().optional()
 });
 
 export const exportArgsSchema = z.object({
@@ -260,8 +268,13 @@ export async function deepthonkPlanAsync(argsInput: unknown): Promise<Record<str
   }) as unknown as Record<string, unknown>;
 }
 
-export async function deepthonkStart(argsInput: unknown): Promise<Record<string, unknown>> {
-  const { runConfig, providerConfig } = await resolveMcpRun(argsInput);
+export interface McpSamplingContext {
+  getClientCapabilities(): ClientCapabilities | undefined;
+  createMessage: SamplingTransport;
+}
+
+export async function deepthonkStart(argsInput: unknown, context?: McpSamplingContext): Promise<Record<string, unknown>> {
+  const { runConfig, providerConfig } = await resolveMcpRun(argsInput, context);
   const jobId = `job_${new Date().toISOString().replace(/[:.]/g, "-")}_${Math.random().toString(16).slice(2, 8)}`;
   const now = new Date().toISOString();
   const claimed = await claimRunLock(runConfig.runDir, jobId);
@@ -383,8 +396,8 @@ export async function deepthonkCancel(argsInput: unknown): Promise<Record<string
   };
 }
 
-export async function deepthonkRun(argsInput: unknown): Promise<Record<string, unknown>> {
-  const { runConfig, providerConfig } = await resolveMcpRun(argsInput);
+export async function deepthonkRun(argsInput: unknown, context?: McpSamplingContext): Promise<Record<string, unknown>> {
+  const { runConfig, providerConfig } = await resolveMcpRun(argsInput, context);
   const result = await runDeepThonk(runConfig, createDriver(providerConfig), {
     shouldCancel: () => isRunCancelRequested(runConfig.runDir)
   });
@@ -399,17 +412,23 @@ export async function deepthonkRun(argsInput: unknown): Promise<Record<string, u
   };
 }
 
-async function resolveMcpRun(argsInput: unknown): Promise<{ runConfig: Parameters<typeof runDeepThonk>[0]; providerConfig: ProviderConfig }> {
+async function resolveMcpRun(argsInput: unknown, context?: McpSamplingContext): Promise<{ runConfig: Parameters<typeof runDeepThonk>[0]; providerConfig: ProviderConfig }> {
   const raw = objectInput(argsInput);
   const args = runArgsSchema.parse(argsInput);
   const config = await readMcpConfig(args.config_path, args.profile_name);
   const profileName = (raw.profile ?? config.profile ?? args.profile) as BuiltInProfileName;
   const baseProfile = getProfile(profileName);
   const profile = mergeProfileOverrides(baseProfile, config.algorithm, args);
-  const providerConfig = resolveMcpProviderConfig(args, raw, config);
+  const providerConfig = resolveMcpProviderConfig(args, raw, config, context?.createMessage);
+  assertSamplingCapability(providerConfig, context);
   const models = providerConfig.models;
   const runDir = args.run_dir ?? `runs/mcp-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const promptOverrides = mergePromptOverrides(config.prompts, args.prompts);
+  const concurrency = capSamplingConcurrency(providerConfig.provider, profile, {
+    generate: args.concurrency?.generate ?? config.concurrency?.generate ?? profile.n,
+    judge: args.concurrency?.judge ?? config.concurrency?.judge ?? Math.max(1, (profile.n * Math.max(profile.k, profile.m)) / 2),
+    mutate: args.concurrency?.mutate ?? config.concurrency?.mutate ?? profile.n - Math.floor(profile.n / 4)
+  });
   return {
     runConfig: {
       task: args.task,
@@ -424,11 +443,7 @@ async function resolveMcpRun(argsInput: unknown): Promise<{ runConfig: Parameter
       mutatorModel: models.mutator,
       judgeModel: models.judge,
       finalizerModel: models.finalizer,
-      concurrency: {
-        generate: args.concurrency?.generate ?? config.concurrency?.generate ?? profile.n,
-        judge: args.concurrency?.judge ?? config.concurrency?.judge ?? Math.max(1, (profile.n * Math.max(profile.k, profile.m)) / 2),
-        mutate: args.concurrency?.mutate ?? config.concurrency?.mutate ?? profile.n - Math.floor(profile.n / 4)
-      },
+      concurrency,
       retry: {
         httpRetries: config.retry?.httpRetries ?? 2,
         invalidJsonRetries: config.retry?.invalidJsonRetries ?? 1,
@@ -492,6 +507,33 @@ export async function deepthonkMutate(argsInput: unknown): Promise<Record<string
 
 export async function deepthonkResume(argsInput: unknown): Promise<Record<string, unknown>> {
   const args = resumeArgsSchema.parse(argsInput);
+  if (args.continue === true) {
+    const raw = JSON.parse(await readFile(join(args.run_dir, "config.json"), "utf8")) as unknown;
+    const config = runConfigSchema.parse(raw);
+    const providerConfig = resolveProviderConfig({
+      provider: config.provider,
+      models: {
+        generator: config.generatorModel,
+        mutator: config.mutatorModel,
+        judge: config.judgeModel,
+        finalizer: config.finalizerModel
+      }
+    });
+    const result = await resumeDeepThonk(args.run_dir, createDriver(providerConfig), { provider: config.provider });
+    if ("winner" in result) {
+      return {
+        status: "completed",
+        message: "Run resumed and completed.",
+        run_id: result.runId,
+        run_dir: result.runDir,
+        winner_id: result.winner.id,
+        final_answer: result.finalAnswer,
+        calls: result.calls,
+        safe_to_continue: false
+      };
+    }
+    return { ...result };
+  }
   return { ...(await detectResumeState(args.run_dir)) };
 }
 
@@ -506,12 +548,13 @@ async function providerConfigFromArgs(args: z.infer<typeof providerArgsSchema>):
 }
 
 function resolveMcpProviderConfig(
-  args: z.infer<typeof providerArgsSchema>,
+  args: ProviderResolutionArgs,
   raw: Record<string, unknown>,
-  config: RawMcpConfig
+  config: RawMcpConfig,
+  samplingTransport?: SamplingTransport
 ): ProviderConfig {
   const provider = String(raw.provider ?? config.provider ?? args.provider);
-  return resolveProviderConfig({
+  const resolved = resolveProviderConfig({
     provider,
     baseUrl: args.base_url ?? config.base_url,
     apiKeyEnv: args.api_key_env ?? config.api_key_env,
@@ -529,6 +572,54 @@ function resolveMcpProviderConfig(
     })),
     retry: { httpRetries: 2, requestTimeoutMs: config.retry?.requestTimeoutMs }
   });
+  if (provider !== "sampling") return resolved;
+  return {
+    ...resolved,
+    samplingTransport,
+    modelHints: args.sampling_model_hints,
+    costPriority: args.sampling_cost_priority,
+    speedPriority: args.sampling_speed_priority,
+    intelligencePriority: args.sampling_intelligence_priority,
+    includeRawOutputs: args.include_raw_model_outputs ?? config.output?.includeRawModelOutputs ?? false
+  };
+}
+
+type ProviderResolutionArgs = z.infer<typeof providerArgsSchema> &
+  Partial<
+    Pick<
+      z.infer<typeof runArgsSchema>,
+      | "sampling_model_hints"
+      | "sampling_cost_priority"
+      | "sampling_speed_priority"
+      | "sampling_intelligence_priority"
+      | "include_raw_model_outputs"
+    >
+  >;
+
+function assertSamplingCapability(providerConfig: ProviderConfig, context?: McpSamplingContext): void {
+  if (providerConfig.provider !== "sampling") return;
+  const capabilities = context?.getClientCapabilities();
+  if (!capabilities?.sampling) {
+    throw new ConfigError("Connected MCP client does not advertise sampling capability. This client cannot serve as a sampling provider.", {
+      code: "provider.sampling_capability_missing",
+      retryable: false,
+      fix: "Use an MCP client that supports sampling, or choose a direct provider such as deepseek, openrouter, or openai-compatible."
+    });
+  }
+}
+
+function capSamplingConcurrency(
+  provider: string,
+  profile: Parameters<typeof runDeepThonk>[0]["profile"],
+  concurrency: Parameters<typeof runDeepThonk>[0]["concurrency"]
+): Parameters<typeof runDeepThonk>[0]["concurrency"] {
+  if (provider !== "sampling") return concurrency;
+  const cap = Math.min(profile.n, 4);
+  return {
+    generate: Math.min(concurrency.generate, cap),
+    judge: Math.min(concurrency.judge, cap),
+    mutate: Math.min(concurrency.mutate, cap)
+  };
 }
 
 export function toolResult(value: unknown): { structuredContent: Record<string, unknown>; content: Array<{ type: "text"; text: string }> } {

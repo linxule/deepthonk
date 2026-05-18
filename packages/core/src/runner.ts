@@ -1,14 +1,31 @@
 import pLimit from "p-limit";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { z } from "zod";
 import { fitBradleyTerry } from "./bradleyTerry.js";
 import { BudgetTracker } from "./budgetTracker.js";
 import { planBudget, validateProfile } from "./budget.js";
 import { BudgetExceededError, CancelledError, ConfigError, DeepThonkError } from "./errors.js";
+import { runArtifactFiles } from "./artifacts.js";
 import { parseJsonObject } from "./json.js";
 import { emptyUsage, type BudgetUsage, type CallRole, type RunLifecycleState, type RunStatus, type UsageDelta, type UsageRecord } from "./lifecycle.js";
 import { makeKRegularPairs, type Pair } from "./pairScheduler.js";
 import { comparePrompt, finalizePrompt, generatePrompt, mutatePrompt } from "./prompts.js";
 import { createRng, type Rng } from "./rng.js";
+import {
+  buildPopulationMap,
+  buildResumePlan,
+  groupComparisons,
+  persistPrunedTrace,
+  pruneTraceToPlan,
+  readResumeTrace,
+  reconstructScores,
+  replayBudgetUsage,
+  resolveResumeRunId,
+  resumeConfigError,
+  toResumePlanStatus,
+  type PhaseCursor
+} from "./resume.js";
 import {
   runConfigSchema,
   builtInProfiles,
@@ -18,6 +35,8 @@ import {
   type Comparison,
   type ModelDriver,
   type ModelTextResult,
+  type PhaseName,
+  phaseCompletedEventSchema,
   type RunConfig,
   type RunResult
 } from "./schemas.js";
@@ -39,22 +58,69 @@ export interface RunControl {
   shouldCancel?: () => boolean | Promise<boolean>;
 }
 
+export interface ResumeDeepThonkOptions {
+  dryRun?: boolean;
+  provider?: string;
+}
+
+export interface ResumePlan {
+  status: "completed" | "resumable";
+  message: string;
+  run_id?: string;
+  run_dir: string;
+  phase?: PhaseName | "summary";
+  generation?: number | "final";
+  safe_to_continue: boolean;
+  summary?: Record<string, unknown>;
+  plan?: {
+    next_phase: PhaseName | "summary";
+    generation?: number | "final";
+    completed_phases: Array<{ phase: PhaseName; generation?: number }>;
+  };
+}
+
 interface RunGuards {
   beforeCall(phase: string): Promise<void>;
   afterCall(phase: string): Promise<void>;
 }
 
-export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, control: RunControl = {}): Promise<RunResult> {
+interface ResumeState {
+  runId: string;
+  startedAt: string;
+  completed: Set<string>;
+  populationByGeneration: Map<number, Candidate[]>;
+  comparisonsByGeneration: Map<number | "final", Comparison[]>;
+  scoresByGeneration: Map<number | "final", BtScore[]>;
+  tracker: BudgetTracker;
+  nextPhase: PhaseCursor;
+}
+
+export async function runDeepThonk(
+  configInput: RunConfig,
+  driver: ModelDriver,
+  control: RunControl = {},
+  resumeState?: ResumeState
+): Promise<RunResult> {
   const config = runConfigSchema.parse(configInput);
   validateProfile(config.profile);
   enforceBudget(config);
 
-  const runId = `run_${new Date().toISOString().replace(/[:.]/g, "-")}_${Math.abs(config.seed)}`;
+  const runId = resumeState?.runId ?? `run_${new Date().toISOString().replace(/[:.]/g, "-")}_${Math.abs(config.seed)}`;
   const trace = new TraceStore(config.runDir);
   const rng = createRng(config.seed);
-  const tracker = new BudgetTracker(config);
-  const startedAt = new Date().toISOString();
-  await trace.init(config, runId);
+  const tracker = resumeState?.tracker ?? new BudgetTracker(config);
+  const startedAt = resumeState?.startedAt ?? new Date().toISOString();
+  if (!resumeState) {
+    await trace.init({ ...config, version: await currentPackageVersion() }, runId);
+  } else {
+    await trace.event({
+      type: "run.resumed",
+      run_id: runId,
+      resumed_at: new Date().toISOString(),
+      next_phase: resumeState.nextPhase.phase,
+      generation: resumeState.nextPhase.generation
+    });
+  }
   let stopped = false;
   const writeStatus = async (
     state: RunLifecycleState,
@@ -79,7 +145,7 @@ export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, 
       throw new CancelledError(`Run cancelled before ${phase}.`, {
         code: "run.cancelled",
         retryable: false,
-        fix: "Start a new run with a fresh output directory. Automatic replay is not implemented yet."
+        fix: "Resume the run with deepthonk resume --continue after the worker has stopped."
       });
     }
   };
@@ -107,37 +173,57 @@ export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, 
   };
 
   try {
-    await writeStatus("running", "initialized");
-    await assertNotCancelled("initial population");
-    let population = await generateInitialPopulation(config, driver, trace, rng, runId, tracker, guards);
-    await trace.writePopulation(0, population);
-    await assertBudget("initial population");
-    await writeStatus("running", "population_completed", { generation: 0 });
+    await writeStatus("running", resumeState ? "resume_replay" : "initialized");
+    let population: Candidate[];
+    if (isResumePhaseCompleted(resumeState, "initial_generation")) {
+      population = resumePopulation(resumeState, 0);
+    } else {
+      await assertNotCancelled("initial population");
+      population = await generateInitialPopulation(config, driver, trace, rng, runId, tracker, guards);
+      await trace.writePopulation(0, population);
+      await assertBudget("initial population");
+      await markPhaseCompleted(trace, "initial_generation");
+      await writeStatus("running", "population_completed", { generation: 0 });
+    }
 
     for (let gen = 1; gen <= config.profile.t; gen += 1) {
-      await assertNotCancelled(`generation ${gen} comparisons`);
-      await writeStatus("running", "generation_comparisons", { generation: gen });
-      const pairs = makeKRegularPairs(
-        population.map((candidate) => candidate.id),
-        config.profile.k,
-        rng
-      );
-      const comparisons = await judgePairs({
-        config,
-        driver,
-        trace,
-        rng,
-        runId,
-        generation: gen,
-        pairs,
-        population,
-        tracker,
-        guards
-      });
+      if (isResumePhaseCompleted(resumeState, "generation_mutation", gen)) {
+        population = resumePopulation(resumeState, gen);
+        continue;
+      }
 
-      const scores = fitBradleyTerry(population, comparisons, config.profile.lambda, gen);
-      await trace.writeScores(gen, scores);
-      await assertBudget(`generation ${gen} comparisons`);
+      let comparisons: Comparison[];
+      let scores: BtScore[];
+      if (isResumePhaseCompleted(resumeState, "generation_judging", gen)) {
+        comparisons = resumeComparisons(resumeState, gen);
+        scores = resumeScores(resumeState, gen, population, comparisons, config.profile.lambda);
+      } else {
+        await assertNotCancelled(`generation ${gen} comparisons`);
+        await writeStatus("running", "generation_comparisons", { generation: gen });
+        const judgingRng = phaseRng(config.seed, "generation_judging", gen);
+        const pairs = makeKRegularPairs(
+          population.map((candidate) => candidate.id),
+          config.profile.k,
+          judgingRng
+        );
+        comparisons = await judgePairs({
+          config,
+          driver,
+          trace,
+          rng: judgingRng,
+          runId,
+          generation: gen,
+          pairs,
+          population,
+          tracker,
+          guards
+        });
+
+        scores = fitBradleyTerry(population, comparisons, config.profile.lambda, gen);
+        await trace.writeScores(gen, scores);
+        await assertBudget(`generation ${gen} comparisons`);
+        await markPhaseCompleted(trace, "generation_judging", gen);
+      }
 
       const ranked = rankPopulation(population, scores);
       const elites = topQuartile(ranked);
@@ -145,10 +231,10 @@ export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, 
       const survivors = ranked.filter((candidate) => !discarded.has(candidate.id));
       const mutationParents = survivors.slice(0, config.profile.n - elites.length);
       const critiquesByCandidate = aggregateCritiques(population, comparisons);
-      await traceDiscardedCandidates(trace, ranked, new Set([...elites, ...mutationParents].map((candidate) => candidate.id)), discarded, gen);
 
       await assertNotCancelled(`generation ${gen} mutation`);
       await writeStatus("running", "generation_mutation", { generation: gen });
+      await traceDiscardedCandidates(trace, ranked, new Set([...elites, ...mutationParents].map((candidate) => candidate.id)), discarded, gen);
       const mutants = await mutateSurvivors({
         config,
         driver,
@@ -168,31 +254,41 @@ export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, 
       population = keepPopulationSize([...eliteCopies, ...mutants], config.profile.n);
       await trace.writePopulation(gen, population);
       await assertBudget(`generation ${gen} mutation`);
+      await markPhaseCompleted(trace, "generation_mutation", gen);
       await writeStatus("running", "generation_completed", { generation: gen });
     }
 
-    await assertNotCancelled("final ranking");
-    await writeStatus("running", "final_ranking", { generation: "final" });
-    const finalPairs = makeKRegularPairs(
-      population.map((candidate) => candidate.id),
-      config.profile.m,
-      rng
-    );
-    const finalComparisons = await judgePairs({
-      config,
-      driver,
-      trace,
-      rng,
-      runId,
-      generation: "final",
-      pairs: finalPairs,
-      population,
-      tracker,
-      guards
-    });
-    const finalScores = fitBradleyTerry(population, finalComparisons, config.profile.lambda, "final");
-    await trace.writeScores("final", finalScores);
-    await assertBudget("final ranking");
+    let finalComparisons: Comparison[];
+    let finalScores: BtScore[];
+    if (isResumePhaseCompleted(resumeState, "final_judging")) {
+      finalComparisons = resumeComparisons(resumeState, "final");
+      finalScores = resumeScores(resumeState, "final", population, finalComparisons, config.profile.lambda);
+    } else {
+      await assertNotCancelled("final ranking");
+      await writeStatus("running", "final_ranking", { generation: "final" });
+      const finalRng = phaseRng(config.seed, "final_judging");
+      const finalPairs = makeKRegularPairs(
+        population.map((candidate) => candidate.id),
+        config.profile.m,
+        finalRng
+      );
+      finalComparisons = await judgePairs({
+        config,
+        driver,
+        trace,
+        rng: finalRng,
+        runId,
+        generation: "final",
+        pairs: finalPairs,
+        population,
+        tracker,
+        guards
+      });
+      finalScores = fitBradleyTerry(population, finalComparisons, config.profile.lambda, "final");
+      await trace.writeScores("final", finalScores);
+      await assertBudget("final ranking");
+      await markPhaseCompleted(trace, "final_judging");
+    }
     const winner = rankPopulation(population, finalScores)[0];
     if (!winner) throw new ConfigError("Run produced no winner.");
 
@@ -217,7 +313,9 @@ export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, 
       completed_at: completedAt
     };
     await trace.writeSummary(summary, finalAnswer, winner.content);
+    await markPhaseCompleted(trace, "finalizing");
     await trace.event({ type: "run.completed", winner_id: winner.id, completed_at: completedAt });
+    if (resumeState) await trace.event({ type: "run.resumed_completed", winner_id: winner.id, completed_at: completedAt });
     await writeStatus("completed", "summary", { generation: "final", completed_at: completedAt });
 
     return {
@@ -235,6 +333,205 @@ export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, 
     await trace.event({ type: `run.${state}`, run_id: runId, error: serialized, updated_at: new Date().toISOString() });
     await writeStatus(state, state, { error: serialized });
     throw error;
+  }
+}
+
+export async function resumeDeepThonk(
+  runDir: string,
+  driver: ModelDriver,
+  options: ResumeDeepThonkOptions = {}
+): Promise<RunResult | ResumePlan> {
+  const existingSummary = await readOptionalJson<Record<string, unknown>>(runDir, runArtifactFiles.summary);
+  if (existingSummary) {
+    resumeConfigError(
+      "Run already has summary.json; nothing to resume.",
+      "resume.already_complete",
+      "Use deepthonk inspect/result to read the completed run."
+    );
+  }
+
+  const rawConfig = await readRequiredConfig(runDir);
+  const currentVersion = await currentPackageVersion();
+  if (rawConfig.version !== currentVersion) {
+    resumeConfigError(
+      `Cannot resume run from version ${String(rawConfig.version ?? "missing")}; current package version is ${currentVersion}.`,
+      "resume.version_mismatch",
+      "Start a fresh run with the current DeepThonk version, or resume with the package version that created this trace."
+    );
+  }
+  const parsedConfig = runConfigSchema.parse(rawConfig);
+  const config: RunConfig = { ...parsedConfig, runDir };
+  validateProfile(config.profile);
+  enforceBudget(config);
+
+  const runtimeProvider = options.provider ?? providerLabel(driver) ?? config.provider;
+  if (runtimeProvider !== config.provider) {
+    resumeConfigError(
+      `Cannot resume provider ${config.provider} with runtime provider ${runtimeProvider}.`,
+      "resume.provider_mismatch",
+      "Use the same provider configuration that created config.json."
+    );
+  }
+
+  const status = await readOptionalJson<RunStatus>(runDir, runArtifactFiles.status);
+  if ((status?.state === "running" || status?.state === "pending") && isLiveWorker(status.worker_pid)) {
+    resumeConfigError(
+      `Run is still in flight at phase ${status.phase}.`,
+      "resume.in_flight",
+      "Wait for the worker to finish, or cancel/stop it before resuming."
+    );
+  }
+
+  const trace = await readResumeTrace(runDir);
+  const runId = resolveResumeRunId(config, status, trace.events);
+  const plan = buildResumePlan(config, trace.events);
+  if (plan.nextPhase.phase === "summary") {
+    resumeConfigError(
+      "Trace says finalizing completed, but summary.json is missing.",
+      "resume.inconsistent_trace",
+      "Inspect the run directory and restore summary.json, or start a fresh run."
+    );
+  }
+
+  const planStatus = toResumePlanStatus(runDir, runId, plan);
+  if (options.dryRun) return planStatus;
+
+  const pruned = pruneTraceToPlan(trace, plan);
+  const populationByGeneration = buildPopulationMap(config, pruned.populations, pruned.candidates, plan);
+  const comparisonsByGeneration = groupComparisons(pruned.comparisons);
+  const scoresByGeneration = reconstructScores(config, populationByGeneration, comparisonsByGeneration, pruned.scores, plan);
+  const tracker = replayBudgetUsage(config, pruned.usage);
+  const startedAt = status?.started_at ?? new Date().toISOString();
+  await new TraceStore(runDir).writeStatus({
+    run_id: runId,
+    run_dir: runDir,
+    state: "running",
+    phase: "resume_planning",
+    usage: cloneUsage(tracker.usage),
+    started_at: startedAt,
+    worker_pid: process.pid,
+    updated_at: new Date().toISOString()
+  });
+  await persistPrunedTrace(runDir, pruned);
+
+  return runDeepThonk(config, driver, {}, {
+    runId,
+    startedAt,
+    completed: plan.completed,
+    populationByGeneration,
+    comparisonsByGeneration,
+    scoresByGeneration,
+    tracker,
+    nextPhase: plan.nextPhase
+  });
+}
+
+async function markPhaseCompleted(trace: TraceStore, phase: PhaseName, generation?: number): Promise<void> {
+  const event = phaseCompletedEventSchema.parse({
+    type: "phase.completed",
+    phase,
+    generation,
+    at: new Date().toISOString()
+  });
+  await trace.event(event);
+}
+
+function isResumePhaseCompleted(resumeState: ResumeState | undefined, phase: PhaseName, generation?: number): boolean {
+  return Boolean(resumeState?.completed.has(resumePhaseKey(phase, generation)));
+}
+
+function resumePopulation(resumeState: ResumeState | undefined, generation: number): Candidate[] {
+  const population = resumeState?.populationByGeneration.get(generation);
+  if (!population) {
+    throw new ConfigError(`Resume state is missing population generation ${generation}.`, {
+      code: "resume.population_missing",
+      retryable: false,
+      fix: "Inspect the run directory for missing population snapshots."
+    });
+  }
+  return population;
+}
+
+function resumeComparisons(resumeState: ResumeState | undefined, generation: number | "final"): Comparison[] {
+  const comparisons = resumeState?.comparisonsByGeneration.get(generation);
+  if (!comparisons) {
+    throw new ConfigError(`Resume state is missing comparisons for generation ${generation}.`, {
+      code: "resume.comparisons_missing",
+      retryable: false,
+      fix: "Inspect the run directory for missing comparison trace rows."
+    });
+  }
+  return comparisons;
+}
+
+function resumeScores(
+  resumeState: ResumeState | undefined,
+  generation: number | "final",
+  population: Candidate[],
+  comparisons: Comparison[],
+  lambda: number
+): BtScore[] {
+  return resumeState?.scoresByGeneration.get(generation) ?? fitBradleyTerry(population, comparisons, lambda, generation);
+}
+
+function phaseRng(seed: number, phase: PhaseName, generation?: number | "final"): Rng {
+  return createRng(hashSeed(`${seed}:${phase}:${generation ?? ""}`));
+}
+
+function hashSeed(value: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function resumePhaseKey(phase: PhaseName, generation?: number): string {
+  if ((phase === "generation_judging" || phase === "generation_mutation") && generation !== undefined) return `${phase}:${generation}`;
+  return phase;
+}
+
+function providerLabel(driver: ModelDriver): string | undefined {
+  const value = driver as { provider?: unknown; providerName?: unknown; config?: { provider?: unknown } };
+  if (typeof value.provider === "string") return value.provider;
+  if (typeof value.providerName === "string") return value.providerName;
+  if (typeof value.config?.provider === "string") return value.config.provider;
+  const constructorName = driver.constructor?.name;
+  if (constructorName === "FakeDriver") return "fake";
+  if (constructorName === "SamplingDriver") return "sampling";
+  if (constructorName === "OpenAiCompatibleDriver") return "openai-compatible";
+  return undefined;
+}
+
+async function readRequiredConfig(runDir: string): Promise<Record<string, unknown>> {
+  const config = await readOptionalJson<Record<string, unknown>>(runDir, runArtifactFiles.config);
+  if (!config) {
+    resumeConfigError(
+      "Run directory is missing config.json; cannot replay safely.",
+      "resume.config_missing",
+      "Resume only from a DeepThonk run directory with config.json."
+    );
+  }
+  return config;
+}
+
+async function readOptionalJson<T>(runDir: string, fileName: string): Promise<T | undefined> {
+  try {
+    return JSON.parse(await readFile(join(runDir, fileName), "utf8")) as T;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function isLiveWorker(pid: number | undefined): boolean {
+  if (!pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -702,4 +999,13 @@ function serializeRunError(error: unknown): RunStatus["error"] {
     message: error instanceof Error ? error.message : String(error),
     retryable: false
   };
+}
+
+async function currentPackageVersion(): Promise<string> {
+  try {
+    const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { version?: string };
+    return packageJson.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
 }

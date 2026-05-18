@@ -42,7 +42,8 @@ import {
   profileSaveOutputSchema,
   profileShowOutputSchema,
   toolError,
-  toolResult
+  toolResult,
+  type McpSamplingContext
 } from "./tools.js";
 import { listRunResources, readJobResource, readRunResource, runResourceMimeType } from "./resources.js";
 import { renderPrompt } from "./prompts.js";
@@ -52,6 +53,10 @@ export function createDeepThonkMcpServer(): McpServer {
     name: "deepthonk",
     version: "0.1.1"
   });
+  const samplingContext: McpSamplingContext = {
+    getClientCapabilities: () => server.server.getClientCapabilities(),
+    createMessage: (params, options) => server.server.createMessage(params, options)
+  };
 
   server.registerTool(
     "deepthonk.plan",
@@ -72,7 +77,7 @@ export function createDeepThonkMcpServer(): McpServer {
       inputSchema: runArgsSchema.shape,
       outputSchema: startOutputSchema.shape
     },
-    async (args) => safeTool(async () => toolResult(await deepthonkStart(args)), args.run_dir)
+    async (args) => safeTool(async () => toolResult(await deepthonkStart(args, samplingContext)), args.run_dir)
   );
 
   server.registerTool(
@@ -116,7 +121,7 @@ export function createDeepThonkMcpServer(): McpServer {
       inputSchema: runArgsSchema.shape,
       outputSchema: runOutputSchema.shape
     },
-    async (args) => safeTool(async () => toolResult(await deepthonkRun(args)), args.run_dir)
+    async (args) => safeTool(async () => toolResult(await deepthonkRun(args, samplingContext)), args.run_dir)
   );
 
   server.registerTool(
@@ -145,7 +150,7 @@ export function createDeepThonkMcpServer(): McpServer {
     "deepthonk.resume",
     {
       title: "Resume Run",
-      description: "Detect whether a run can be resumed.",
+      description: "Detect resume state (default) or replay an interrupted run with continue: true.",
       inputSchema: resumeArgsSchema.shape,
       outputSchema: resumeOutputSchema.shape
     },

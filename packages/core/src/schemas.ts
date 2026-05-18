@@ -117,6 +117,8 @@ export type PromptOverride = z.infer<typeof promptOverrideSchema>;
 export type PromptOverrides = z.infer<typeof promptOverridesSchema>;
 
 export const runConfigSchema = z.object({
+  version: z.string().optional(),
+  runId: z.string().optional(),
   task: z.string().min(1),
   rubric: z.string().optional(),
   promptStyle: z.enum(["general", "paper-programming"]).default("general"),
@@ -188,6 +190,23 @@ export const runConfigSchema = z.object({
     .default({ includeRawModelOutputs: false, includePrompts: false })
 });
 export type RunConfig = z.infer<typeof runConfigSchema>;
+
+export const phaseNameSchema = z.enum([
+  "initial_generation",
+  "generation_judging",
+  "generation_mutation",
+  "final_judging",
+  "finalizing"
+]);
+export type PhaseName = z.infer<typeof phaseNameSchema>;
+
+export const phaseCompletedEventSchema = z.object({
+  type: z.literal("phase.completed"),
+  phase: phaseNameSchema,
+  generation: z.number().int().optional(),
+  at: z.string().datetime()
+});
+export type PhaseCompletedEvent = z.infer<typeof phaseCompletedEventSchema>;
 
 export interface ModelTextResult {
   text: string;
