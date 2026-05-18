@@ -7,6 +7,9 @@ export interface ModelPrice {
   inputCacheHitUsdPerMillion?: number;
   inputCacheMissUsdPerMillion?: number;
   outputUsdPerMillion?: number;
+  longContextThresholdTokens?: number;
+  inputUsdPerMillionLong?: number;
+  outputUsdPerMillionLong?: number;
   source?: string;
   note?: string;
 }

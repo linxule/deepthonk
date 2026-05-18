@@ -5,7 +5,7 @@ import { BudgetTracker } from "./budgetTracker.js";
 import { planBudget, validateProfile } from "./budget.js";
 import { BudgetExceededError, CancelledError, ConfigError, DeepThonkError } from "./errors.js";
 import { parseJsonObject } from "./json.js";
-import { emptyUsage, type BudgetUsage, type RunLifecycleState, type RunStatus } from "./lifecycle.js";
+import { emptyUsage, type BudgetUsage, type CallRole, type RunLifecycleState, type RunStatus, type UsageDelta, type UsageRecord } from "./lifecycle.js";
 import { makeKRegularPairs, type Pair } from "./pairScheduler.js";
 import { comparePrompt, finalizePrompt, generatePrompt, mutatePrompt } from "./prompts.js";
 import { createRng, type Rng } from "./rng.js";
@@ -278,7 +278,7 @@ async function generateInitialPopulation(
   const jobs = Array.from({ length: config.profile.n }, (_, index) => ({
     index,
     id: `g0_c${index}_${rng.id("c")}`,
-    prompt: generatePrompt(config.task, config.rubric, config.promptStyle)
+    prompt: generatePrompt(config.task, config.rubric, config.promptStyle, config.promptOverrides?.generate)
   }));
   const candidates = await Promise.all(
     jobs.map((job) =>
@@ -292,7 +292,15 @@ async function generateInitialPopulation(
           candidateIndex: job.index,
           prompt: job.prompt
         });
-        tracker.record(result, { provider: config.provider, model: config.generatorModel });
+        const delta = tracker.record(result, { provider: config.provider, model: config.generatorModel });
+        await trace.writeUsage(buildUsageRecord({
+          phase: "gen0_initial",
+          role: "generator",
+          result,
+          delta,
+          provider: result.provider ?? config.provider,
+          model: result.model ?? config.generatorModel
+        }));
         await guards.afterCall("initial population call");
         const candidate: Candidate = {
           id: job.id,
@@ -302,14 +310,12 @@ async function generateInitialPopulation(
           status: "generated",
           metadata: resultMetadata(result, config, job.prompt)
         };
+        await trace.writeCandidate(candidate);
+        await trace.event({ type: "candidate.generated", run_id: runId, candidate_id: candidate.id });
         return candidate;
       })
     )
   );
-  for (const candidate of candidates) {
-    await trace.writeCandidate(candidate);
-    await trace.event({ type: "candidate.generated", run_id: runId, candidate_id: candidate.id });
-  }
   return candidates;
 }
 
@@ -341,7 +347,7 @@ async function judgePairs(args: {
       presentedA,
       presentedB,
       id: `${args.generation}_cmp_${pairIndex}_${args.rng.id("cmp")}`,
-      prompt: comparePrompt(args.config.task, presentedA, presentedB, args.config.rubric, args.config.promptStyle)
+      prompt: comparePrompt(args.config.task, presentedA, presentedB, args.config.rubric, args.config.promptStyle, args.config.promptOverrides?.compare)
     };
   });
   const comparisons = await Promise.all(
@@ -371,7 +377,15 @@ async function judgePairs(args: {
             candidateB: job.presentedB,
             prompt: job.prompt
           });
-          args.tracker.record(result, { provider: args.config.provider, model: args.config.judgeModel });
+          const delta = args.tracker.record(result, { provider: args.config.provider, model: args.config.judgeModel });
+          await args.trace.writeUsage(buildUsageRecord({
+            phase: args.generation === "final" ? "final_judge" : `gen${args.generation}_judge`,
+            role: "judge",
+            result,
+            delta,
+            provider: result.provider ?? args.config.provider,
+            model: result.model ?? args.config.judgeModel
+          }));
           await args.guards.afterCall(`${args.generation} comparison call`);
           inputTokens += result.usage?.inputTokens ?? 0;
           inputCacheHitTokens += result.usage?.inputCacheHitTokens ?? 0;
@@ -423,19 +437,17 @@ async function judgePairs(args: {
             prompt: args.config.output.includePrompts ? job.prompt : undefined
           })
         };
+        await args.trace.writeComparison(comparison);
+        await args.trace.event({
+          type: "comparison.completed",
+          run_id: args.runId,
+          comparison_id: comparison.id,
+          generation: args.generation
+        });
         return comparison;
       })
     )
   );
-  for (const comparison of comparisons) {
-    await args.trace.writeComparison(comparison);
-    await args.trace.event({
-      type: "comparison.completed",
-      run_id: args.runId,
-      comparison_id: comparison.id,
-      generation: args.generation
-    });
-  }
   return comparisons;
 }
 
@@ -454,7 +466,7 @@ async function mutateSurvivors(args: {
     args.survivors.map((candidate, index) =>
       limit(async () => {
         const critique = args.critiquesByCandidate.get(candidate.id) ?? "";
-        const prompt = mutatePrompt(args.config.task, candidate, critique, args.config.rubric, args.config.promptStyle);
+        const prompt = mutatePrompt(args.config.task, candidate, critique, args.config.rubric, args.config.promptStyle, args.config.promptOverrides?.mutate);
         await args.guards.beforeCall(`generation ${args.generation} mutation call`);
         const result = await args.driver.mutate({
           task: args.config.task,
@@ -465,7 +477,15 @@ async function mutateSurvivors(args: {
           critique,
           prompt
         });
-        args.tracker.record(result, { provider: args.config.provider, model: args.config.mutatorModel });
+        const delta = args.tracker.record(result, { provider: args.config.provider, model: args.config.mutatorModel });
+        await args.trace.writeUsage(buildUsageRecord({
+          phase: `gen${args.generation}_mutate`,
+          role: "mutator",
+          result,
+          delta,
+          provider: result.provider ?? args.config.provider,
+          model: result.model ?? args.config.mutatorModel
+        }));
         await args.guards.afterCall(`generation ${args.generation} mutation call`);
         const mutant: Candidate = {
           id: `g${args.generation}_m${index}_${candidate.id}`,
@@ -476,14 +496,12 @@ async function mutateSurvivors(args: {
           status: "mutated",
           metadata: resultMetadata(result, args.config, prompt)
         };
+        await args.trace.writeCandidate(mutant);
+        await args.trace.event({ type: "candidate.mutated", candidate_id: mutant.id, parent_id: mutant.parentId });
         return mutant;
       })
     )
   );
-  for (const mutant of mutants) {
-    await args.trace.writeCandidate(mutant);
-    await args.trace.event({ type: "candidate.mutated", candidate_id: mutant.id, parent_id: mutant.parentId });
-  }
   return mutants;
 }
 
@@ -502,9 +520,17 @@ async function maybeFinalize(
     rubric: config.rubric,
     model: config.finalizerModel,
     candidate: winner,
-    prompt: finalizePrompt(config.task, winner, config.rubric)
+    prompt: finalizePrompt(config.task, winner, config.rubric, config.promptStyle, config.promptOverrides?.finalize)
   });
-  tracker.record(result, { provider: config.provider, model: config.finalizerModel });
+  const delta = tracker.record(result, { provider: config.provider, model: config.finalizerModel });
+  await trace.writeUsage(buildUsageRecord({
+    phase: "finalize",
+    role: "finalizer",
+    result,
+    delta,
+    provider: result.provider ?? config.provider,
+    model: result.model ?? config.finalizerModel
+  }));
   await guards.afterCall("finalization call");
   await trace.event({ type: "finalized", winner_id: winner.id, model: result.model, provider: result.provider });
   return result.text;
@@ -538,9 +564,42 @@ function compactMetadata(metadata: Record<string, unknown>): Record<string, unkn
   return Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== undefined));
 }
 
+function buildUsageRecord(args: {
+  phase: string;
+  role: CallRole;
+  result: ModelTextResult;
+  delta: UsageDelta;
+  provider?: string;
+  model?: string;
+}): UsageRecord {
+  return {
+    ts: new Date().toISOString(),
+    phase: args.phase,
+    role: args.role,
+    provider: args.provider,
+    model: args.model,
+    input_tokens: args.delta.inputTokens,
+    input_cache_hit_tokens: args.delta.inputCacheHitTokens,
+    input_cache_miss_tokens: args.delta.inputCacheMissTokens,
+    output_tokens: args.delta.outputTokens,
+    total_tokens: args.delta.totalTokens,
+    input_usd: args.delta.inputUsd,
+    output_usd: args.delta.outputUsd,
+    total_usd: args.delta.usd,
+    latency_ms: args.result.latencyMs,
+    retry_count: args.result.retryCount
+  };
+}
+
 function enforceBudget(config: RunConfig): void {
   const plan = planBudget(config.profile);
-  const plannedCalls = plan.calls + (config.finalizerModel ? 1 : 0);
+  // Each comparison call may fire up to invalidJsonRetries extra requests before the loop gives up.
+  // Include that worst-case headroom so a user who sets --max-calls = plan.calls isn't tripped by
+  // a single retry mid-run.
+  const judgeCalls = plan.per_generation_judge_calls * config.profile.t + plan.final_judge_calls;
+  const retryHeadroom = judgeCalls * config.retry.invalidJsonRetries;
+  const finalizerCalls = config.finalizerModel ? 1 : 0;
+  const plannedCalls = plan.calls + finalizerCalls + retryHeadroom;
   if (config.budget?.maxCalls !== undefined && plannedCalls > config.budget.maxCalls) {
     throw new BudgetExceededError(`Planned call count ${plannedCalls} exceeds maxCalls ${config.budget.maxCalls}.`, {
       code: "budget.planned_calls_exceeded",

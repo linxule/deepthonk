@@ -31,7 +31,7 @@ export class OpenAiCompatibleDriver implements ModelDriver {
     this.provider = config.provider;
     this.baseUrl = normalizeBaseUrl(config.baseUrl);
     this.apiKey = config.apiKey ?? (config.apiKeyEnv ? process.env[config.apiKeyEnv] : undefined);
-    this.httpRetries = config.retry?.httpRetries ?? 2;
+    this.httpRetries = config.retry?.httpRetries ?? 12;
     this.requestTimeoutMs = config.retry?.requestTimeoutMs ?? 120_000;
     this.supportsJsonMode = config.supportsJsonMode ?? true;
     if (!this.apiKey) {
@@ -211,7 +211,12 @@ function isAbortError(error: unknown): boolean {
 }
 
 function backoff(attempt: number): number {
-  return 200 * 2 ** attempt + Math.floor(Math.random() * 50);
+  // Multiplicative jitter (±20% around the capped exponential base) matches the reference
+  // Python's burst dispersion. Additive jitter at the 60s cap was effectively ±0.4% and would
+  // align concurrent retries into the next provider rate-limit window.
+  const base = Math.min(60_000, 500 * 2 ** attempt);
+  const jitterFactor = 0.8 + Math.random() * 0.4;
+  return Math.floor(base * jitterFactor);
 }
 
 function sleep(ms: number): Promise<void> {

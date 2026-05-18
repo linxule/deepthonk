@@ -1,5 +1,5 @@
 import { BudgetExceededError, ConfigError } from "./errors.js";
-import type { BudgetUsage } from "./lifecycle.js";
+import type { BudgetUsage, UsageDelta } from "./lifecycle.js";
 import { emptyUsage } from "./lifecycle.js";
 import type { ModelTextResult, RunConfig } from "./schemas.js";
 
@@ -19,7 +19,7 @@ export class BudgetTracker {
     }
   }
 
-  record(result: ModelTextResult, fallback: { provider?: string; model: string; calls?: number } = { model: "unknown" }): void {
+  record(result: ModelTextResult, fallback: { provider?: string; model: string; calls?: number } = { model: "unknown" }): UsageDelta {
     const calls = fallback.calls ?? 1;
     this.usage.calls += calls;
     const inputCacheHitTokens = result.usage?.inputCacheHitTokens ?? 0;
@@ -35,18 +35,31 @@ export class BudgetTracker {
     const provider = result.provider ?? fallback.provider ?? this.config.provider;
     const model = result.model ?? fallback.model;
     const price = this.findPrice(provider, model);
+    let inputUsd: number | undefined;
+    let outputUsd: number | undefined;
     if (price) {
       if (this.config.budget?.maxUsd !== undefined) this.requirePrice(provider, model);
-      const inputUsd = inputUsdForUsage(price, {
+      inputUsd = inputUsdForUsage(price, {
         inputTokens,
         inputCacheHitTokens: result.usage?.inputCacheHitTokens,
         inputCacheMissTokens: result.usage?.inputCacheMissTokens
       });
-      const usd = inputUsd + (outputTokens / 1_000_000) * (price.outputUsdPerMillion ?? 0);
-      this.usage.usd = (this.usage.usd ?? 0) + usd;
+      outputUsd = (outputTokens / 1_000_000) * outputRateFor(price, inputTokens);
+      this.usage.usd = (this.usage.usd ?? 0) + inputUsd + outputUsd;
     } else if (this.config.budget?.maxUsd !== undefined) {
       this.requirePrice(provider, model);
     }
+    return {
+      calls,
+      inputTokens,
+      inputCacheHitTokens: result.usage?.inputCacheHitTokens,
+      inputCacheMissTokens: result.usage?.inputCacheMissTokens,
+      outputTokens,
+      totalTokens,
+      inputUsd,
+      outputUsd,
+      usd: inputUsd !== undefined && outputUsd !== undefined ? inputUsd + outputUsd : undefined
+    };
   }
 
   assertWithinBudget(phase: string): void {
@@ -95,12 +108,30 @@ export class BudgetTracker {
 }
 
 function inputUsdForUsage(price: Price, usage: { inputTokens: number; inputCacheHitTokens?: number; inputCacheMissTokens?: number }): number {
+  // Cache hit/miss rates are flat in v0.1 — long-context tier does not apply when the provider
+  // reports prompt_cache_hit_tokens / prompt_cache_miss_tokens. Real pricing tables for tiered
+  // models (Gemini, GPT-5.4) rarely tier their cache rates, and DeepSeek does not have long-context tiers today.
   if (usage.inputCacheHitTokens !== undefined && usage.inputCacheMissTokens !== undefined) {
     const hit = (usage.inputCacheHitTokens / 1_000_000) * (price.inputCacheHitUsdPerMillion ?? price.inputUsdPerMillion ?? 0);
     const miss = (usage.inputCacheMissTokens / 1_000_000) * (price.inputCacheMissUsdPerMillion ?? price.inputUsdPerMillion ?? 0);
     return hit + miss;
   }
-  return (usage.inputTokens / 1_000_000) * (price.inputUsdPerMillion ?? price.inputCacheMissUsdPerMillion ?? 0);
+  const rate = isLongContext(price, usage.inputTokens)
+    ? (price.inputUsdPerMillionLong ?? price.inputUsdPerMillion ?? 0)
+    : (price.inputUsdPerMillion ?? price.inputCacheMissUsdPerMillion ?? 0);
+  return (usage.inputTokens / 1_000_000) * rate;
+}
+
+function outputRateFor(price: Price, inputTokens: number): number {
+  return isLongContext(price, inputTokens)
+    ? (price.outputUsdPerMillionLong ?? price.outputUsdPerMillion ?? 0)
+    : (price.outputUsdPerMillion ?? 0);
+}
+
+function isLongContext(price: Price, inputTokens: number): boolean {
+  if (price.longContextThresholdTokens === undefined) return false;
+  if (price.inputUsdPerMillionLong === undefined && price.outputUsdPerMillionLong === undefined) return false;
+  return inputTokens > price.longContextThresholdTokens;
 }
 
 function hasUsableInputPrice(price: Price): boolean {

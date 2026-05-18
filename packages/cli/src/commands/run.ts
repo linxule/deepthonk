@@ -26,6 +26,16 @@ export function registerRun(program: Command): void {
     .option("--max-output-tokens <number>")
     .option("--max-usd <number>")
     .option("--request-timeout-ms <number>")
+    .option("--n <number>", "Population size override (default: profile)")
+    .option("--k <number>", "Comparisons per candidate per generation override")
+    .option("--t <number>", "Number of mutation generations override")
+    .option("--m <number>", "Comparisons per candidate in the final dense ranking round")
+    .option("--lambda <number>", "Bradley-Terry L2 regularization override")
+    .option("--sample-temperature <number>", "Temperature for initial candidate generation")
+    .option("--mutate-temperature <number>", "Temperature for critique-guided mutation")
+    .option("--judge-temperature <number>", "Temperature for pairwise judging")
+    .option("--prompt-style <style>", "general|paper-programming")
+    .option("--prompts <yaml>", "YAML file with per-phase prompt overrides")
     .option("--dry-run")
     .action(async (options) => {
       const resolved = await resolveRunConfig(options);
@@ -50,10 +60,14 @@ export function registerRun(program: Command): void {
     });
 }
 
+// Match keys that hold a secret value. Exclude metadata pointers like apiKeyEnv/apiKeyFile/apiKeyStdin
+// which only name where the secret lives.
+const SECRET_KEY_RE = /^(api[_-]?key|token|secret|password|authorization|bearer|cookie|credential)$/i;
+
 function redacted(value: unknown): unknown {
   return JSON.parse(
     JSON.stringify(value, (key, inner) => {
-      if (/^(apiKey|token|password|secret)$/i.test(key) && inner) return "[redacted]";
+      if (SECRET_KEY_RE.test(key) && inner) return "[redacted]";
       return inner;
     })
   );

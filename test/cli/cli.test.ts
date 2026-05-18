@@ -180,6 +180,94 @@ describe("deepthonk CLI", () => {
     });
   });
 
+  it("overrides profile n/k/t/m and temperatures via CLI flags", async () => {
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      cli,
+      "run",
+      "--provider",
+      "fake",
+      "--profile",
+      "paper",
+      "--task",
+      "toy",
+      "--n",
+      "12",
+      "--k",
+      "2",
+      "--t",
+      "1",
+      "--m",
+      "6",
+      "--lambda",
+      "0.05",
+      "--sample-temperature",
+      "1.4",
+      "--dry-run"
+    ]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig.profile.n).toBe(12);
+    expect(parsed.runConfig.profile.k).toBe(2);
+    expect(parsed.runConfig.profile.t).toBe(1);
+    expect(parsed.runConfig.profile.m).toBe(6);
+    expect(parsed.runConfig.profile.lambda).toBe(0.05);
+    expect(parsed.runConfig.profile.sampleTemperature).toBe(1.4);
+  });
+
+  it("loads prompt overrides from --prompts YAML file", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-prompts-"));
+    const promptsPath = join(configDir, "prompts.yaml");
+    await writeFile(
+      promptsPath,
+      [
+        "generate:",
+        "  system: 'You are an experienced employment-law attorney.'",
+        "  user: 'TASK: {task}\\nProduce one drafted clause.'",
+        "compare:",
+        "  user: 'Pick the more enforceable clause. JSON only.'"
+      ].join("\n")
+    );
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      cli,
+      "run",
+      "--provider",
+      "fake",
+      "--profile",
+      "quick",
+      "--task",
+      "toy",
+      "--prompts",
+      promptsPath,
+      "--dry-run"
+    ]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig.promptOverrides.generate.system).toContain("attorney");
+    expect(parsed.runConfig.promptOverrides.compare.user).toContain("enforceable");
+  });
+
+  it("--prompt-style overrides profile-derived default", async () => {
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      cli,
+      "run",
+      "--provider",
+      "fake",
+      "--profile",
+      "quick",
+      "--task",
+      "toy",
+      "--prompt-style",
+      "paper-programming",
+      "--dry-run"
+    ]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig.promptStyle).toBe("paper-programming");
+  });
+
   it("runs fake quick profile and writes final artifact", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-cli-"));
     const { stdout } = await execFileAsync(process.execPath, [

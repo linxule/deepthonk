@@ -99,10 +99,26 @@ export interface BtScore {
   comparisons: number;
 }
 
+const promptOverrideSchema = z.object({
+  system: z.string().optional(),
+  user: z.string().optional()
+});
+
+const promptOverridesSchema = z.object({
+  generate: promptOverrideSchema.optional(),
+  compare: promptOverrideSchema.optional(),
+  mutate: promptOverrideSchema.optional(),
+  finalize: promptOverrideSchema.optional()
+});
+
+export type PromptOverride = z.infer<typeof promptOverrideSchema>;
+export type PromptOverrides = z.infer<typeof promptOverridesSchema>;
+
 export const runConfigSchema = z.object({
   task: z.string().min(1),
   rubric: z.string().optional(),
   promptStyle: z.enum(["general", "paper-programming"]).default("general"),
+  promptOverrides: promptOverridesSchema.optional(),
   profile: profileSchema,
   runDir: z.string().min(1),
   seed: z.number().int(),
@@ -117,7 +133,7 @@ export const runConfigSchema = z.object({
     mutate: z.number().int().min(1)
   }),
   retry: z.object({
-    httpRetries: z.number().int().min(0).default(2),
+    httpRetries: z.number().int().min(0).default(12),
     invalidJsonRetries: z.number().int().min(0).default(1),
     requestTimeoutMs: z.number().int().min(1).optional()
   }),
@@ -129,14 +145,35 @@ export const runConfigSchema = z.object({
       maxUsd: z.number().min(0).optional(),
       prices: z
         .array(
-          z.object({
-            provider: z.string().min(1),
-            model: z.string().min(1),
-            inputUsdPerMillion: z.number().min(0).optional(),
-            inputCacheHitUsdPerMillion: z.number().min(0).optional(),
-            inputCacheMissUsdPerMillion: z.number().min(0).optional(),
-            outputUsdPerMillion: z.number().min(0).optional()
-          })
+          z
+            .object({
+              provider: z.string().min(1),
+              model: z.string().min(1),
+              inputUsdPerMillion: z.number().min(0).optional(),
+              inputCacheHitUsdPerMillion: z.number().min(0).optional(),
+              inputCacheMissUsdPerMillion: z.number().min(0).optional(),
+              outputUsdPerMillion: z.number().min(0).optional(),
+              longContextThresholdTokens: z.number().int().min(1).optional(),
+              inputUsdPerMillionLong: z.number().min(0).optional(),
+              outputUsdPerMillionLong: z.number().min(0).optional()
+            })
+            .refine(
+              (price) => {
+                const hasAnyLong =
+                  price.longContextThresholdTokens !== undefined ||
+                  price.inputUsdPerMillionLong !== undefined ||
+                  price.outputUsdPerMillionLong !== undefined;
+                if (!hasAnyLong) return true;
+                return (
+                  price.longContextThresholdTokens !== undefined &&
+                  price.inputUsdPerMillion !== undefined &&
+                  price.outputUsdPerMillion !== undefined &&
+                  price.inputUsdPerMillionLong !== undefined &&
+                  price.outputUsdPerMillionLong !== undefined
+                );
+              },
+              { message: "Long-context pricing requires longContextThresholdTokens and the full flat/long input/output rate set together." }
+            )
         )
         .optional()
     })

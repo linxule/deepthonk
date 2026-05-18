@@ -236,6 +236,7 @@ export async function serveMcp(options: { transport: "stdio" | "http"; port?: nu
 }
 
 async function serveHttp(port: number): Promise<void> {
+  const allowedHosts = [`127.0.0.1:${port}`, `localhost:${port}`];
   const httpServer = createServer(async (req, res) => {
     if (req.url !== "/mcp") {
       res.writeHead(404, { "content-type": "application/json" });
@@ -251,7 +252,13 @@ async function serveHttp(port: number): Promise<void> {
     try {
       const body = await readJsonBody(req);
       const server = createDeepThonkMcpServer();
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        // CVE-2025-66414 / GHSA-w48q-cv73-mx4w: SDK ships with protection OFF.
+        // Loopback bind blocks remote attackers; DNS rebinding still bypasses it via the browser.
+        enableDnsRebindingProtection: true,
+        allowedHosts
+      });
       res.on("close", () => {
         void transport.close();
         void server.close();

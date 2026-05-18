@@ -1,8 +1,25 @@
 {
-  "name": "@deepthonk/cli",
+  "name": "deepthonk",
   "version": "0.1.0",
-  "description": "DeepThonk command-line interface and MCP server launcher.",
+  "description": "Provider-neutral OpenDeepThink CLI and MCP server. Population-based reasoning via pairwise judging and Bradley-Terry ranking.",
   "license": "MIT",
+  "author": "Xule Lin",
+  "homepage": "https://github.com/linxule/deepthonk#readme",
+  "bugs": {
+    "url": "https://github.com/linxule/deepthonk/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "opendeepthink",
+    "reasoning",
+    "bradley-terry",
+    "test-time-compute",
+    "deepseek",
+    "cli",
+    "llm",
+    "agent"
+  ],
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,13 +35,18 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/xulelin/deepthonk.git",
+    "url": "https://github.com/linxule/deepthonk.git",
     "directory": "packages/cli"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "deepthonk": "tsx src/index.ts"
+    "deepthonk": "tsx src/index.ts",
+    "prepack": "cp ../../README.md ./README.md && cp ../../LICENSE ./LICENSE",
+    "postpack": "rm -f ./README.md ./LICENSE"
   },
   "dependencies": {
     "@deepthonk/core": "workspace:*",

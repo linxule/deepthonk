@@ -39,10 +39,10 @@ export const toolNames = [
 
 export const planArgsSchema = z.object({
   profile: z.enum(["quick", "balanced", "paper"]).default("quick"),
-  n: z.number().int().optional(),
-  k: z.number().int().optional(),
-  t: z.number().int().optional(),
-  m: z.number().int().optional()
+  n: z.number().int().min(2).optional(),
+  k: z.number().int().min(1).optional(),
+  t: z.number().int().min(0).optional(),
+  m: z.number().int().min(1).optional()
 });
 
 const providerNameSchema = z
@@ -57,6 +57,7 @@ export const runArgsSchema = z.object({
   rubric: z.string().optional().describe("Optional judging rubric text."),
   config_path: z.string().optional().describe("Optional DeepThonk YAML config path, such as ~/.config/deepthonk/config.yaml."),
   profile: z.enum(["quick", "balanced", "paper"]).default("quick").describe("Run profile. quick is safest for smoke tests; paper plans 285 calls."),
+  prompt_style: z.enum(["general", "paper-programming"]).optional().describe("Prompt template style. Defaults to paper-programming for the paper profile, general otherwise."),
   provider: providerNameSchema,
   base_url: z.string().optional().describe("OpenAI-compatible base URL, ending at /v1."),
   api_key_env: z.string().optional().describe("Environment variable that contains the API key."),
@@ -70,7 +71,26 @@ export const runArgsSchema = z.object({
   max_input_tokens: z.number().int().optional().describe("Maximum recorded input tokens before the run stops at a phase boundary."),
   max_output_tokens: z.number().int().optional().describe("Maximum recorded output tokens before the run stops at a phase boundary."),
   max_usd: z.number().optional().describe("Maximum estimated USD spend; requires matching budget.prices in config."),
-  request_timeout_ms: z.number().int().optional().describe("Per-request provider timeout in milliseconds.")
+  request_timeout_ms: z.number().int().optional().describe("Per-request provider timeout in milliseconds."),
+  n: z.number().int().min(2).optional().describe("Population size override. Defaults to the profile's n."),
+  k: z.number().int().min(1).optional().describe("Comparisons per candidate per mutation-generation round."),
+  t: z.number().int().min(0).optional().describe("Number of mutation generations (t=0 disables mutation rounds)."),
+  m: z.number().int().min(1).optional().describe("Comparisons per candidate in the final dense ranking round. Mutation count per generation is n - ceil(n/4), not m."),
+  lambda: z.number().min(0).optional().describe("Bradley-Terry L2 regularization. Defaults to 0.01."),
+  sample_temperature: z.number().min(0).optional().describe("Temperature for initial candidate generation."),
+  mutate_temperature: z.number().min(0).optional().describe("Temperature for critique-guided mutation."),
+  judge_temperature: z.number().min(0).optional().describe("Temperature for pairwise judging."),
+  concurrency: z.object({
+    generate: z.number().int().min(1).optional(),
+    judge: z.number().int().min(1).optional(),
+    mutate: z.number().int().min(1).optional()
+  }).optional().describe("Per-phase concurrency overrides."),
+  prompts: z.object({
+    generate: z.object({ system: z.string().optional(), user: z.string().optional() }).optional(),
+    compare: z.object({ system: z.string().optional(), user: z.string().optional() }).optional(),
+    mutate: z.object({ system: z.string().optional(), user: z.string().optional() }).optional(),
+    finalize: z.object({ system: z.string().optional(), user: z.string().optional() }).optional()
+  }).optional().describe("Optional per-phase prompt template overrides. Templates use {task}, {rubric}, {candidate}, {candidateA}, {candidateB}, {critique} placeholders. Use {{ and }} to escape literal braces. See docs/customization.md for the variable contract per phase.")
 });
 
 export const jobArgsSchema = z.object({
@@ -214,27 +234,35 @@ export async function deepthonkStart(argsInput: unknown): Promise<Record<string,
     shouldCancel: () => isRunCancelRequested(runConfig.runDir)
   })
     .then(async (result) => {
-      await recordRunResource(result.runId, result.runDir);
+      try {
+        await recordRunResource(result.runId, result.runDir);
+      } catch (writeErr) {
+        process.stderr.write(`deepthonk: failed to record run resource: ${(writeErr as Error).message}\n`);
+      }
     })
     .catch(async (error) => {
-      const existing = await readRunStatus(runConfig.runDir);
-      if (existing && existing.state !== "pending") return;
-      const serialized = serializeToolError(error, runConfig.runDir);
-      await new TraceStore(runConfig.runDir).writeStatus({
-        job_id: jobId,
-        run_dir: runConfig.runDir,
-        state: "failed",
-        phase: "failed",
-        usage: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-        started_at: now,
-        updated_at: new Date().toISOString(),
-        error: {
-          code: String(serialized.code),
-          message: String(serialized.message),
-          retryable: Boolean(serialized.retryable),
-          fix: typeof serialized.fix === "string" ? serialized.fix : undefined
-        }
-      });
+      try {
+        const existing = await readRunStatus(runConfig.runDir);
+        if (existing && existing.state !== "pending") return;
+        const serialized = serializeToolError(error, runConfig.runDir);
+        await new TraceStore(runConfig.runDir).writeStatus({
+          job_id: jobId,
+          run_dir: runConfig.runDir,
+          state: "failed",
+          phase: "failed",
+          usage: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          started_at: now,
+          updated_at: new Date().toISOString(),
+          error: {
+            code: String(serialized.code),
+            message: String(serialized.message),
+            retryable: Boolean(serialized.retryable),
+            fix: typeof serialized.fix === "string" ? serialized.fix : undefined
+          }
+        });
+      } catch (writeErr) {
+        process.stderr.write(`deepthonk: failed to persist failure status: ${(writeErr as Error).message}\n`);
+      }
     });
   return {
     job_id: jobId,
@@ -314,15 +342,18 @@ async function resolveMcpRun(argsInput: unknown): Promise<{ runConfig: Parameter
   const args = runArgsSchema.parse(argsInput);
   const config = await readMcpConfig(args.config_path);
   const profileName = (raw.profile ?? config.profile ?? args.profile) as BuiltInProfileName;
-  const profile = getProfile(profileName);
+  const baseProfile = getProfile(profileName);
+  const profile = mergeProfileOverrides(baseProfile, config.algorithm, args);
   const providerConfig = resolveMcpProviderConfig(args, raw, config);
   const models = providerConfig.models;
   const runDir = args.run_dir ?? `runs/mcp-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const promptOverrides = mergePromptOverrides(config.prompts, args.prompts);
   return {
     runConfig: {
       task: args.task,
       rubric: args.rubric,
-      promptStyle: config.prompt_style ?? (profileName === "paper" ? "paper-programming" : "general"),
+      promptStyle: args.prompt_style ?? config.prompt_style ?? (profileName === "paper" ? "paper-programming" : "general"),
+      promptOverrides,
       profile,
       runDir,
       seed: args.seed,
@@ -332,9 +363,9 @@ async function resolveMcpRun(argsInput: unknown): Promise<{ runConfig: Parameter
       judgeModel: models.judge,
       finalizerModel: models.finalizer,
       concurrency: {
-        generate: config.concurrency?.generate ?? profile.n,
-        judge: config.concurrency?.judge ?? Math.max(1, (profile.n * Math.max(profile.k, profile.m)) / 2),
-        mutate: config.concurrency?.mutate ?? profile.n - Math.floor(profile.n / 4)
+        generate: args.concurrency?.generate ?? config.concurrency?.generate ?? profile.n,
+        judge: args.concurrency?.judge ?? config.concurrency?.judge ?? Math.max(1, (profile.n * Math.max(profile.k, profile.m)) / 2),
+        mutate: args.concurrency?.mutate ?? config.concurrency?.mutate ?? profile.n - Math.floor(profile.n / 4)
       },
       retry: {
         httpRetries: config.retry?.httpRetries ?? 2,
@@ -450,6 +481,57 @@ interface RawMcpConfig {
   budget?: Parameters<typeof runDeepThonk>[0]["budget"];
   output?: Partial<Parameters<typeof runDeepThonk>[0]["output"]>;
   prompt_style?: Parameters<typeof runDeepThonk>[0]["promptStyle"];
+  algorithm?: McpAlgorithmOverrides;
+  prompts?: McpPromptOverrides;
+}
+
+interface McpPromptOverrides {
+  generate?: { system?: string; user?: string };
+  compare?: { system?: string; user?: string };
+  mutate?: { system?: string; user?: string };
+  finalize?: { system?: string; user?: string };
+}
+
+function mergePromptOverrides(
+  fileOverrides: McpPromptOverrides | undefined,
+  argOverrides: z.infer<typeof runArgsSchema>["prompts"]
+): Parameters<typeof runDeepThonk>[0]["promptOverrides"] {
+  if (!fileOverrides && !argOverrides) return undefined;
+  const merged: McpPromptOverrides = { ...(fileOverrides ?? {}) };
+  if (argOverrides) {
+    for (const phase of ["generate", "compare", "mutate", "finalize"] as const) {
+      if (argOverrides[phase]) merged[phase] = { ...(merged[phase] ?? {}), ...argOverrides[phase] };
+    }
+  }
+  return Object.keys(merged).length ? merged : undefined;
+}
+
+interface McpAlgorithmOverrides {
+  n?: number;
+  k?: number;
+  t?: number;
+  m?: number;
+  lambda?: number;
+  sample_temperature?: number;
+  mutate_temperature?: number;
+  judge_temperature?: number;
+}
+
+function mergeProfileOverrides(
+  base: Parameters<typeof runDeepThonk>[0]["profile"],
+  fileOverrides: McpAlgorithmOverrides | undefined,
+  args: z.infer<typeof runArgsSchema>
+): Parameters<typeof runDeepThonk>[0]["profile"] {
+  return {
+    n: args.n ?? fileOverrides?.n ?? base.n,
+    k: args.k ?? fileOverrides?.k ?? base.k,
+    t: args.t ?? fileOverrides?.t ?? base.t,
+    m: args.m ?? fileOverrides?.m ?? base.m,
+    lambda: args.lambda ?? fileOverrides?.lambda ?? base.lambda,
+    sampleTemperature: args.sample_temperature ?? fileOverrides?.sample_temperature ?? base.sampleTemperature,
+    mutateTemperature: args.mutate_temperature ?? fileOverrides?.mutate_temperature ?? base.mutateTemperature,
+    judgeTemperature: args.judge_temperature ?? fileOverrides?.judge_temperature ?? base.judgeTemperature
+  };
 }
 
 async function readMcpConfig(path?: string): Promise<RawMcpConfig> {

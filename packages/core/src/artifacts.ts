@@ -7,6 +7,7 @@ export const runArtifactFiles = {
   candidates: "candidates.jsonl",
   comparisons: "comparisons.jsonl",
   scores: "scores.jsonl",
+  usage: "usage.jsonl",
   trace: "events.jsonl",
   final: "artifacts/final.txt",
   winner: "artifacts/winner.txt",

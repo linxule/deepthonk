@@ -17,7 +17,7 @@ providers:
 models:
   generator: openrouter/auto
   mutator: openrouter/auto
-  judge: deepseek-v4-pro
+  judge: openrouter/auto  # overridden by providers.judge above; here only as a fallback if that role override is removed
 concurrency:
   generate: 8
   judge: 12

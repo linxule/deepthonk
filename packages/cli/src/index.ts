@@ -11,6 +11,10 @@ import { registerRun } from "./commands/run.js";
 import { registerServeMcp } from "./commands/serveMcp.js";
 import { registerSetup } from "./commands/setup.js";
 
+process.on("unhandledRejection", (reason) => {
+  process.stderr.write(`deepthonk unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}\n`);
+});
+
 const program = new Command();
 program.name("deepthonk").description("Thonk harder, not richer.").version("0.1.0").option("--json-errors", "Print machine-readable errors to stderr.");
 

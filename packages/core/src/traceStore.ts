@@ -2,11 +2,15 @@ import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runArtifactFiles, traceJsonlFiles } from "./artifacts.js";
 import { TraceError } from "./errors.js";
-import type { RunStatus } from "./lifecycle.js";
+import type { RunStatus, UsageRecord } from "./lifecycle.js";
 import type { BtScore, Candidate, Comparison, RunConfig } from "./schemas.js";
 
 export class TraceStore {
   readonly runDir: string;
+  // Single-writer queue: every appendJsonl chains onto this promise so concurrent
+  // writes (e.g. from pLimit closures writing candidates/comparisons as each
+  // call completes) cannot interleave on disk.
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(runDir: string) {
     this.runDir = runDir;
@@ -50,6 +54,10 @@ export class TraceStore {
     await this.writeJson(runArtifactFiles.status, status);
   }
 
+  async writeUsage(record: UsageRecord): Promise<void> {
+    await this.appendJsonl(runArtifactFiles.usage, record);
+  }
+
   async readSummary(): Promise<Record<string, unknown>> {
     return JSON.parse(await readFile(join(this.runDir, runArtifactFiles.summary), "utf8")) as Record<string, unknown>;
   }
@@ -72,7 +80,15 @@ export class TraceStore {
 
   private async appendJsonl(fileName: string, value: unknown): Promise<void> {
     await mkdir(this.runDir, { recursive: true });
-    await writeFile(join(this.runDir, fileName), `${JSON.stringify(value)}\n`, { encoding: "utf8", flag: "a" });
+    const next = this.writeQueue.then(() =>
+      writeFile(join(this.runDir, fileName), `${JSON.stringify(value)}\n`, { encoding: "utf8", flag: "a" })
+    );
+    // Keep the queue alive even if one write rejects, so subsequent appends are not blocked.
+    this.writeQueue = next.then(
+      () => undefined,
+      () => undefined
+    );
+    await next;
   }
 
   private async writeJson(fileName: string, value: unknown): Promise<void> {

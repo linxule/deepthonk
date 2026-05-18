@@ -79,3 +79,35 @@ export async function isRunCancelRequested(runDir: string): Promise<boolean> {
 export function emptyUsage(): BudgetUsage {
   return { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 }
+
+export interface UsageDelta {
+  calls: number;
+  inputTokens: number;
+  inputCacheHitTokens?: number;
+  inputCacheMissTokens?: number;
+  outputTokens: number;
+  totalTokens: number;
+  inputUsd?: number;
+  outputUsd?: number;
+  usd?: number;
+}
+
+export type CallRole = "generator" | "judge" | "mutator" | "finalizer";
+
+export interface UsageRecord {
+  ts: string;
+  phase: string;
+  role: CallRole;
+  provider?: string;
+  model?: string;
+  input_tokens: number;
+  input_cache_hit_tokens?: number;
+  input_cache_miss_tokens?: number;
+  output_tokens: number;
+  total_tokens: number;
+  input_usd?: number;
+  output_usd?: number;
+  total_usd?: number;
+  latency_ms?: number;
+  retry_count?: number;
+}

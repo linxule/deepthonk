@@ -76,4 +76,47 @@ describe("planBudget", () => {
 
     expect(tracker.usage.usd).toBeCloseTo((40 * 0.0028 + 60 * 0.14 + 10 * 0.28) / 1_000_000);
   });
+
+  it("applies long-context input and output rates above the threshold", () => {
+    const baseConfig: Omit<RunConfig, "budget"> = {
+      task: "toy",
+      profile: builtInProfiles.quick,
+      runDir: "runs/test",
+      seed: 1,
+      provider: "gemini",
+      generatorModel: "gemini-3.1-pro-preview",
+      mutatorModel: "gemini-3.1-pro-preview",
+      judgeModel: "gemini-3.1-pro-preview",
+      concurrency: { generate: 1, judge: 1, mutate: 1 },
+      retry: { httpRetries: 0, invalidJsonRetries: 0 },
+      output: { includeRawModelOutputs: false, includePrompts: false }
+    };
+    const price = {
+      provider: "gemini",
+      model: "gemini-3.1-pro-preview",
+      inputUsdPerMillion: 2,
+      outputUsdPerMillion: 12,
+      longContextThresholdTokens: 200_000,
+      inputUsdPerMillionLong: 4,
+      outputUsdPerMillionLong: 18
+    };
+
+    const shortTracker = new BudgetTracker({ ...baseConfig, budget: { prices: [price] } });
+    shortTracker.record({
+      text: "x",
+      provider: "gemini",
+      model: "gemini-3.1-pro-preview",
+      usage: { inputTokens: 100_000, outputTokens: 1_000, totalTokens: 101_000 }
+    });
+    expect(shortTracker.usage.usd).toBeCloseTo((100_000 * 2 + 1_000 * 12) / 1_000_000);
+
+    const longTracker = new BudgetTracker({ ...baseConfig, budget: { prices: [price] } });
+    longTracker.record({
+      text: "x",
+      provider: "gemini",
+      model: "gemini-3.1-pro-preview",
+      usage: { inputTokens: 250_000, outputTokens: 1_000, totalTokens: 251_000 }
+    });
+    expect(longTracker.usage.usd).toBeCloseTo((250_000 * 4 + 1_000 * 18) / 1_000_000);
+  });
 });

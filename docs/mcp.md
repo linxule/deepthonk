@@ -119,3 +119,9 @@ deepthonk serve-mcp --transport http --port 3333
 ```
 
 The endpoint is `http://127.0.0.1:3333/mcp`.
+
+## Security defaults
+
+The HTTP transport binds to `127.0.0.1` only and runs with the MCP SDK's DNS rebinding protection enabled, with `Host` validated against `127.0.0.1:<port>` and `localhost:<port>`. Loopback bind alone does not protect against browser-pivoted attackers (see CVE-2025-66414 / GHSA-w48q-cv73-mx4w), so do not remove the rebinding guard when adding new transport features. The HTTP transport currently has no authentication — treat it as trusted-local-host-only and prefer `stdio` for MCP host integration.
+
+API keys are read from `process.env` and never logged or written into trace files. The background `deepthonk.start` runner wraps its failure-path file writes so a transient I/O error cannot surface as an unhandled rejection in the server process.

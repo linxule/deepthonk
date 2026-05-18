@@ -129,7 +129,7 @@ function fitLbfgs(scores: number[], outcomes: Outcome[], lambda: number): void {
     currentLoss = acceptedLoss;
     currentGrad = nextGrad;
   }
-  center(scores);
+  zScore(scores);
 }
 
 function lbfgsDirection(grad: number[], sHistory: number[][], yHistory: number[][], rhoHistory: number[]): number[] {
@@ -189,6 +189,26 @@ function softplus(value: number): number {
 function center(values: number[]): void {
   const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
   for (let i = 0; i < values.length; i += 1) values[i] -= mean;
+}
+
+// Match the reference Python implementation's score scaling: subtract the mean
+// and divide by stddev (z-score). Rank is invariant under this affine transform.
+// Note: the OpenDeepThink paper (Zhou et al. 2026) specifies raw L2-regularized
+// MLE; z-scoring is a reference-repo logging convention, not a paper-specified
+// step. We adopt it so logged `score:` values are directly comparable to the
+// reference's outputs.
+function zScore(values: number[]): void {
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  let variance = 0;
+  for (let i = 0; i < values.length; i += 1) {
+    const centered = values[i] - mean;
+    values[i] = centered;
+    variance += centered * centered;
+  }
+  variance /= values.length;
+  const std = Math.sqrt(variance);
+  if (std <= 1e-6) return;
+  for (let i = 0; i < values.length; i += 1) values[i] /= std;
 }
 
 function dot(left: number[], right: number[]): number {

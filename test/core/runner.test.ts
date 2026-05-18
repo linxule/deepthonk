@@ -68,9 +68,20 @@ describe("runDeepThonk", () => {
       runDeepThonk(config(secondDir), new DelayedFakeDriver())
     ]);
     expect(first.winner.id).toBe(second.winner.id);
-    const firstComparisons = (await readFile(join(firstDir, "comparisons.jsonl"), "utf8")).replaceAll(first.runId, "run");
-    const secondComparisons = (await readFile(join(secondDir, "comparisons.jsonl"), "utf8")).replaceAll(second.runId, "run");
-    expect(firstComparisons).toBe(secondComparisons);
+    // Comparisons stream to disk in completion order, which varies across runs with the same seed
+    // when provider responses resolve out of order. The deterministic invariant is the *set* of
+    // recorded comparisons keyed by their seeded IDs, so compare sorted by ID with the run ID
+    // tokens normalised.
+    const parseJsonl = async (dir: string, runId: string): Promise<unknown[]> =>
+      (await readFile(join(dir, "comparisons.jsonl"), "utf8"))
+        .replaceAll(runId, "run")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { id: string })
+        .sort((left, right) => left.id.localeCompare(right.id));
+    const firstComparisons = await parseJsonl(firstDir, first.runId);
+    const secondComparisons = await parseJsonl(secondDir, second.runId);
+    expect(firstComparisons).toEqual(secondComparisons);
   });
 
   it("refuses to append a second run into an existing trace directory", async () => {

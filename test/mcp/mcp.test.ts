@@ -123,6 +123,77 @@ describe("MCP helpers", () => {
     expect(Object.keys(statusOutputSchema.shape).length).toBeGreaterThan(0);
   });
 
+  it("accepts inline algorithm-shape overrides via deepthonk.run", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-overrides-"));
+    const result = await deepthonkRun({
+      task: "toy",
+      profile: "paper",
+      provider: "fake",
+      n: 8,
+      k: 2,
+      t: 1,
+      m: 4,
+      lambda: 0.05,
+      sample_temperature: 1.2,
+      run_dir: runDir
+    });
+    expect(result.winner_id).toBeTruthy();
+    const config = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as { profile: { n: number; k: number; t: number; m: number; lambda: number; sampleTemperature: number } };
+    expect(config.profile.n).toBe(8);
+    expect(config.profile.k).toBe(2);
+    expect(config.profile.t).toBe(1);
+    expect(config.profile.m).toBe(4);
+    expect(config.profile.lambda).toBe(0.05);
+    expect(config.profile.sampleTemperature).toBe(1.2);
+  });
+
+  it("accepts inline prompt overrides via deepthonk.run", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-prompts-"));
+    await deepthonkRun({
+      task: "draft a counter-offer clause",
+      profile: "quick",
+      provider: "fake",
+      run_dir: runDir,
+      prompts: {
+        generate: {
+          system: "You are an experienced contracts attorney.",
+          user: "TASK:\n{task}\n\nProduce one drafted clause."
+        }
+      }
+    });
+    // Override should be recorded in the stored config
+    const config = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as {
+      promptOverrides?: { generate?: { system?: string } };
+    };
+    expect(config.promptOverrides?.generate?.system).toContain("contracts attorney");
+  });
+
+  it("accepts inline prompt_style override via deepthonk.run", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-style-"));
+    await deepthonkRun({
+      task: "toy",
+      profile: "quick",
+      provider: "fake",
+      prompt_style: "paper-programming",
+      run_dir: runDir
+    });
+    const config = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as { promptStyle: string };
+    expect(config.promptStyle).toBe("paper-programming");
+  });
+
+  it("rejects unknown variables in prompt overrides at run-start", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-bad-vars-"));
+    await expect(
+      deepthonkRun({
+        task: "toy",
+        profile: "quick",
+        provider: "fake",
+        run_dir: runDir,
+        prompts: { generate: { user: "Try: {candiate}" } }
+      })
+    ).rejects.toThrow(/Unknown template variable.*candiate/);
+  });
+
   it("passes MCP finalizer model through to the shared runner", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-finalizer-"));
     const result = await deepthonkRun({

@@ -68,10 +68,17 @@ export function registerSetup(program: Command): void {
       await writeFile(configPath, yaml, "utf8");
 
       let envMessage = process.env[apiKeyEnv] ? `Detected ${apiKeyEnv} in the current environment.` : `Set ${apiKeyEnv} before paid runs.`;
+      if (options.apiKey && !options.apiKeyStdin && !options.apiKeyFile) {
+        process.stderr.write(
+          "warning: --api-key exposes the secret via process arguments and shell history. Prefer --api-key-stdin or --api-key-file.\n"
+        );
+      }
       const apiKey = await resolveApiKey(options);
       if (apiKey) {
         const envPath = resolveCliPath(options.keyFile);
         await mkdir(dirname(envPath), { recursive: true });
+        // writeFile mode is only honored at file *creation* on POSIX; the explicit chmod handles
+        // the case where the file pre-existed with looser permissions. Do not remove either.
         await writeFile(envPath, `export ${apiKeyEnv}=${shellQuote(apiKey)}\n`, { encoding: "utf8", mode: 0o600 });
         await chmod(envPath, 0o600);
         envMessage = `Stored ${apiKeyEnv} in ${envPath}.`;

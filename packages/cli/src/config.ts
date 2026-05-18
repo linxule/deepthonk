@@ -37,6 +37,26 @@ interface RawConfigFile {
   budget?: RunConfig["budget"];
   output?: Partial<RunConfig["output"]>;
   prompt_style?: RunConfig["promptStyle"];
+  algorithm?: AlgorithmOverrides;
+  prompts?: PromptOverridesFile;
+}
+
+interface AlgorithmOverrides {
+  n?: number;
+  k?: number;
+  t?: number;
+  m?: number;
+  lambda?: number;
+  sample_temperature?: number;
+  mutate_temperature?: number;
+  judge_temperature?: number;
+}
+
+interface PromptOverridesFile {
+  generate?: { system?: string; user?: string };
+  compare?: { system?: string; user?: string };
+  mutate?: { system?: string; user?: string };
+  finalize?: { system?: string; user?: string };
 }
 
 interface RawRoleProviderConfig {
@@ -52,7 +72,7 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
   const configPath = resolveConfigPath(options);
   const fileConfig = configPath ? await readConfig(configPath) : {};
   const profileName = builtInProfileName(options.profile ?? fileConfig.profile ?? "quick");
-  const profile = getProfile(profileName);
+  const profile = mergeAlgorithmOverrides(getProfile(profileName), fileConfig.algorithm, options);
   const task = await readPathOrInline(String(options.task ?? ""));
   const rubric = options.rubric ? await readPathOrInline(String(options.rubric)) : undefined;
   const provider = String(options.provider ?? fileConfig.provider ?? "fake");
@@ -82,10 +102,15 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
     maxOutputTokens: numberOption(options.maxOutputTokens),
     maxUsd: numberOption(options.maxUsd)
   }, defaultPricesForProviderConfig(providerConfig));
+  const promptOverrides = await loadPromptOverrides(options, fileConfig);
   const runConfig: RunConfig = {
     task,
     rubric,
-    promptStyle: fileConfig.prompt_style ?? (profileName === "paper" ? "paper-programming" : "general"),
+    promptStyle:
+      (stringOption(options.promptStyle) as RunConfig["promptStyle"] | undefined) ??
+      fileConfig.prompt_style ??
+      (profileName === "paper" ? "paper-programming" : "general"),
+    promptOverrides,
     profile,
     runDir: resolveCliPath(String(options.out ?? `runs/${new Date().toISOString().replace(/[:.]/g, "-")}`)),
     seed: numberOption(options.seed) ?? 1,
@@ -141,17 +166,54 @@ export async function resolveProviderOnlyConfig(options: Record<string, unknown>
 }
 
 export function profileFromOptions(options: Record<string, unknown>): Profile {
-  if (options.n || options.k || options.t || options.m) {
-    const base = builtInProfiles[builtInProfileName(options.profile ?? "quick")];
-    return {
-      ...base,
-      n: numberOption(options.n) ?? base.n,
-      k: numberOption(options.k) ?? base.k,
-      t: numberOption(options.t) ?? base.t,
-      m: numberOption(options.m) ?? base.m
-    };
+  const base = getProfile(builtInProfileName(options.profile ?? "quick"));
+  return mergeAlgorithmOverrides(base, undefined, options);
+}
+
+async function loadPromptOverrides(
+  options: Record<string, unknown>,
+  fileConfig: RawConfigFile
+): Promise<RunConfig["promptOverrides"]> {
+  let fromFlag: PromptOverridesFile | undefined;
+  const path = stringOption(options.prompts);
+  if (path) {
+    const resolved = resolveCliPath(path);
+    if (!existsSync(resolved)) {
+      throw new ConfigError(`--prompts file does not exist: ${path}`, {
+        code: "config.prompts_file_missing",
+        retryable: false,
+        fix: "Pass a YAML file path. The file should map phase names to { system, user } templates."
+      });
+    }
+    fromFlag = YAML.parse(await readFile(resolved, "utf8")) as PromptOverridesFile;
   }
-  return getProfile(builtInProfileName(options.profile ?? "quick"));
+  const merged: PromptOverridesFile = { ...(fileConfig.prompts ?? {}) };
+  if (fromFlag) {
+    for (const phase of ["generate", "compare", "mutate", "finalize"] as const) {
+      if (fromFlag[phase]) merged[phase] = { ...(merged[phase] ?? {}), ...fromFlag[phase] };
+    }
+  }
+  return Object.keys(merged).length ? (merged as RunConfig["promptOverrides"]) : undefined;
+}
+
+function mergeAlgorithmOverrides(
+  base: Profile,
+  fileOverrides: AlgorithmOverrides | undefined,
+  cliOptions: Record<string, unknown>
+): Profile {
+  return {
+    n: numberOption(cliOptions.n) ?? fileOverrides?.n ?? base.n,
+    k: numberOption(cliOptions.k) ?? fileOverrides?.k ?? base.k,
+    t: numberOption(cliOptions.t) ?? fileOverrides?.t ?? base.t,
+    m: numberOption(cliOptions.m) ?? fileOverrides?.m ?? base.m,
+    lambda: numberOption(cliOptions.lambda) ?? fileOverrides?.lambda ?? base.lambda,
+    sampleTemperature:
+      numberOption(cliOptions.sampleTemperature) ?? fileOverrides?.sample_temperature ?? base.sampleTemperature,
+    mutateTemperature:
+      numberOption(cliOptions.mutateTemperature) ?? fileOverrides?.mutate_temperature ?? base.mutateTemperature,
+    judgeTemperature:
+      numberOption(cliOptions.judgeTemperature) ?? fileOverrides?.judge_temperature ?? base.judgeTemperature
+  };
 }
 
 export async function readPathOrInline(value: string): Promise<string> {
