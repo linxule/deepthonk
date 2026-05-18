@@ -74,7 +74,7 @@ describe("provider registry", () => {
 
     expect(result.provider).toBe("sampling");
     expect(result.model).toBe("host-model");
-    expect(createMessage).toHaveBeenCalledWith(expect.objectContaining({ systemPrompt: "s", temperature: 0 }));
+    expect(createMessage).toHaveBeenCalledWith(expect.objectContaining({ systemPrompt: "s", temperature: 0 }), expect.anything());
   });
 
   it("returns structured errors for unknown providers without a base URL", () => {

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runArtifactFiles } from "./artifacts.js";
 import { ConfigError } from "./errors.js";
@@ -50,6 +50,19 @@ export async function claimRunLock(runDir: string, jobId?: string): Promise<bool
       code: "run.lock_failed",
       retryable: false,
       fix: "Choose a writable run directory."
+    });
+  }
+}
+
+export async function releaseRunLock(runDir: string): Promise<void> {
+  try {
+    await unlink(join(runDir, runArtifactFiles.lock));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new ConfigError(`Could not release run directory lock: ${(error as Error).message}`, {
+      code: "run.lock_release_failed",
+      retryable: false,
+      fix: "Inspect the run directory lock file and permissions."
     });
   }
 }

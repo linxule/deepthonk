@@ -18,7 +18,10 @@ export interface SamplingDriverConfig {
   speedPriority?: number;
   intelligencePriority?: number;
   includeRawOutputs?: boolean;
+  requestTimeoutMs?: number;
 }
+
+const DEFAULT_SAMPLING_TIMEOUT_MS = 60_000;
 
 export type SamplingTransport = (
   params: CreateMessageRequestParamsBase,
@@ -93,15 +96,50 @@ export class SamplingDriver implements ModelDriver {
   }
 
   private async callCreateMessage(params: CreateMessageRequestParamsBase): Promise<CreateMessageResult> {
+    const timeoutMs = this.config.requestTimeoutMs ?? DEFAULT_SAMPLING_TIMEOUT_MS;
     try {
-      return await this.createMessage(params);
+      return await callWithTimeout(this.createMessage, params, timeoutMs);
     } catch (error) {
+      if (error instanceof SamplingTimeoutError) {
+        throw new ProviderError(`MCP Sampling request timed out after ${error.timeoutMs}ms.`, {
+          code: "provider.sampling_timeout",
+          retryable: false,
+          fix: "Increase retry.requestTimeoutMs, switch to a direct provider, or check the MCP host responsiveness. Use 'deepthonk resume <run-dir> --continue' to retry an interrupted run."
+        });
+      }
       throw new ProviderError(`MCP Sampling request failed: ${error instanceof Error ? error.message : String(error)}`, {
         code: "provider.sampling_request_failed",
-        retryable: true,
-        fix: "Retry the run or check the MCP host's sampling provider availability."
+        retryable: false,
+        fix: "The MCP host refused or errored the sampling request. Use 'deepthonk resume <run-dir> --continue' to retry an interrupted run, or switch to a direct provider."
       });
     }
+  }
+}
+
+class SamplingTimeoutError extends Error {
+  constructor(public readonly timeoutMs: number) {
+    super(`MCP Sampling request timed out after ${timeoutMs}ms.`);
+    this.name = "SamplingTimeoutError";
+  }
+}
+
+async function callWithTimeout(
+  fn: SamplingTransport,
+  params: CreateMessageRequestParamsBase,
+  timeoutMs: number
+): Promise<CreateMessageResult> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new SamplingTimeoutError(timeoutMs));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([fn(params, { signal: controller.signal, timeout: timeoutMs }), timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

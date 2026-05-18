@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runArtifactFiles } from "./artifacts.js";
@@ -8,6 +9,8 @@ import { ConfigError } from "./errors.js";
 import type { RunStatus, UsageRecord } from "./lifecycle.js";
 import type { BtScore, Candidate, Comparison, PhaseName, RunConfig } from "./schemas.js";
 import { phaseCompletedEventSchema } from "./schemas.js";
+
+export const pruneSentinelFile = ".prune-in-progress";
 
 export interface ResumeTrace {
   events: Array<Record<string, unknown>>;
@@ -126,11 +129,17 @@ export function toResumePlanStatus(runDir: string, runId: string, plan: Internal
 }
 
 export function pruneTraceToPlan(trace: ResumeTrace, plan: InternalResumePlan): ResumeTrace {
+  const candidates = trace.candidates.filter((candidate) => keepCandidate(candidate, plan.completed));
+  const comparisons = trace.comparisons.filter((comparison) => plan.completed.has(phaseKeyForComparison(comparison)));
+  const scores = trace.scores.filter((score) => plan.completed.has(phaseKeyForScore(score)));
+  const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+  const comparisonIds = new Set(comparisons.map((comparison) => comparison.id));
+
   return {
-    events: trace.events,
-    candidates: trace.candidates.filter((candidate) => keepCandidate(candidate, plan.completed)),
-    comparisons: trace.comparisons.filter((comparison) => plan.completed.has(phaseKeyForComparison(comparison))),
-    scores: trace.scores.filter((score) => plan.completed.has(phaseKeyForScore(score))),
+    events: trace.events.filter((event) => keepEvent(event, plan.completed, candidateIds, comparisonIds)),
+    candidates,
+    comparisons,
+    scores,
     populations: new Map([...trace.populations].filter(([generation]) => keepPopulationGeneration(generation, plan.completed))),
     usage: trace.usage.filter((record) => {
       const key = usagePhaseKey(record.phase);
@@ -239,12 +248,28 @@ export function replayBudgetUsage(config: RunConfig, usage: UsageRecord[]): Budg
 }
 
 export async function persistPrunedTrace(runDir: string, pruned: ResumeTrace): Promise<void> {
-  await Promise.all([
-    writeJsonlAtomic(runDir, runArtifactFiles.candidates, pruned.candidates),
-    writeJsonlAtomic(runDir, runArtifactFiles.comparisons, pruned.comparisons),
-    writeJsonlAtomic(runDir, runArtifactFiles.scores, pruned.scores),
-    writeJsonlAtomic(runDir, runArtifactFiles.usage, pruned.usage)
-  ]);
+  const sentinelPath = join(runDir, pruneSentinelFile);
+  await writeFile(sentinelPath, `${JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() })}\n`, "utf8");
+  const rewrites: Array<readonly [string, unknown[]]> = [
+    [runArtifactFiles.trace, pruned.events],
+    [runArtifactFiles.candidates, pruned.candidates],
+    [runArtifactFiles.comparisons, pruned.comparisons],
+    [runArtifactFiles.scores, pruned.scores],
+    [runArtifactFiles.usage, pruned.usage]
+  ];
+  for (const [fileName, rows] of rewrites) {
+    await writeJsonlAtomic(runDir, fileName, rows);
+  }
+  await unlink(sentinelPath);
+}
+
+export function assertNoPruneInProgress(runDir: string): void {
+  if (!existsSync(join(runDir, pruneSentinelFile))) return;
+  resumeConfigError(
+    "A previous trace prune did not finish; refusing to resume from a partially rewritten trace.",
+    "resume.prune_in_progress",
+    `Inspect ${join(runDir, pruneSentinelFile)} and the JSONL artifacts before retrying.`
+  );
 }
 
 function phaseKey(phase: PhaseName, generation?: number): string {
@@ -300,6 +325,29 @@ function keepCandidate(candidate: Candidate, completed: Set<string>): boolean {
 function keepPopulationGeneration(generation: number, completed: Set<string>): boolean {
   if (generation === 0) return completed.has("initial_generation");
   return completed.has(phaseKey("generation_mutation", generation));
+}
+
+function keepEvent(
+  event: Record<string, unknown>,
+  completed: Set<string>,
+  candidateIds: Set<string>,
+  comparisonIds: Set<string>
+): boolean {
+  const type = event.type;
+  if (typeof type !== "string") return true;
+  if (type.startsWith("candidate.")) {
+    const candidateId = event.candidate_id;
+    return typeof candidateId !== "string" || candidateIds.has(candidateId);
+  }
+  if (type.startsWith("comparison.")) {
+    const comparisonId = event.comparison_id;
+    return typeof comparisonId !== "string" || comparisonIds.has(comparisonId);
+  }
+  if (type === "phase.completed") {
+    const parsed = phaseCompletedEventSchema.safeParse(event);
+    return !parsed.success || completed.has(phaseKey(parsed.data.phase, parsed.data.generation));
+  }
+  return true;
 }
 
 function phaseKeyForComparison(comparison: Comparison): string {
@@ -369,31 +417,27 @@ async function readJson<T>(runDir: string, fileName: string): Promise<T> {
 }
 
 async function readJsonl<T>(runDir: string, fileName: string): Promise<T[]> {
-  let text: string;
-  try {
-    text = await readFile(join(runDir, fileName), "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    resumeConfigError(
-      `Could not read ${fileName}: ${(error as Error).message}`,
-      "resume.trace_read_failed",
-      "Inspect the run directory and file permissions."
-    );
-  }
-  return text
-    .split("\n")
-    .filter((line) => line.trim().length > 0)
-    .map((line, index) => {
-      try {
-        return JSON.parse(line) as T;
-      } catch (error) {
-        resumeConfigError(
-          `Could not parse ${fileName} line ${index + 1}: ${(error as Error).message}`,
-          "resume.trace_parse_failed",
-          "Inspect the run directory for a truncated JSONL write."
-        );
+  const path = join(runDir, fileName);
+  if (!existsSync(path)) return [];
+  const raw = await readFile(path, "utf8");
+  const lines = raw.split("\n").filter((line) => line.length > 0);
+  if (lines.length === 0) return [];
+  const out: T[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    try {
+      out.push(JSON.parse(lines[i]) as T);
+    } catch (err) {
+      if (i === lines.length - 1) {
+        break;
       }
-    });
+      throw resumeConfigError(
+        `Corrupted ${fileName} JSONL at line ${i + 1}: ${(err as Error).message}`,
+        "resume.corrupted_trace",
+        `Inspect ${path}; mid-file parse failures indicate non-recoverable trace corruption.`
+      );
+    }
+  }
+  return out;
 }
 
 async function writeJsonlAtomic(runDir: string, fileName: string, rows: unknown[]): Promise<void> {

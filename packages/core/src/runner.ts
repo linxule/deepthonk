@@ -8,11 +8,22 @@ import { planBudget, validateProfile } from "./budget.js";
 import { BudgetExceededError, CancelledError, ConfigError, DeepThonkError } from "./errors.js";
 import { runArtifactFiles } from "./artifacts.js";
 import { parseJsonObject } from "./json.js";
-import { emptyUsage, type BudgetUsage, type CallRole, type RunLifecycleState, type RunStatus, type UsageDelta, type UsageRecord } from "./lifecycle.js";
+import {
+  claimRunLock,
+  emptyUsage,
+  releaseRunLock,
+  type BudgetUsage,
+  type CallRole,
+  type RunLifecycleState,
+  type RunStatus,
+  type UsageDelta,
+  type UsageRecord
+} from "./lifecycle.js";
 import { makeKRegularPairs, type Pair } from "./pairScheduler.js";
 import { comparePrompt, finalizePrompt, generatePrompt, mutatePrompt } from "./prompts.js";
 import { createRng, type Rng } from "./rng.js";
 import {
+  assertNoPruneInProgress,
   buildPopulationMap,
   buildResumePlan,
   groupComparisons,
@@ -61,6 +72,14 @@ export interface RunControl {
 export interface ResumeDeepThonkOptions {
   dryRun?: boolean;
   provider?: string;
+}
+
+type ProviderRole = "generator" | "mutator" | "judge" | "finalizer";
+
+interface ProviderRouteFingerprint {
+  provider?: string;
+  baseUrl?: string;
+  model?: string;
 }
 
 export interface ResumePlan {
@@ -352,78 +371,86 @@ export async function resumeDeepThonk(
 
   const rawConfig = await readRequiredConfig(runDir);
   const currentVersion = await currentPackageVersion();
-  if (rawConfig.version !== currentVersion) {
+  if (!sameMajorMinor(typeof rawConfig.version === "string" ? rawConfig.version : undefined, currentVersion)) {
     resumeConfigError(
-      `Cannot resume run from version ${String(rawConfig.version ?? "missing")}; current package version is ${currentVersion}.`,
+      `Cannot resume run from version ${String(rawConfig.version ?? "missing")}; current package version is ${currentVersion}. Resume requires matching major.minor.`,
       "resume.version_mismatch",
-      "Start a fresh run with the current DeepThonk version, or resume with the package version that created this trace."
+      "Start a fresh run with the current DeepThonk version, or resume with a package version whose major.minor matches the trace."
     );
   }
+  assertStoredOutputConfigComplete(rawConfig);
   const parsedConfig = runConfigSchema.parse(rawConfig);
   const config: RunConfig = { ...parsedConfig, runDir };
   validateProfile(config.profile);
   enforceBudget(config);
 
-  const runtimeProvider = options.provider ?? providerLabel(driver) ?? config.provider;
-  if (runtimeProvider !== config.provider) {
-    resumeConfigError(
-      `Cannot resume provider ${config.provider} with runtime provider ${runtimeProvider}.`,
-      "resume.provider_mismatch",
-      "Use the same provider configuration that created config.json."
-    );
+  assertResumeProviderMatches(rawConfig, config, driver, options);
+  assertNoPruneInProgress(runDir);
+  const lockRunId = resolveResumeRunId(config, undefined, []);
+  const claimed = await claimRunLock(runDir, lockRunId);
+  if (!claimed) {
+    throw new ConfigError(`Run directory is already claimed: ${runDir}`, {
+      code: "run.directory_locked",
+      retryable: false,
+      fix: "Wait for the active run to finish, or inspect the existing run.lock file."
+    });
   }
 
-  const status = await readOptionalJson<RunStatus>(runDir, runArtifactFiles.status);
-  if ((status?.state === "running" || status?.state === "pending") && isLiveWorker(status.worker_pid)) {
-    resumeConfigError(
-      `Run is still in flight at phase ${status.phase}.`,
-      "resume.in_flight",
-      "Wait for the worker to finish, or cancel/stop it before resuming."
-    );
+  try {
+    const status = await readOptionalJson<RunStatus>(runDir, runArtifactFiles.status);
+    if ((status?.state === "running" || status?.state === "pending") && isLiveWorker(status.worker_pid)) {
+      resumeConfigError(
+        `Run is still in flight at phase ${status.phase}.`,
+        "resume.in_flight",
+        "Wait for the worker to finish, or cancel/stop it before resuming."
+      );
+    }
+
+    const trace = await readResumeTrace(runDir);
+    const runId = resolveResumeRunId(config, status, trace.events);
+    const plan = buildResumePlan(config, trace.events);
+    if (plan.nextPhase.phase === "summary") {
+      resumeConfigError(
+        "Trace says finalizing completed, but summary.json is missing.",
+        "resume.inconsistent_trace",
+        "Inspect the run directory and restore summary.json, or start a fresh run."
+      );
+    }
+
+    const planStatus = toResumePlanStatus(runDir, runId, plan);
+    if (options.dryRun) return planStatus;
+
+    const pruned = pruneTraceToPlan(trace, plan);
+    const populationByGeneration = buildPopulationMap(config, pruned.populations, pruned.candidates, plan);
+    const comparisonsByGeneration = groupComparisons(pruned.comparisons);
+    const scoresByGeneration = reconstructScores(config, populationByGeneration, comparisonsByGeneration, pruned.scores, plan);
+    const tracker = replayBudgetUsage(config, pruned.usage);
+    const startedAt = status?.started_at ?? new Date().toISOString();
+    await new TraceStore(runDir).writeStatus({
+      run_id: runId,
+      run_dir: runDir,
+      state: "running",
+      phase: "resume_planning",
+      usage: cloneUsage(tracker.usage),
+      started_at: startedAt,
+      worker_pid: process.pid,
+      updated_at: new Date().toISOString()
+    });
+    await persistPrunedTrace(runDir, pruned);
+
+    return await runDeepThonk(config, driver, {}, {
+      runId,
+      startedAt,
+      completed: plan.completed,
+      populationByGeneration,
+      comparisonsByGeneration,
+      scoresByGeneration,
+      tracker,
+      nextPhase: plan.nextPhase
+    });
+  } finally {
+    await releaseRunLock(runDir);
   }
-
-  const trace = await readResumeTrace(runDir);
-  const runId = resolveResumeRunId(config, status, trace.events);
-  const plan = buildResumePlan(config, trace.events);
-  if (plan.nextPhase.phase === "summary") {
-    resumeConfigError(
-      "Trace says finalizing completed, but summary.json is missing.",
-      "resume.inconsistent_trace",
-      "Inspect the run directory and restore summary.json, or start a fresh run."
-    );
-  }
-
-  const planStatus = toResumePlanStatus(runDir, runId, plan);
-  if (options.dryRun) return planStatus;
-
-  const pruned = pruneTraceToPlan(trace, plan);
-  const populationByGeneration = buildPopulationMap(config, pruned.populations, pruned.candidates, plan);
-  const comparisonsByGeneration = groupComparisons(pruned.comparisons);
-  const scoresByGeneration = reconstructScores(config, populationByGeneration, comparisonsByGeneration, pruned.scores, plan);
-  const tracker = replayBudgetUsage(config, pruned.usage);
-  const startedAt = status?.started_at ?? new Date().toISOString();
-  await new TraceStore(runDir).writeStatus({
-    run_id: runId,
-    run_dir: runDir,
-    state: "running",
-    phase: "resume_planning",
-    usage: cloneUsage(tracker.usage),
-    started_at: startedAt,
-    worker_pid: process.pid,
-    updated_at: new Date().toISOString()
-  });
-  await persistPrunedTrace(runDir, pruned);
-
-  return runDeepThonk(config, driver, {}, {
-    runId,
-    startedAt,
-    completed: plan.completed,
-    populationByGeneration,
-    comparisonsByGeneration,
-    scoresByGeneration,
-    tracker,
-    nextPhase: plan.nextPhase
-  });
 }
 
 async function markPhaseCompleted(trace: TraceStore, phase: PhaseName, generation?: number): Promise<void> {
@@ -493,15 +520,129 @@ function resumePhaseKey(phase: PhaseName, generation?: number): string {
 }
 
 function providerLabel(driver: ModelDriver): string | undefined {
-  const value = driver as { provider?: unknown; providerName?: unknown; config?: { provider?: unknown } };
+  const value = driver as { provider?: unknown; providerName?: unknown; config?: { provider?: unknown }; baseDriver?: ModelDriver };
   if (typeof value.provider === "string") return value.provider;
   if (typeof value.providerName === "string") return value.providerName;
   if (typeof value.config?.provider === "string") return value.config.provider;
+  if (value.baseDriver) return providerLabel(value.baseDriver);
   const constructorName = driver.constructor?.name;
   if (constructorName === "FakeDriver") return "fake";
   if (constructorName === "SamplingDriver") return "sampling";
   if (constructorName === "OpenAiCompatibleDriver") return "openai-compatible";
   return undefined;
+}
+
+function assertStoredOutputConfigComplete(rawConfig: Record<string, unknown>): void {
+  const output = rawConfig.output;
+  if (!isRecord(output) || typeof output.includeRawModelOutputs !== "boolean" || typeof output.includePrompts !== "boolean") {
+    resumeConfigError(
+      "Stored config.json is missing the complete output block required for deterministic resume.",
+      "resume.config_incomplete",
+      "Restore output.includeRawModelOutputs and output.includePrompts, or start a fresh run."
+    );
+  }
+}
+
+function assertResumeProviderMatches(
+  rawConfig: Record<string, unknown>,
+  config: RunConfig,
+  driver: ModelDriver,
+  options: ResumeDeepThonkOptions
+): void {
+  const runtimeProvider = options.provider ?? providerLabel(driver) ?? config.provider;
+  if (runtimeProvider !== config.provider) {
+    providerMismatch(`Cannot resume provider ${config.provider} with runtime provider ${runtimeProvider}.`);
+  }
+
+  const expectedRoutes = expectedProviderRoutes(rawConfig, config);
+  const actualRoutes = runtimeProviderRoutes(driver);
+  for (const role of providerRoles) {
+    const expected = expectedRoutes[role];
+    if (!expected) continue;
+    const actual = actualRoutes[role];
+    if (!actual) {
+      providerMismatch(`Cannot resume ${role} route ${routeLabel(expected)} without a matching runtime route.`);
+    }
+    if (expected.provider !== undefined && actual.provider !== expected.provider) {
+      providerMismatch(`Cannot resume ${role} route provider ${expected.provider} with runtime provider ${actual.provider ?? "missing"}.`);
+    }
+    if (expected.baseUrl !== undefined && normalizeBaseUrl(actual.baseUrl) !== normalizeBaseUrl(expected.baseUrl)) {
+      providerMismatch(`Cannot resume ${role} route baseUrl ${expected.baseUrl} with runtime baseUrl ${actual.baseUrl ?? "missing"}.`);
+    }
+    if (expected.model !== undefined && actual.model !== expected.model) {
+      providerMismatch(`Cannot resume ${role} route model ${expected.model} with runtime model ${actual.model ?? "missing"}.`);
+    }
+  }
+}
+
+const providerRoles = ["generator", "mutator", "judge", "finalizer"] as const satisfies readonly ProviderRole[];
+
+function expectedProviderRoutes(rawConfig: Record<string, unknown>, config: RunConfig): Partial<Record<ProviderRole, ProviderRouteFingerprint>> {
+  const providers = rawConfig.providers;
+  if (!isRecord(providers)) return {};
+  const routes: Partial<Record<ProviderRole, ProviderRouteFingerprint>> = {};
+  for (const role of providerRoles) {
+    const rawRoute = providers[role];
+    if (!isRecord(rawRoute)) continue;
+    routes[role] = {
+      provider: stringValue(rawRoute.provider) ?? config.provider,
+      baseUrl: stringValue(rawRoute.baseUrl) ?? stringValue(rawRoute.base_url),
+      model: stringValue(rawRoute.model) ?? modelForRole(config, role)
+    };
+  }
+  return routes;
+}
+
+function runtimeProviderRoutes(driver: ModelDriver): Partial<Record<ProviderRole, ProviderRouteFingerprint>> {
+  const routeTable = (driver as { routes?: unknown }).routes;
+  if (!isRecord(routeTable)) return {};
+  const routes: Partial<Record<ProviderRole, ProviderRouteFingerprint>> = {};
+  for (const role of providerRoles) {
+    const route = routeTable[role];
+    if (!isRecord(route)) continue;
+    const routeDriver = route.driver as ModelDriver | undefined;
+    routes[role] = {
+      provider: routeDriver ? providerLabel(routeDriver) : undefined,
+      baseUrl: routeDriver ? providerBaseUrl(routeDriver) : undefined,
+      model: stringValue(route.model)
+    };
+  }
+  return routes;
+}
+
+function providerBaseUrl(driver: ModelDriver): string | undefined {
+  const value = driver as { baseUrl?: unknown; config?: { baseUrl?: unknown }; baseDriver?: ModelDriver };
+  if (typeof value.baseUrl === "string") return value.baseUrl;
+  if (typeof value.config?.baseUrl === "string") return value.config.baseUrl;
+  if (value.baseDriver) return providerBaseUrl(value.baseDriver);
+  return undefined;
+}
+
+function modelForRole(config: RunConfig, role: ProviderRole): string | undefined {
+  if (role === "generator") return config.generatorModel;
+  if (role === "mutator") return config.mutatorModel;
+  if (role === "judge") return config.judgeModel;
+  return config.finalizerModel;
+}
+
+function routeLabel(route: ProviderRouteFingerprint): string {
+  return [route.provider, route.baseUrl, route.model].filter(Boolean).join("/") || "provider route";
+}
+
+function providerMismatch(message: string): never {
+  resumeConfigError(message, "resume.provider_mismatch", "Use the same provider configuration that created config.json.");
+}
+
+function normalizeBaseUrl(value: string | undefined): string | undefined {
+  return value?.replace(/\/+$/, "");
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
 async function readRequiredConfig(runDir: string): Promise<Record<string, unknown>> {
@@ -731,6 +872,17 @@ async function judgePairs(args: {
             invalidJson = true;
             jsonParseFailures += 1;
           }
+        }
+
+        if (invalidJson || !parsed) {
+          throw new ConfigError(
+            `Judge produced ${jsonParseFailures} consecutive invalid-JSON responses (${args.config.retry.invalidJsonRetries + 1} attempts) for comparison ${job.id}. Refusing to synthesize a tie and pollute the ranking.`,
+            {
+              code: "judge.persistent_invalid_json",
+              retryable: false,
+              fix: "The judge model is producing unparseable output. Inspect the raw response (set output.includeRawModelOutputs: true), switch judge models, or raise retry.invalidJsonRetries if the failures are transient."
+            }
+          );
         }
 
         const comparison: Comparison = {
@@ -1008,4 +1160,17 @@ async function currentPackageVersion(): Promise<string> {
   } catch {
     return "0.0.0";
   }
+}
+
+function sameMajorMinor(left: string | undefined, right: string): boolean {
+  if (!left) return false;
+  const parse = (version: string): [number, number] | undefined => {
+    const match = version.match(/^(\d+)\.(\d+)/);
+    if (!match) return undefined;
+    return [Number(match[1]), Number(match[2])];
+  };
+  const a = parse(left);
+  const b = parse(right);
+  if (!a || !b) return false;
+  return a[0] === b[0] && a[1] === b[1];
 }

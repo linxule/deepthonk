@@ -19,6 +19,16 @@ import { FakeDriver } from "@deepthonk/providers";
 import { buildResumePlan, readResumeTrace } from "../../packages/core/src/resume.js";
 
 describe("resume replay", () => {
+  it("ignores a crash-truncated final JSONL row when reading resume traces", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-jsonl-"));
+    const candidate = candidateRow("kept_candidate", 0);
+    await writeFile(join(runDir, "candidates.jsonl"), `${JSON.stringify(candidate)}\n{"id":"truncated"\n`, "utf8");
+
+    const trace = await readResumeTrace(runDir);
+
+    expect(trace.candidates).toEqual([candidate]);
+  });
+
   it("detects a completed phase plan and refuses to resume an already complete run", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-complete-"));
     const config = quickConfig(runDir);
@@ -76,6 +86,33 @@ describe("resume replay", () => {
     expect(result.calls).toBe(15);
   });
 
+  it("refuses to resume while a prune sentinel is present", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-prune-sentinel-"));
+    await writeStoredConfig(runDir, quickConfig(runDir));
+    await writeFile(join(runDir, ".prune-in-progress"), "stale prune\n", "utf8");
+
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.prune_in_progress" });
+  });
+
+  it("prunes candidate and comparison events for dropped trace rows", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-events-"));
+    const config = quickConfig(runDir);
+    const staleCandidateId = "stale_candidate_for_prune";
+    const staleComparisonId = "stale_comparison_for_prune";
+
+    await expect(runDeepThonk(config, new FailAfterRoleCallDriver("mutate", 1))).rejects.toThrow(/Injected mutate failure/);
+    await appendJsonl(join(runDir, "candidates.jsonl"), candidateRow(staleCandidateId, 2));
+    await appendJsonl(join(runDir, "comparisons.jsonl"), comparisonRow(staleComparisonId));
+    await appendJsonl(join(runDir, "events.jsonl"), { type: "candidate.mutated", candidate_id: staleCandidateId });
+    await appendJsonl(join(runDir, "events.jsonl"), { type: "comparison.completed", comparison_id: staleComparisonId });
+
+    expectRunResult(await resumeDeepThonk(runDir, new FakeDriver()));
+    const events = await readJsonl<{ type?: string; candidate_id?: string; comparison_id?: string }>(join(runDir, "events.jsonl"));
+
+    expect(events).not.toContainEqual(expect.objectContaining({ type: expect.stringMatching(/^candidate\./), candidate_id: staleCandidateId }));
+    expect(events).not.toContainEqual(expect.objectContaining({ type: expect.stringMatching(/^comparison\./), comparison_id: staleComparisonId }));
+  });
+
   it("refuses to replay traces from a different package version", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-version-"));
     await writeFile(join(runDir, "config.json"), JSON.stringify({ ...quickConfig(runDir), version: "0.0.1" }, null, 2), "utf8");
@@ -110,6 +147,46 @@ describe("resume replay", () => {
     );
 
     await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.in_flight" });
+  });
+
+  it("refuses provider-routed configs that do not match the runtime driver", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-provider-"));
+    await writeStoredConfig(runDir, {
+      ...quickConfig(runDir),
+      providers: {
+        judge: {
+          provider: "deepseek",
+          model: "deepseek-v4-pro"
+        }
+      }
+    });
+
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.provider_mismatch" });
+  });
+
+  it("allows only one concurrent resume to claim the run lock", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-lock-"));
+    const config = quickConfig(runDir);
+
+    await expect(runDeepThonk(config, new FailAfterRoleCallDriver("compare", 1))).rejects.toThrow(/Injected compare failure/);
+    const results = await Promise.allSettled([
+      resumeDeepThonk(runDir, new SlowDriver()),
+      resumeDeepThonk(runDir, new SlowDriver())
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toMatchObject({ code: "run.directory_locked" });
+  });
+
+  it("refuses stored configs missing the output block", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-incomplete-config-"));
+    const { output: _output, ...configWithoutOutput } = quickConfig(runDir);
+    await writeStoredConfig(runDir, configWithoutOutput);
+
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.config_incomplete" });
   });
 
   it("preserves winner and rank order when replaying from a killed stream", async () => {
@@ -154,6 +231,41 @@ function expectRunResult(result: RunResult | unknown): RunResult {
 async function readJsonl<T>(path: string): Promise<T[]> {
   const text = await readFile(path, "utf8");
   return text.trim() ? text.trim().split("\n").map((line) => JSON.parse(line) as T) : [];
+}
+
+async function appendJsonl(path: string, value: unknown): Promise<void> {
+  await writeFile(path, `${JSON.stringify(value)}\n`, { encoding: "utf8", flag: "a" });
+}
+
+async function writeStoredConfig(runDir: string, config: Record<string, unknown>): Promise<void> {
+  await writeFile(join(runDir, "config.json"), JSON.stringify({ ...config, version: await currentCoreVersion() }, null, 2), "utf8");
+}
+
+function candidateRow(id: string, generation: number): Record<string, unknown> {
+  return {
+    id,
+    generation,
+    kind: generation === 0 ? "initial" : "mutation",
+    content: `candidate ${id}`,
+    status: generation === 0 ? "generated" : "mutated",
+    metadata: { createdAt: "2026-01-01T00:00:00.000Z" }
+  };
+}
+
+function comparisonRow(id: string): Record<string, unknown> {
+  return {
+    id,
+    runId: "stale_run",
+    generation: 999,
+    candidateAId: "candidate_a",
+    candidateBId: "candidate_b",
+    presentedAOriginalId: "candidate_a",
+    presentedBOriginalId: "candidate_b",
+    winner: "tie",
+    critiqueForA: "",
+    critiqueForB: "",
+    selectionReason: "stale"
+  };
 }
 
 async function readSummary(runDir: string): Promise<{ winner_id: string; final_scores: Array<{ candidateId: string; rank: number }> }> {
@@ -231,4 +343,32 @@ class FailOnCallDriver implements ModelDriver {
     if (this.calls === this.failAtCall) throw new Error(`Injected failure at call ${this.calls}.`);
     return call();
   }
+}
+
+class SlowDriver implements ModelDriver {
+  private readonly inner = new FakeDriver();
+
+  async generate(input: GenerateInput): Promise<ModelTextResult> {
+    await delay();
+    return this.inner.generate(input);
+  }
+
+  async compare(input: CompareInput): Promise<ModelTextResult> {
+    await delay();
+    return this.inner.compare(input);
+  }
+
+  async mutate(input: MutateInput): Promise<ModelTextResult> {
+    await delay();
+    return this.inner.mutate(input);
+  }
+
+  async finalize(input: FinalizeInput): Promise<ModelTextResult> {
+    await delay();
+    return this.inner.finalize(input);
+  }
+}
+
+function delay(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 25));
 }

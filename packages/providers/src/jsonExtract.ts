@@ -1,6 +1,11 @@
 import { JsonParseError } from "@deepthonk/core";
 
+export const MAX_EXTRACTION_BYTES = 131_072;
+
 export function extractJsonObjectText(text: string): string {
+  if (text.length > MAX_EXTRACTION_BYTES) {
+    throw new JsonParseError(`Response text exceeds ${MAX_EXTRACTION_BYTES}-byte JSON extraction cap; refusing to parse.`);
+  }
   const trimmed = text.trim();
   const candidates = [trimmed, extractFence(trimmed), extractBalancedObject(trimmed)].filter(
     (candidate): candidate is string => Boolean(candidate)

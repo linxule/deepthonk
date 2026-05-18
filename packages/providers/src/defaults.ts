@@ -1,3 +1,4 @@
+import type { SamplingTransport } from "./sampling.js";
 import type { ProviderConfig, ProviderRole, RoleProviderConfig } from "./types.js";
 
 export type DirectProviderName = "fake" | "openai-compatible" | "deepseek" | "openrouter";
@@ -17,6 +18,7 @@ export interface ProviderConfigOptions {
   models?: ProviderModelOverrides;
   retry?: ProviderConfig["retry"];
   supportsJsonMode?: boolean;
+  samplingTransport?: SamplingTransport;
   roleProviders?: Partial<Record<ProviderRole, Partial<Omit<RoleProviderConfig, "model">> & { model?: string }>>;
 }
 
@@ -39,6 +41,7 @@ export function resolveProviderConfig(options: ProviderConfigOptions): ProviderC
     models,
     retry: options.retry,
     supportsJsonMode: options.supportsJsonMode,
+    samplingTransport: options.samplingTransport,
     roleProviders: resolveRoleProviders(options.provider, models, options.roleProviders, options.retry)
   };
 }

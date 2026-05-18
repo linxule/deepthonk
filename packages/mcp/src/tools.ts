@@ -509,7 +509,7 @@ export async function deepthonkMutate(argsInput: unknown): Promise<Record<string
   };
 }
 
-export async function deepthonkResume(argsInput: unknown): Promise<Record<string, unknown>> {
+export async function deepthonkResume(argsInput: unknown, context?: McpSamplingContext): Promise<Record<string, unknown>> {
   const args = resumeArgsSchema.parse(argsInput);
   if (args.continue === true) {
     const raw = JSON.parse(await readFile(join(args.run_dir, "config.json"), "utf8")) as unknown;
@@ -521,8 +521,10 @@ export async function deepthonkResume(argsInput: unknown): Promise<Record<string
         mutator: config.mutatorModel,
         judge: config.judgeModel,
         finalizer: config.finalizerModel
-      }
+      },
+      samplingTransport: config.provider === "sampling" ? context?.createMessage : undefined
     });
+    assertSamplingCapability(providerConfig, context);
     const result = await resumeDeepThonk(args.run_dir, createDriver(providerConfig), { provider: config.provider });
     if ("winner" in result) {
       return {

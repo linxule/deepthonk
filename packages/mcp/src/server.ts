@@ -154,7 +154,7 @@ export function createDeepThonkMcpServer(): McpServer {
       inputSchema: resumeArgsSchema.shape,
       outputSchema: resumeOutputSchema.shape
     },
-    async (args) => safeTool(async () => toolResult(await deepthonkResume(args)), args.run_dir)
+    async (args) => safeTool(async () => toolResult(await deepthonkResume(args, samplingContext)), args.run_dir)
   );
 
   server.registerTool(

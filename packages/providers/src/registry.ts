@@ -20,7 +20,10 @@ function createSingleDriver(config: ProviderConfig): ModelDriver {
         fix: "Run DeepThonk through an MCP host that advertises sampling, or choose a direct provider for CLI runs."
       });
     }
-    return new SamplingDriver(config.samplingTransport, config);
+    return new SamplingDriver(config.samplingTransport, {
+      ...config,
+      requestTimeoutMs: config.retry?.requestTimeoutMs ?? (config as { requestTimeoutMs?: number }).requestTimeoutMs
+    });
   }
   if (config.provider === "deepseek") return createDeepSeekDriver(config);
   if (config.provider === "openai-compatible") return new OpenAiCompatibleDriver(config);

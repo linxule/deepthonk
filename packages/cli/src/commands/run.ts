@@ -1,5 +1,5 @@
 import type { Command } from "commander";
-import { runDeepThonk } from "@deepthonk/core";
+import { ConfigError, runDeepThonk } from "@deepthonk/core";
 import { createDriver } from "@deepthonk/providers";
 import { resolveRunConfig } from "../config.js";
 import { redacted } from "../redaction.js";
@@ -44,8 +44,20 @@ export function registerRun(program: Command): void {
     .option("--dry-run")
     .action(async (options) => {
       const resolved = await resolveRunConfig(options);
+      if (resolved.providerConfig.provider === "sampling") {
+        const profileHint = options.profileName
+          ? ` The profile '${options.profileName}' selects provider: sampling.`
+          : "";
+        throw new ConfigError(
+          `MCP Sampling provider requires running as an MCP server.${profileHint} Use a direct provider mode (deepseek, openrouter, openai-compatible) for CLI runs, or run via 'deepthonk serve-mcp' with a sampling-capable MCP client.`,
+          {
+            code: "provider.sampling_requires_mcp",
+            retryable: false,
+            fix: "Switch to a direct provider via --provider, edit the named profile to use a direct provider, or invoke this work through an MCP host."
+          }
+        );
+      }
       if (options.dryRun) {
-        if (resolved.providerConfig.provider === "sampling") createDriver(resolved.providerConfig);
         console.log(JSON.stringify(redacted(withApiKeyPresence(resolved)), null, 2));
         return;
       }

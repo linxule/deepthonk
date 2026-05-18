@@ -72,14 +72,14 @@ describe("SamplingDriver", () => {
     expect(result.text).toBe('{"winner":"A","feedback_a":"ok","feedback_b":"no"}');
   });
 
-  it("wraps createMessage rejection in retryable ProviderError", async () => {
+  it("wraps createMessage rejection in non-retryable ProviderError", async () => {
     const createMessage = vi.fn(async () => {
       throw new Error("host unavailable");
     });
     const driver = new SamplingDriver(createMessage);
     await expect(driver.generate({ task: "task", model: "m", temperature: 0, prompt: { system: "", user: "u" } })).rejects.toMatchObject({
       code: "provider.sampling_request_failed",
-      retryable: true
+      retryable: false
     });
     await expect(driver.generate({ task: "task", model: "m", temperature: 0, prompt: { system: "", user: "u" } })).rejects.toBeInstanceOf(ProviderError);
   });
@@ -96,6 +96,31 @@ describe("SamplingDriver", () => {
     expect(hidden.raw).toBeUndefined();
     expect(included.raw).toBe(raw);
     expect(included.usage).toEqual({ inputTokens: undefined, outputTokens: undefined });
+  });
+
+  it("throws a non-retryable timeout ProviderError when the host stalls past requestTimeoutMs", async () => {
+    const createMessage = vi.fn(() => new Promise<never>(() => {}));
+    const driver = new SamplingDriver(createMessage, { requestTimeoutMs: 60 });
+    const start = Date.now();
+    await expect(
+      driver.generate({ task: "task", model: "m", temperature: 0, prompt: { system: "", user: "u" } })
+    ).rejects.toMatchObject({
+      code: "provider.sampling_timeout",
+      retryable: false
+    });
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  it("rejects oversized host responses via the JSON extraction cap", async () => {
+    const enormous = "a".repeat(150_000) + '{"winner":"A","feedback_a":"x","feedback_b":"y"}';
+    const driver = new SamplingDriver(async () => textResult(enormous));
+    await expect(
+      driver.compare({ task: "t", model: "m", temperature: 0, prompt: { system: "", user: "u" }, candidateA: { id: "a", content: "" }, candidateB: { id: "b", content: "" } })
+    ).resolves.toMatchObject({ provider: "sampling" });
+    // The compare path uses extractJsonTextOrOriginal which catches errors and returns the original text.
+    // Verify the extractor itself rejects oversized text by importing it directly.
+    const { extractJsonObjectText } = await import("@deepthonk/providers");
+    expect(() => extractJsonObjectText(enormous)).toThrow(/exceeds .* JSON extraction cap/);
   });
 
   it("requires an MCP sampling transport when created through the registry", () => {

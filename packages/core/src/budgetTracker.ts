@@ -17,6 +17,20 @@ export class BudgetTracker {
         fix: "Add budget.prices entries with inputUsdPerMillion and outputUsdPerMillion, or remove maxUsd."
       });
     }
+    if (config.provider === "sampling") {
+      const samplingTokenCaps = {
+        maxInputTokens: config.budget?.maxInputTokens,
+        maxOutputTokens: config.budget?.maxOutputTokens,
+        maxUsd: config.budget?.maxUsd
+      };
+      const caps = Object.entries(samplingTokenCaps).filter(([, value]) => value !== undefined).map(([key]) => key);
+      if (caps.length > 0) {
+        throw new ConfigError(`MCP Sampling provider does not report token usage; ${caps.join(", ")} cannot be enforced reliably.`, {
+          code: "budget.tokens_unreported_unsupported",
+          fix: "Remove the listed token/USD budget caps, or switch to a direct provider mode that reports token usage."
+        });
+      }
+    }
   }
 
   record(result: ModelTextResult, fallback: { provider?: string; model: string; calls?: number } = { model: "unknown" }): UsageDelta {
