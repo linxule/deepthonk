@@ -39,7 +39,7 @@ import { renderPrompt } from "./prompts.js";
 export function createDeepThonkMcpServer(): McpServer {
   const server = new McpServer({
     name: "deepthonk",
-    version: "0.1.0"
+    version: "0.1.1"
   });
 
   server.registerTool(
@@ -50,7 +50,7 @@ export function createDeepThonkMcpServer(): McpServer {
       inputSchema: planArgsSchema.shape,
       outputSchema: z.object({}).passthrough().describe("Budget plan with total calls and sequential rounds.")
     },
-    async (args) => safeTool(async () => toolResult(args.config_path ? await deepthonkPlanAsync(args) : deepthonkPlan(args)))
+    async (args) => safeTool(async () => toolResult(args.config_path || args.profile_name ? await deepthonkPlanAsync(args) : deepthonkPlan(args)))
   );
 
   server.registerTool(
@@ -331,15 +331,15 @@ function registerPrompt(server: McpServer, name: string, argsSchema: z.ZodRawSha
 }
 
 async function readJsonBody(req: import("node:http").IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
+  const chunks: Uint8Array[] = [];
   let size = 0;
   const maxBytes = 1_000_000;
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
     if (size > maxBytes) throw new Error("Request body too large.");
-    chunks.push(buffer);
+    chunks.push(new Uint8Array(buffer));
   }
-  const text = Buffer.concat(chunks).toString("utf8");
+  const text = Buffer.concat(chunks as unknown as Uint8Array[]).toString("utf8");
   return text.trim() ? JSON.parse(text) : undefined;
 }

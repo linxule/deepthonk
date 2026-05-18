@@ -11,6 +11,8 @@ import { comparePrompt, finalizePrompt, generatePrompt, mutatePrompt } from "./p
 import { createRng, type Rng } from "./rng.js";
 import {
   runConfigSchema,
+  builtInProfiles,
+  type BuiltInProfileName,
   type BtScore,
   type Candidate,
   type Comparison,
@@ -202,6 +204,10 @@ export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, 
     const summary = {
       run_id: runId,
       winner_id: winner.id,
+      profile: summaryProfile(config.profile),
+      profile_name: summaryProfileName(config.profile),
+      prompt_style: config.promptStyle,
+      models: summaryModels(config),
       calls: tracker.usage.calls,
       usage: cloneUsage(tracker.usage),
       ranked_winner_answer_path: "artifacts/winner.txt",
@@ -588,6 +594,48 @@ function compactMetadata(metadata: Record<string, unknown>): Record<string, unkn
   return Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== undefined));
 }
 
+function summaryProfile(profile: RunConfig["profile"]): Record<string, number> {
+  return {
+    n: profile.n,
+    k: profile.k,
+    t: profile.t,
+    m: profile.m,
+    lambda: profile.lambda,
+    sample_temperature: profile.sampleTemperature,
+    mutate_temperature: profile.mutateTemperature,
+    judge_temperature: profile.judgeTemperature
+  };
+}
+
+function summaryProfileName(profile: RunConfig["profile"]): BuiltInProfileName | null {
+  for (const name of ["quick", "balanced", "paper"] as const) {
+    if (profilesEqual(profile, builtInProfiles[name])) return name;
+  }
+  return null;
+}
+
+function profilesEqual(left: RunConfig["profile"], right: RunConfig["profile"]): boolean {
+  return (
+    left.n === right.n &&
+    left.k === right.k &&
+    left.t === right.t &&
+    left.m === right.m &&
+    left.lambda === right.lambda &&
+    left.sampleTemperature === right.sampleTemperature &&
+    left.mutateTemperature === right.mutateTemperature &&
+    left.judgeTemperature === right.judgeTemperature
+  );
+}
+
+function summaryModels(config: RunConfig): { generator: string; mutator: string; judge: string; finalizer: string | null } {
+  return {
+    generator: config.generatorModel,
+    mutator: config.mutatorModel,
+    judge: config.judgeModel,
+    finalizer: config.finalizerModel ?? null
+  };
+}
+
 function buildUsageRecord(args: {
   phase: string;
   role: CallRole;
@@ -597,6 +645,7 @@ function buildUsageRecord(args: {
   model?: string;
 }): UsageRecord {
   return {
+    schema_version: 1,
     ts: new Date().toISOString(),
     phase: args.phase,
     role: args.role,

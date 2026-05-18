@@ -95,6 +95,7 @@ export interface UsageDelta {
 export type CallRole = "generator" | "judge" | "mutator" | "finalizer";
 
 export interface UsageRecord {
+  schema_version: 1;
   ts: string;
   phase: string;
   role: CallRole;

@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import { describe, expect, it } from "vitest";
 import {
   deepthonkCancel,
@@ -15,6 +16,8 @@ import {
   promptNames,
   readRunResource,
   resourceTemplates,
+  mutateArgsSchema,
+  rankArgsSchema,
   runArgsSchema,
   toolNames
 } from "@deepthonk/mcp";
@@ -82,6 +85,45 @@ describe("MCP helpers", () => {
     await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/population/0`, join(runDir, ".."))).resolves.toContain("\"kind\"");
   });
 
+  it("loads a named profile via profile_name", async () => {
+    const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-profiles-"));
+    await writeFile(
+      join(profilesDir, "fake-balanced.yaml"),
+      [
+        "profile: balanced",
+        "prompt_style: general",
+        "provider: fake",
+        "models:",
+        "  generator: fake-model",
+        "  mutator: fake-model",
+        "  judge: fake-model",
+        "algorithm:",
+        "  n: 6",
+        "  k: 2",
+        "  t: 1",
+        "  m: 4"
+      ].join("\n")
+    );
+    const originalDir = process.env.DEEPTHONK_PROFILES_DIR;
+    process.env.DEEPTHONK_PROFILES_DIR = profilesDir;
+    try {
+      const plan = await deepthonkPlanAsync({ profile_name: "fake-balanced" });
+      expect(plan.calls).toBe(28);
+    } finally {
+      if (originalDir === undefined) delete process.env.DEEPTHONK_PROFILES_DIR;
+      else process.env.DEEPTHONK_PROFILES_DIR = originalDir;
+    }
+  });
+
+  it("rejects profile_name combined with config_path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-profile-conflict-"));
+    const configPath = join(root, "config.yaml");
+    await writeFile(configPath, "profile: quick");
+    await expect(deepthonkPlanAsync({ profile_name: "anything", config_path: configPath })).rejects.toThrow(
+      /profile_name and config_path cannot be used together/
+    );
+  });
+
   it("plans from config_path with algorithm overrides", async () => {
     const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-plan-"));
     const configPath = join(root, "config.yaml");
@@ -99,6 +141,17 @@ describe("MCP helpers", () => {
   it("does not advertise deferred MCP Sampling as a provider", () => {
     expect(runArgsSchema.safeParse({ task: "toy", provider: "sampling" }).success).toBe(false);
     expect(runArgsSchema.safeParse({ task: "toy", provider: "openrouter" }).success).toBe(true);
+  });
+
+  it("describes per-phase prompt variables in MCP JSON schemas", () => {
+    expect(promptPhaseDescription(runArgsSchema, "compare")).toBe(
+      "Variables: {task}, {rubric}, {candidateA}, {candidateB}. Output must be strict JSON: {feedback_a, feedback_b, winner: A|B|tie}."
+    );
+    expect(promptPhaseDescription(runArgsSchema, "mutate")).toBe("Variables: {task}, {rubric}, {candidate}, {critique}");
+    expect(promptPhaseDescription(rankArgsSchema, "compare")).toBe(
+      "Variables: {task}, {rubric}, {candidateA}, {candidateB}. Output must be strict JSON: {feedback_a, feedback_b, winner: A|B|tie}."
+    );
+    expect(promptPhaseDescription(mutateArgsSchema, "mutate")).toBe("Variables: {task}, {rubric}, {candidate}, {critique}");
   });
 
   it("runs with provider settings from config_path", async () => {
@@ -229,3 +282,15 @@ describe("MCP helpers", () => {
     expect(summary.calls).toBe(16);
   });
 });
+
+function promptPhaseDescription(schema: Parameters<typeof zodToJsonSchema>[0], phase: string): unknown {
+  const jsonSchema = zodToJsonSchema(schema, { $refStrategy: "none" }) as JsonObject;
+  const prompts = jsonSchema.properties?.prompts as JsonObject | undefined;
+  const promptProperties = prompts?.properties as Record<string, JsonObject> | undefined;
+  return promptProperties?.[phase]?.description;
+}
+
+interface JsonObject {
+  properties?: Record<string, unknown>;
+  description?: string;
+}

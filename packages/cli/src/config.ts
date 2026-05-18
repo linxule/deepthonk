@@ -13,6 +13,7 @@ import {
   type ProviderConfig,
   type ProviderRole
 } from "@deepthonk/providers";
+import { loadNamedProfile } from "./profileRegistry.js";
 
 export interface ResolvedCliConfig {
   runConfig: RunConfig;
@@ -76,8 +77,7 @@ interface RawRoleProviderConfig {
 
 export async function resolveRunConfig(options: Record<string, unknown>): Promise<ResolvedCliConfig> {
   await loadDeepThonkEnv();
-  const configPath = resolveConfigPath(options);
-  const fileConfig = configPath ? await readConfig(configPath) : {};
+  const fileConfig = await resolveBaseConfig(options);
   const profileName = builtInProfileName(options.profile ?? fileConfig.profile ?? "quick");
   const profile = mergeAlgorithmOverrides(getProfile(profileName), fileConfig.algorithm, options);
   const task = await readPathOrInline(String(options.task ?? ""));
@@ -147,8 +147,7 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
 
 export async function resolveProviderOnlyConfig(options: Record<string, unknown>): Promise<ResolvedProviderConfig> {
   await loadDeepThonkEnv();
-  const configPath = resolveConfigPath(options);
-  const fileConfig = configPath ? await readConfig(configPath) : {};
+  const fileConfig = await resolveBaseConfig(options);
   const provider = String(options.provider ?? fileConfig.provider ?? "fake");
   const models = resolveProviderModels(provider, {
     generator: stringOption(options.generatorModel) ?? fileConfig.models?.generator,
@@ -230,8 +229,7 @@ export function mergeAlgorithmOverrides(
 }
 
 export async function resolvePlanProfile(options: Record<string, unknown>): Promise<Profile | BuiltInProfileName> {
-  const configPath = resolveConfigPath(options);
-  const fileConfig = configPath ? await readConfig(configPath) : {};
+  const fileConfig = await resolveBaseConfig(options);
   const profileName = builtInProfileName(options.profile ?? fileConfig.profile ?? "quick");
   const hasOverrides =
     fileConfig.algorithm !== undefined ||
@@ -268,6 +266,22 @@ async function readConfig(path: string): Promise<RawConfigFile> {
 
 function resolveConfigPath(options: Record<string, unknown>): string | undefined {
   return stringOption(options.config) ?? process.env.DEEPTHONK_CONFIG ?? (existsSync(defaultConfigPath) ? defaultConfigPath : undefined);
+}
+
+async function resolveBaseConfig(options: Record<string, unknown>): Promise<RawConfigFile> {
+  const profileName = stringOption(options.profileName);
+  if (profileName) {
+    if (stringOption(options.config)) {
+      throw new ConfigError("--profile-name and --config cannot be used together. A named profile replaces the config file.", {
+        code: "config.profile_and_config_conflict",
+        retryable: false,
+        fix: "Choose one: --profile-name <name> to load a saved bundle, or --config <path> to point at a config YAML."
+      });
+    }
+    return (await loadNamedProfile(profileName)) as unknown as RawConfigFile;
+  }
+  const configPath = resolveConfigPath(options);
+  return configPath ? await readConfig(configPath) : {};
 }
 
 function numberOption(value: unknown): number | undefined {

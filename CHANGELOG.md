@@ -2,6 +2,18 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
+## [0.1.1] — 2026-05-18
+
+### Added — agent polish
+
+- Named profile registry. Save reusable bundles at `~/.config/deepthonk/profiles/<name>.yaml` and load them with `--profile-name <name>` (CLI) or `profile_name: "<name>"` (MCP, on `run`, `start`, `plan`, `rank`, `mutate`). Mutually exclusive with `--config`/`config_path`. CLI flags and MCP inline args still override fields inside the named profile. Standalone bundle schema requires `profile` or `algorithm` block, `prompt_style`, `provider`, and at least `models.{generator,mutator,judge}`; raw `api_key` values are rejected at load time. `DEEPTHONK_PROFILES_DIR` overrides the registry directory. Documented in `docs/customization.md` with the `examples/profiles/legal-drafting.yaml` example.
+- `summary.json` now includes the resolved `profile`, `profile_name`, `prompt_style`, and per-role `models` so inspect-time consumers no longer have to read both `summary.json` and `config.json`.
+- Per-phase variable descriptions on the MCP `prompts` schema. Each phase (`generate`, `compare`, `mutate`, `finalize`) documents its valid variables and, for `compare`, the strict JSON output contract.
+
+### Added — runtime hardening
+
+- Added `schema_version: 1` to every `usage.jsonl` row for forward compatibility.
+
 ## [0.1.0] — 2026-05-18
 
 Initial public release. Independent TypeScript reimplementation of the OpenDeepThink algorithm (Zhou et al., 2026, [arXiv:2605.15177](https://arxiv.org/abs/2605.15177)). Reference Python implementation by the paper authors at [ZhouShang0817/open-deep-think](https://github.com/ZhouShang0817/open-deep-think) (MIT). DeepThonk vendors no source from the reference; it contributes the provider-neutral TypeScript core, MCP server, CLI, structured trace artifacts, and budget enforcement.

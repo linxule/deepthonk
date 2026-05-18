@@ -241,7 +241,9 @@ Example agent call (MCP), no YAML file required:
 
 CLI accepts the same surface. Use `--prompts <yaml>` for reusable prompt files or `--prompts-json <json>` for one-off inline overrides. MCP and CLI both merge over any `--config`/`config_path` YAML defaults.
 
-See the [Customization guide](https://github.com/linxule/deepthonk/blob/main/docs/customization.md) for the complete variable contract, the compare-phase JSON safety rule, and three worked examples. Per-role provider routing (`providers.judge.provider = openrouter`) and per-model pricing remain YAML-only — they're nested structured config, not inline ergonomics.
+Save reusable bundles as **named profiles** at `~/.config/deepthonk/profiles/<name>.yaml` and load them with `--profile-name <name>` (CLI) or `profile_name: "<name>"` (MCP). A named profile is a standalone bundle that replaces the main config file for that run; CLI flags and MCP inline arguments still override fields inside it. See `examples/profiles/legal-drafting.yaml` for the shape.
+
+See the [Customization guide](https://github.com/linxule/deepthonk/blob/main/docs/customization.md) for the complete variable contract, the compare-phase JSON safety rule, the named-profile schema, and three worked examples. Per-role provider routing (`providers.judge.provider = openrouter`) and per-model pricing remain YAML-only — they're nested structured config, not inline ergonomics.
 
 ## Trace Files
 

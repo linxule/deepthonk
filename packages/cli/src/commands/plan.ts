@@ -8,12 +8,13 @@ export function registerPlan(program: Command): void {
     .description("Print DeepThonk call budget for a profile.")
     .option("--config <yaml>")
     .option("--profile <profile>", "quick|balanced|paper")
+    .option("--profile-name <name>", "Load saved bundle from ~/.config/deepthonk/profiles/<name>.yaml")
     .option("--n <number>")
     .option("--k <number>")
     .option("--t <number>")
     .option("--m <number>")
     .action(async (options) => {
-      if (options.config) {
+      if (options.config || options.profileName) {
         console.log(JSON.stringify(planBudget(await resolvePlanProfile(options)), null, 2));
         return;
       }

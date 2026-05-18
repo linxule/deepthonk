@@ -25,7 +25,12 @@ describe("runDeepThonk", () => {
     expect(result.finalScores).toHaveLength(4);
     expect(result.calls).toBe(15);
     expect(result.winner.content).toContain("FAKE_QUALITY");
-    await expect(readFile(join(runDir, "summary.json"), "utf8")).resolves.toContain(result.winner.id);
+    const summary = JSON.parse(await readFile(join(runDir, "summary.json"), "utf8")) as {
+      winner_id: string;
+      profile_name: string | null;
+    };
+    expect(summary.winner_id).toBe(result.winner.id);
+    expect(summary.profile_name).toBe("quick");
     await expect(readFile(join(runDir, "artifacts", "final.txt"), "utf8")).resolves.toContain("FAKE_QUALITY");
     const population = JSON.parse(await readFile(join(runDir, "population-1.json"), "utf8")) as Array<{ kind: string }>;
     expect(population).toHaveLength(4);
@@ -43,6 +48,36 @@ describe("runDeepThonk", () => {
       .map((line) => JSON.parse(line) as { candidateAId: string; candidateBId: string; presentedAOriginalId: string; presentedBOriginalId: string });
     expect(comparisons.every((comparison) => comparison.candidateAId === comparison.presentedAOriginalId)).toBe(true);
     expect(comparisons.every((comparison) => comparison.candidateBId === comparison.presentedBOriginalId)).toBe(true);
+  });
+
+  it("writes resolved profile, prompt, model, and usage schema metadata", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-summary-"));
+    const config: RunConfig = {
+      task: "solve toy",
+      profile: { ...builtInProfiles.quick, n: 3, t: 0 },
+      runDir,
+      seed: 42,
+      provider: "fake",
+      generatorModel: "fake-generator",
+      mutatorModel: "fake-mutator",
+      judgeModel: "fake-judge",
+      concurrency: { generate: 3, judge: 3, mutate: 2 },
+      retry: { httpRetries: 0, invalidJsonRetries: 1 },
+      output: { includeRawModelOutputs: false, includePrompts: false }
+    };
+    await runDeepThonk(config, new FakeDriver());
+
+    const summary = JSON.parse(await readFile(join(runDir, "summary.json"), "utf8")) as {
+      profile: { n: number };
+      prompt_style: string;
+      models: { judge: unknown };
+    };
+    expect(summary.profile.n).toBe(3);
+    expect(summary.prompt_style).toBe("general");
+    expect(summary.models.judge).toEqual(expect.any(String));
+
+    const firstUsageLine = (await readFile(join(runDir, "usage.jsonl"), "utf8")).trim().split("\n")[0];
+    expect(JSON.parse(firstUsageLine).schema_version).toBe(1);
   });
 
   it("keeps seeded trace IDs stable when provider responses resolve out of order", async () => {

@@ -204,6 +204,82 @@ YAML config can also contain `prompts`.
 CLI `--prompts` merges over config `prompts`, and `--prompts-json` merges over both.
 MCP inline `prompts` merges over config `prompts`.
 
+## Named profiles
+
+Inline overrides are the right surface for one-off runs.
+Named profiles are the right surface for a customization you want to reuse.
+A named profile is a standalone YAML bundle that lives in `~/.config/deepthonk/profiles/<name>.yaml`.
+Override the directory with `DEEPTHONK_PROFILES_DIR=/path/to/profiles`.
+
+Load a named profile with `--profile-name <name>` on the CLI or `profile_name: "<name>"` in MCP.
+A named profile replaces the main config file for that run — `--profile-name` and `--config` cannot be used together.
+CLI flags and MCP inline arguments still override fields inside the named profile.
+
+A named profile must declare enough to fully describe a run:
+
+| Field | Required | Notes |
+|---|---|---|
+| `profile` or `algorithm` | required | Either a built-in profile name as the algorithm floor (`quick`, `balanced`, `paper`) or an explicit `algorithm` block. |
+| `prompt_style` | required | `general` or `paper-programming`. |
+| `provider` | required | Provider label. |
+| `models.generator` | required | Model used for initial generation. |
+| `models.mutator` | required | Model used for mutation. |
+| `models.judge` | required | Model used for pairwise judging. |
+| `models.finalizer` | optional | Model used to polish the winner. Defaults to the generator. |
+| `prompts` | optional | Per-phase template overrides. Same shape as `--prompts` YAML. |
+| `providers` | optional | Per-role provider routing for mixed-provider runs. |
+| `budget` | optional | Cost and call caps. |
+| `concurrency` | optional | Per-phase concurrency caps. |
+| `base_url`, `api_key_env` | optional | Required only when the provider needs them. |
+
+Named profiles must never contain a raw `api_key` value.
+Use `api_key_env` to point at an environment variable name; DeepThonk will read that env var at run time.
+The CLI rejects profiles that contain a top-level or per-role `api_key` field.
+
+Example profile (also shipped at `examples/profiles/legal-drafting.yaml`):
+
+```yaml
+profile: balanced
+prompt_style: general
+
+provider: deepseek
+api_key_env: DEEPSEEK_API_KEY
+models:
+  generator: deepseek-v4-flash
+  mutator: deepseek-v4-flash
+  judge: deepseek-v4-pro
+
+algorithm:
+  judge_temperature: 0.1
+
+prompts:
+  generate:
+    system: |
+      You are an experienced employment-law attorney. Draft practical contract
+      language. Do not include hidden chain-of-thought. Return the clause only.
+
+budget:
+  max_calls: 50
+```
+
+Run it:
+
+```bash
+deepthonk run --profile-name legal-drafting --task "Draft a non-solicitation clause."
+```
+
+Or call it through MCP:
+
+```json
+{
+  "profile_name": "legal-drafting",
+  "task": "Draft a non-solicitation clause."
+}
+```
+
+CLI flags still win for the run.
+For example, `deepthonk run --profile-name legal-drafting --judge-temperature 0.3 ...` raises the judge temperature only for that call.
+
 ## What stays YAML-only
 
 Per-role provider routing stays YAML-only through `providers.generator`, `providers.mutator`, `providers.judge`, and `providers.finalizer`.

@@ -11,6 +11,7 @@ export function registerRun(program: Command): void {
     .option("--rubric <path-or-inline>")
     .option("--config <yaml>")
     .option("--profile <profile>", "quick|balanced|paper")
+    .option("--profile-name <name>", "Load saved bundle from ~/.config/deepthonk/profiles/<name>.yaml")
     .option("--provider <provider>", "fake|deepseek|openrouter|openai-compatible or any OpenAI-compatible alias")
     .option("--base-url <url>")
     .option("--api-key-env <name>")

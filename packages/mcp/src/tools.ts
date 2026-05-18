@@ -21,7 +21,7 @@ import {
   type BuiltInProfileName,
   type CandidateInput
 } from "@deepthonk/core";
-import { createDriver, defaultPricesForProviderConfig, loadDeepThonkEnv, resolveProviderConfig, resolveProviderModels, type ProviderConfig } from "@deepthonk/providers";
+import { createDriver, defaultPricesForProviderConfig, loadDeepThonkEnv, loadNamedProfile, resolveProviderConfig, resolveProviderModels, type ProviderConfig } from "@deepthonk/providers";
 import { recordRunResource } from "./resources.js";
 
 export const toolNames = [
@@ -39,6 +39,7 @@ export const toolNames = [
 
 export const planArgsSchema = z.object({
   config_path: z.string().optional().describe("Optional DeepThonk YAML config path."),
+  profile_name: z.string().optional().describe("Saved profile bundle name; loads ~/.config/deepthonk/profiles/<name>.yaml. Mutually exclusive with config_path."),
   profile: z.enum(["quick", "balanced", "paper"]).default("quick"),
   n: z.number().int().min(2).optional(),
   k: z.number().int().min(1).optional(),
@@ -57,6 +58,7 @@ export const runArgsSchema = z.object({
   task: z.string().min(1).describe("Task text to solve. MCP tools do not read task files."),
   rubric: z.string().optional().describe("Optional judging rubric text."),
   config_path: z.string().optional().describe("Optional DeepThonk YAML config path, such as ~/.config/deepthonk/config.yaml."),
+  profile_name: z.string().optional().describe("Saved profile bundle name; loads ~/.config/deepthonk/profiles/<name>.yaml. Mutually exclusive with config_path."),
   profile: z.enum(["quick", "balanced", "paper"]).default("quick").describe("Run profile. quick is safest for smoke tests; paper plans 285 calls."),
   prompt_style: z.enum(["general", "paper-programming"]).optional().describe("Prompt template style. Defaults to paper-programming for the paper profile, general otherwise."),
   provider: providerNameSchema,
@@ -89,10 +91,10 @@ export const runArgsSchema = z.object({
     mutate: z.number().int().min(1).optional()
   }).optional().describe("Per-phase concurrency overrides."),
   prompts: z.object({
-    generate: z.object({ system: z.string().optional(), user: z.string().optional() }).optional(),
-    compare: z.object({ system: z.string().optional(), user: z.string().optional() }).optional(),
-    mutate: z.object({ system: z.string().optional(), user: z.string().optional() }).optional(),
-    finalize: z.object({ system: z.string().optional(), user: z.string().optional() }).optional()
+    generate: z.object({ system: z.string().optional(), user: z.string().optional() }).describe("Variables: {task}, {rubric}").optional(),
+    compare: z.object({ system: z.string().optional(), user: z.string().optional() }).describe("Variables: {task}, {rubric}, {candidateA}, {candidateB}. Output must be strict JSON: {feedback_a, feedback_b, winner: A|B|tie}.").optional(),
+    mutate: z.object({ system: z.string().optional(), user: z.string().optional() }).describe("Variables: {task}, {rubric}, {candidate}, {critique}").optional(),
+    finalize: z.object({ system: z.string().optional(), user: z.string().optional() }).describe("Variables: {task}, {rubric}, {candidate}").optional()
   }).optional().describe("Optional per-phase prompt template overrides. Templates use {task}, {rubric}, {candidate}, {candidateA}, {candidateB}, {critique} placeholders. Use {{ and }} to escape literal braces. See docs/customization.md for the variable contract per phase.")
 });
 
@@ -103,6 +105,7 @@ export const jobArgsSchema = z.object({
 
 const providerArgsSchema = z.object({
   config_path: z.string().optional().describe("Optional DeepThonk YAML config path."),
+  profile_name: z.string().optional().describe("Saved profile bundle name; loads ~/.config/deepthonk/profiles/<name>.yaml. Mutually exclusive with config_path."),
   provider: providerNameSchema,
   base_url: z.string().optional().describe("OpenAI-compatible base URL, ending at /v1."),
   api_key_env: z.string().optional().describe("Environment variable that contains the API key."),
@@ -121,7 +124,7 @@ export const rankArgsSchema = providerArgsSchema.extend({
   concurrency: z.number().int().min(1).optional().describe("Maximum concurrent pairwise comparisons."),
   prompt_style: z.enum(["general", "paper-programming"]).optional(),
   prompts: z.object({
-    compare: z.object({ system: z.string().optional(), user: z.string().optional() }).optional()
+    compare: z.object({ system: z.string().optional(), user: z.string().optional() }).describe("Variables: {task}, {rubric}, {candidateA}, {candidateB}. Output must be strict JSON: {feedback_a, feedback_b, winner: A|B|tie}.").optional()
   }).optional()
 });
 
@@ -133,7 +136,7 @@ export const mutateArgsSchema = providerArgsSchema.extend({
   mutate_temperature: z.number().min(0).optional().describe("Temperature for mutation."),
   prompt_style: z.enum(["general", "paper-programming"]).optional(),
   prompts: z.object({
-    mutate: z.object({ system: z.string().optional(), user: z.string().optional() }).optional()
+    mutate: z.object({ system: z.string().optional(), user: z.string().optional() }).describe("Variables: {task}, {rubric}, {candidate}, {critique}").optional()
   }).optional()
 });
 
@@ -200,11 +203,11 @@ export const mutateOutputSchema = z.object({
 
 export function deepthonkPlan(argsInput: unknown): Record<string, unknown> {
   const args = planArgsSchema.parse(argsInput);
-  if (args.config_path === undefined && args.n === undefined && args.k === undefined && args.t === undefined && args.m === undefined) {
+  if (args.config_path === undefined && args.profile_name === undefined && args.n === undefined && args.k === undefined && args.t === undefined && args.m === undefined) {
     return planBudget(args.profile) as unknown as Record<string, unknown>;
   }
-  if (args.config_path !== undefined) {
-    throw new ConfigError("deepthonk.plan with config_path is async; use deepthonkPlanAsync.", {
+  if (args.config_path !== undefined || args.profile_name !== undefined) {
+    throw new ConfigError("deepthonk.plan with config_path or profile_name is async; use deepthonkPlanAsync.", {
       code: "mcp.plan_async_required",
       retryable: false
     });
@@ -221,7 +224,7 @@ export function deepthonkPlan(argsInput: unknown): Record<string, unknown> {
 
 export async function deepthonkPlanAsync(argsInput: unknown): Promise<Record<string, unknown>> {
   const args = planArgsSchema.parse(argsInput);
-  const config = await readMcpConfig(args.config_path);
+  const config = await readMcpConfig(args.config_path, args.profile_name);
   const profileName = config.profile ?? args.profile;
   const base = builtInProfiles[profileName];
   return planBudget({
@@ -379,7 +382,7 @@ export async function deepthonkRun(argsInput: unknown): Promise<Record<string, u
 async function resolveMcpRun(argsInput: unknown): Promise<{ runConfig: Parameters<typeof runDeepThonk>[0]; providerConfig: ProviderConfig }> {
   const raw = objectInput(argsInput);
   const args = runArgsSchema.parse(argsInput);
-  const config = await readMcpConfig(args.config_path);
+  const config = await readMcpConfig(args.config_path, args.profile_name);
   const profileName = (raw.profile ?? config.profile ?? args.profile) as BuiltInProfileName;
   const baseProfile = getProfile(profileName);
   const profile = mergeProfileOverrides(baseProfile, config.algorithm, args);
@@ -478,7 +481,7 @@ export async function deepthonkExport(argsInput: unknown): Promise<Record<string
 }
 
 async function providerConfigFromArgs(args: z.infer<typeof providerArgsSchema>): Promise<ProviderConfig> {
-  const config = await readMcpConfig(args.config_path);
+  const config = await readMcpConfig(args.config_path, args.profile_name);
   return resolveMcpProviderConfig(args, objectInput(args), config);
 }
 
@@ -587,8 +590,18 @@ function mergeProfileOverrides(
   };
 }
 
-async function readMcpConfig(path?: string): Promise<RawMcpConfig> {
+async function readMcpConfig(path?: string, profileName?: string): Promise<RawMcpConfig> {
   await loadDeepThonkEnv();
+  if (profileName) {
+    if (path) {
+      throw new ConfigError("profile_name and config_path cannot be used together. A named profile replaces the config file.", {
+        code: "config.profile_and_config_conflict",
+        retryable: false,
+        fix: "Choose one: profile_name to load a saved bundle, or config_path to point at a config YAML."
+      });
+    }
+    return (await loadNamedProfile(profileName)) as RawMcpConfig;
+  }
   if (!path) return {};
   return YAML.parse(await readFile(resolveMcpPath(path), "utf8")) as RawMcpConfig;
 }

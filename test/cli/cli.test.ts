@@ -304,6 +304,115 @@ describe("deepthonk CLI", () => {
     expect(parsed.runConfig.promptStyle).toBe("paper-programming");
   });
 
+  it("loads a named profile via --profile-name", async () => {
+    const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-profiles-"));
+    await writeFile(
+      join(profilesDir, "fake-balanced.yaml"),
+      [
+        "profile: balanced",
+        "prompt_style: general",
+        "provider: fake",
+        "models:",
+        "  generator: fake-model",
+        "  mutator: fake-model",
+        "  judge: fake-model",
+        "algorithm:",
+        "  judge_temperature: 0.2"
+      ].join("\n")
+    );
+    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--profile-name", "fake-balanced", "--task", "toy", "--dry-run"], {
+      env: { ...process.env, DEEPTHONK_PROFILES_DIR: profilesDir }
+    });
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig.provider).toBe("fake");
+    expect(parsed.runConfig.profile.judgeTemperature).toBe(0.2);
+    expect(parsed.runConfig.profile.n).toBe(8);
+  });
+
+  it("rejects --profile-name combined with --config", async () => {
+    await expect(
+      execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--profile-name", "anything", "--config", "examples/configs/quick.fake.yaml", "--task", "toy", "--dry-run"])
+    ).rejects.toMatchObject({ stderr: expect.stringContaining("--profile-name and --config cannot be used together") });
+  });
+
+  it("emits a clear error when the named profile is missing", async () => {
+    const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-profiles-missing-"));
+    await expect(
+      execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--profile-name", "does-not-exist", "--task", "toy", "--dry-run"], {
+        env: { ...process.env, DEEPTHONK_PROFILES_DIR: profilesDir }
+      })
+    ).rejects.toMatchObject({ stderr: expect.stringContaining("Named profile 'does-not-exist' not found") });
+  });
+
+  it("rejects named profiles that contain a raw api_key", async () => {
+    const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-profiles-secret-"));
+    await writeFile(
+      join(profilesDir, "leaky.yaml"),
+      [
+        "profile: quick",
+        "prompt_style: general",
+        "provider: fake",
+        "api_key: sk-secret-do-not-write",
+        "models:",
+        "  generator: fake-model",
+        "  mutator: fake-model",
+        "  judge: fake-model"
+      ].join("\n")
+    );
+    await expect(
+      execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--profile-name", "leaky", "--task", "toy", "--dry-run"], {
+        env: { ...process.env, DEEPTHONK_PROFILES_DIR: profilesDir }
+      })
+    ).rejects.toMatchObject({ stderr: expect.stringContaining("must not contain a raw 'api_key' value") });
+  });
+
+  it("lets CLI flags override named profile fields", async () => {
+    const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-profiles-override-"));
+    await writeFile(
+      join(profilesDir, "base.yaml"),
+      [
+        "profile: balanced",
+        "prompt_style: general",
+        "provider: fake",
+        "models:",
+        "  generator: fake-model",
+        "  mutator: fake-model",
+        "  judge: fake-model"
+      ].join("\n")
+    );
+    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--profile-name", "base", "--judge-temperature", "0.5", "--task", "toy", "--dry-run"], {
+      env: { ...process.env, DEEPTHONK_PROFILES_DIR: profilesDir }
+    });
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig.profile.judgeTemperature).toBe(0.5);
+  });
+
+  it("plans from a named profile", async () => {
+    const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-profiles-plan-"));
+    await writeFile(
+      join(profilesDir, "p.yaml"),
+      [
+        "profile: paper",
+        "prompt_style: paper-programming",
+        "provider: fake",
+        "models:",
+        "  generator: fake-model",
+        "  mutator: fake-model",
+        "  judge: fake-model",
+        "algorithm:",
+        "  n: 8",
+        "  k: 2",
+        "  t: 1",
+        "  m: 4"
+      ].join("\n")
+    );
+    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "plan", "--profile-name", "p"], {
+      env: { ...process.env, DEEPTHONK_PROFILES_DIR: profilesDir }
+    });
+    const parsed = JSON.parse(stdout);
+    expect(parsed.calls).toBe(38);
+  });
+
   it("runs fake quick profile and writes final artifact", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-cli-"));
     const { stdout } = await execFileAsync(process.execPath, [
