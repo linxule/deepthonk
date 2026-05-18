@@ -280,6 +280,25 @@ Or call it through MCP:
 CLI flags still win for the run.
 For example, `deepthonk run --profile-name legal-drafting --judge-temperature 0.3 ...` raises the judge temperature only for that call.
 
+## Managing named profiles
+
+Named profiles can be managed without hand-editing the registry directory.
+The CLI and MCP surfaces expose the same registry operations:
+
+| Operation | CLI | MCP |
+|---|---|---|
+| List profiles | `deepthonk profile list` or `deepthonk profile list --json` | `deepthonk.profile_list` with `{}` |
+| Show one profile | `deepthonk profile show legal-drafting` | `deepthonk.profile_show` with `{ "name": "legal-drafting" }` |
+| Save from YAML | `deepthonk profile save legal-drafting --from-config ./legal.yaml` | `deepthonk.profile_save` with the profile bundle plus `{ "name": "legal-drafting" }` |
+| Save from inline fields | `deepthonk profile save quick-fake --profile quick --prompt-style general --provider fake --generator-model fake-model --mutator-model fake-model --judge-model fake-model` | `deepthonk.profile_save` with `{ "name": "quick-fake", "profile": "quick", "prompt_style": "general", "provider": "fake", "models": { "generator": "fake-model", "mutator": "fake-model", "judge": "fake-model" } }` |
+| Overwrite | Add `--force` | Add `"force": true` |
+| Delete | `deepthonk profile delete legal-drafting --yes` | `deepthonk.profile_delete` with `{ "name": "legal-drafting" }` |
+
+`profile show` and `deepthonk.profile_show` redact secret-shaped values such as `token`, `secret`, `password`, `authorization`, and `api_key`.
+They keep `api_key_env` visible because it is metadata naming where the runtime secret lives.
+`profile save` and `deepthonk.profile_save` reject raw `api_key` fields; use `api_key_env` instead.
+Creating a profile uses create-or-fail writes, and overwriting uses a temporary file plus rename.
+
 ## What stays YAML-only
 
 Per-role provider routing stays YAML-only through `providers.generator`, `providers.mutator`, `providers.judge`, and `providers.finalizer`.

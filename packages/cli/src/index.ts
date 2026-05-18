@@ -5,6 +5,7 @@ import { registerExport } from "./commands/export.js";
 import { registerInspect } from "./commands/inspect.js";
 import { registerMutate } from "./commands/mutate.js";
 import { registerPlan } from "./commands/plan.js";
+import { registerProfile } from "./commands/profile/index.js";
 import { registerRank } from "./commands/rank.js";
 import { registerResume } from "./commands/resume.js";
 import { registerRun } from "./commands/run.js";
@@ -19,6 +20,7 @@ const program = new Command();
 program.name("deepthonk").description("Thonk harder, not richer.").version("0.1.0").option("--json-errors", "Print machine-readable errors to stderr.");
 
 registerPlan(program);
+registerProfile(program);
 registerRun(program);
 registerInspect(program);
 registerResume(program);

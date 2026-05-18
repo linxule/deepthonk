@@ -15,6 +15,10 @@ import {
   deepthonkStatus,
   deepthonkResult,
   deepthonkCancel,
+  deepthonkProfileDelete,
+  deepthonkProfileList,
+  deepthonkProfileSave,
+  deepthonkProfileShow,
   exportArgsSchema,
   jobArgsSchema,
   mutateArgsSchema,
@@ -30,6 +34,13 @@ import {
   resumeOutputSchema,
   rankOutputSchema,
   mutateOutputSchema,
+  profileDeleteOutputSchema,
+  profileListArgsSchema,
+  profileListOutputSchema,
+  profileNameArgsSchema,
+  profileSaveArgsSchema,
+  profileSaveOutputSchema,
+  profileShowOutputSchema,
   toolError,
   toolResult
 } from "./tools.js";
@@ -224,6 +235,50 @@ export function createDeepThonkMcpServer(): McpServer {
     rubric: z.string().optional(),
     candidate: z.string().min(1)
   });
+
+  server.registerTool(
+    "deepthonk.profile_list",
+    {
+      title: "List DeepThonk Profiles",
+      description: "List saved named profiles.",
+      inputSchema: profileListArgsSchema.shape,
+      outputSchema: profileListOutputSchema.shape
+    },
+    async (args) => safeTool(async () => toolResult(await deepthonkProfileList(args)))
+  );
+
+  server.registerTool(
+    "deepthonk.profile_show",
+    {
+      title: "Show DeepThonk Profile",
+      description: "Show a saved named profile with secret-shaped values redacted.",
+      inputSchema: profileNameArgsSchema.shape,
+      outputSchema: profileShowOutputSchema.shape
+    },
+    async (args) => safeTool(async () => toolResult(await deepthonkProfileShow(args)))
+  );
+
+  server.registerTool(
+    "deepthonk.profile_save",
+    {
+      title: "Save DeepThonk Profile",
+      description: "Save a reusable named profile bundle.",
+      inputSchema: profileSaveArgsSchema.shape,
+      outputSchema: profileSaveOutputSchema.shape
+    },
+    async (args) => safeTool(async () => toolResult(await deepthonkProfileSave(args)))
+  );
+
+  server.registerTool(
+    "deepthonk.profile_delete",
+    {
+      title: "Delete DeepThonk Profile",
+      description: "Delete a saved named profile.",
+      inputSchema: profileNameArgsSchema.shape,
+      outputSchema: profileDeleteOutputSchema.shape
+    },
+    async (args) => safeTool(async () => toolResult(await deepthonkProfileDelete(args)))
+  );
 
   return server;
 }

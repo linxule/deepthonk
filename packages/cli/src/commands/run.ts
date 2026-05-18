@@ -2,6 +2,7 @@ import type { Command } from "commander";
 import { runDeepThonk } from "@deepthonk/core";
 import { createDriver } from "@deepthonk/providers";
 import { resolveRunConfig } from "../config.js";
+import { redacted } from "../redaction.js";
 
 export function registerRun(program: Command): void {
   program
@@ -44,6 +45,7 @@ export function registerRun(program: Command): void {
     .action(async (options) => {
       const resolved = await resolveRunConfig(options);
       if (options.dryRun) {
+        if (resolved.providerConfig.provider === "sampling") createDriver(resolved.providerConfig);
         console.log(JSON.stringify(redacted(withApiKeyPresence(resolved)), null, 2));
         return;
       }
@@ -62,19 +64,6 @@ export function registerRun(program: Command): void {
         )
       );
     });
-}
-
-// Match keys that hold a secret value. Exclude metadata pointers like apiKeyEnv/apiKeyFile/apiKeyStdin
-// which only name where the secret lives.
-const SECRET_KEY_RE = /^(api[_-]?key|token|secret|password|authorization|bearer|cookie|credential)$/i;
-
-function redacted(value: unknown): unknown {
-  return JSON.parse(
-    JSON.stringify(value, (key, inner) => {
-      if (SECRET_KEY_RE.test(key) && inner) return "[redacted]";
-      return inner;
-    })
-  );
 }
 
 function withApiKeyPresence<T extends { providerConfig: { apiKeyEnv?: string; apiKey?: string } }>(value: T): T & { providerConfig: T["providerConfig"] & { apiKeyPresent: boolean } } {

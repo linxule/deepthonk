@@ -1,5 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import YAML from "yaml";
 import {
@@ -21,7 +24,20 @@ import {
   type BuiltInProfileName,
   type CandidateInput
 } from "@deepthonk/core";
-import { createDriver, defaultPricesForProviderConfig, loadDeepThonkEnv, loadNamedProfile, resolveProviderConfig, resolveProviderModels, type ProviderConfig } from "@deepthonk/providers";
+import {
+  createDriver,
+  defaultPricesForProviderConfig,
+  listProfiles,
+  loadDeepThonkEnv,
+  loadNamedProfile,
+  NAMED_PROFILE_NAME_RE,
+  profilePath,
+  profilesDir,
+  resolveProviderConfig,
+  resolveProviderModels,
+  type NamedProfileBundle,
+  type ProviderConfig
+} from "@deepthonk/providers";
 import { recordRunResource } from "./resources.js";
 
 export const toolNames = [
@@ -34,7 +50,11 @@ export const toolNames = [
   "deepthonk.rank",
   "deepthonk.mutate",
   "deepthonk.resume",
-  "deepthonk.export"
+  "deepthonk.export",
+  "deepthonk.profile_list",
+  "deepthonk.profile_show",
+  "deepthonk.profile_save",
+  "deepthonk.profile_delete"
 ] as const;
 
 export const planArgsSchema = z.object({
@@ -715,4 +735,186 @@ function serializeToolError(error: unknown, runDir?: string): Record<string, unk
     retryable: false,
     run_dir: runDir
   };
+}
+
+export const profileListArgsSchema = z.object({});
+export const profileNameArgsSchema = z.object({
+  name: z.string().min(1)
+});
+export const profileSaveArgsSchema = z.object({
+  name: z.string().min(1),
+  force: z.boolean().optional(),
+  profile: z.enum(["quick", "balanced", "paper"]).optional(),
+  prompt_style: z.enum(["general", "paper-programming"]).optional(),
+  provider: z.string().min(1).optional(),
+  base_url: z.string().optional(),
+  api_key_env: z.string().optional(),
+  models: z.object({
+    generator: z.string().optional(),
+    mutator: z.string().optional(),
+    judge: z.string().optional(),
+    finalizer: z.string().optional()
+  }).optional(),
+  providers: z.record(z.unknown()).optional(),
+  algorithm: z.record(z.unknown()).optional(),
+  prompts: z.record(z.object({ system: z.string().optional(), user: z.string().optional() })).optional(),
+  budget: z.unknown().optional(),
+  concurrency: z.unknown().optional(),
+  retry: z.unknown().optional(),
+  output: z.unknown().optional()
+}).passthrough();
+
+export const profileListOutputSchema = z.object({
+  profiles: z.array(z.string())
+});
+export const profileShowOutputSchema = z.object({
+  profile: z.object({}).passthrough()
+});
+export const profileSaveOutputSchema = z.object({
+  path: z.string()
+});
+export const profileDeleteOutputSchema = z.object({
+  deleted: z.string()
+});
+
+export async function deepthonkProfileList(_argsInput: unknown): Promise<Record<string, unknown>> {
+  profileListArgsSchema.parse(_argsInput ?? {});
+  return { profiles: await listProfiles() };
+}
+
+export async function deepthonkProfileShow(argsInput: unknown): Promise<Record<string, unknown>> {
+  const args = profileNameArgsSchema.parse(argsInput);
+  return { profile: redactedProfile(await loadNamedProfile(args.name)) as Record<string, unknown> };
+}
+
+export async function deepthonkProfileSave(argsInput: unknown): Promise<Record<string, unknown>> {
+  const args = profileSaveArgsSchema.parse(argsInput);
+  const { name, force, ...profile } = args;
+  const path = await saveMcpProfileBundle(name, stripUndefined(profile) as NamedProfileBundle, Boolean(force));
+  return { path };
+}
+
+export async function deepthonkProfileDelete(argsInput: unknown): Promise<Record<string, unknown>> {
+  const args = profileNameArgsSchema.parse(argsInput);
+  await loadNamedProfile(args.name);
+  const path = profilePath(args.name);
+  await unlink(path);
+  return { deleted: path };
+}
+
+const MCP_SECRET_KEY_RE = /^(api[_-]?key|token|secret|password|authorization|bearer|cookie|credential)$/i;
+const MCP_RAW_API_KEY_RE = /^api[_-]?key$/i;
+
+function redactedProfile(value: unknown): unknown {
+  const serialized = JSON.stringify(value, (key, inner) => {
+    if (MCP_SECRET_KEY_RE.test(key) && inner) return "[redacted]";
+    return inner;
+  });
+  return serialized === undefined ? undefined : JSON.parse(serialized);
+}
+
+async function saveMcpProfileBundle(name: string, bundle: NamedProfileBundle, force: boolean): Promise<string> {
+  assertMcpProfileName(name);
+  rejectMcpRawApiKeyFields(bundle, name);
+  const dir = profilesDir();
+  const target = profilePath(name);
+  await mkdir(dir, { recursive: true });
+  if (existsSync(target) && !force) {
+    throw new ConfigError(`Named profile '${name}' already exists at ${target}.`, {
+      code: "config.profile_exists",
+      retryable: false,
+      fix: "Pass force: true to overwrite it."
+    });
+  }
+
+  const yaml = YAML.stringify(bundle);
+  await validateMcpProfileWithLoadNamedProfile(yaml);
+  if (force) {
+    await writeMcpProfileOverwrite(target, yaml, name);
+  } else {
+    await writeMcpProfileCreate(target, yaml, name);
+  }
+  return target;
+}
+
+function assertMcpProfileName(name: string): void {
+  if (!NAMED_PROFILE_NAME_RE.test(name)) {
+    throw new ConfigError(`Invalid profile name '${name}'. Names must start with a letter and contain only letters, digits, hyphens, and underscores (max 64 chars).`, {
+      code: "config.profile_invalid_name",
+      retryable: false,
+      fix: "Rename the profile to match /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/."
+    });
+  }
+}
+
+function rejectMcpRawApiKeyFields(value: unknown, name: string): void {
+  const seen = new WeakSet<object>();
+  const visit = (current: unknown, path: string): void => {
+    if (!current || typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      current.forEach((item, index) => visit(item, `${path}[${index}]`));
+      return;
+    }
+    for (const [key, inner] of Object.entries(current as Record<string, unknown>)) {
+      const childPath = path ? `${path}.${key}` : key;
+      if (MCP_RAW_API_KEY_RE.test(key)) {
+        throw new ConfigError(`Named profile '${name}' must not contain a raw '${key}' value at ${childPath}.`, {
+          code: "config.profile_raw_api_key",
+          retryable: false,
+          fix: "Use api_key_env to reference an environment variable name instead. Raw secrets must not be written to profile files."
+        });
+      }
+      visit(inner, childPath);
+    }
+  };
+  visit(value, "");
+}
+
+async function validateMcpProfileWithLoadNamedProfile(yaml: string): Promise<void> {
+  const tempName = `ProfileValidate${randomUUID().replaceAll("-", "").slice(0, 32)}`;
+  const tempPath = profilePath(tempName);
+  await writeFile(tempPath, yaml, { encoding: "utf8", flag: "wx" });
+  try {
+    await loadNamedProfile(tempName);
+  } finally {
+    await unlink(tempPath).catch(() => undefined);
+  }
+}
+
+async function writeMcpProfileCreate(target: string, yaml: string, name: string): Promise<void> {
+  try {
+    await writeFile(target, yaml, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new ConfigError(`Named profile '${name}' already exists at ${target}.`, {
+        code: "config.profile_exists",
+        retryable: false,
+        fix: "Pass force: true to overwrite it."
+      });
+    }
+    throw error;
+  }
+}
+
+async function writeMcpProfileOverwrite(target: string, yaml: string, name: string): Promise<void> {
+  const tempPath = join(dirname(target), `.${name}.${randomUUID()}.tmp`);
+  await writeFile(tempPath, yaml, { encoding: "utf8", flag: "wx" });
+  try {
+    await rename(tempPath, target);
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+function stripUndefined(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripUndefined);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, inner]) => inner !== undefined)
+      .map(([key, inner]) => [key, stripUndefined(inner)])
+  );
 }

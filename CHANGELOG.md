@@ -2,6 +2,13 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- CLI profile registry CRUD: `deepthonk profile list`, `deepthonk profile show <name>`, `deepthonk profile save <name>`, and `deepthonk profile delete <name>`.
+- MCP profile registry CRUD tools: `deepthonk.profile_list`, `deepthonk.profile_show`, `deepthonk.profile_save`, and `deepthonk.profile_delete`.
+
 ## [0.1.1] — 2026-05-18
 
 ### Added — agent polish

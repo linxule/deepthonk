@@ -11,6 +11,9 @@ import {
   deepthonkRun,
   deepthonkStart,
   deepthonkStatus,
+  deepthonkProfileList,
+  deepthonkProfileSave,
+  deepthonkProfileShow,
   statusOutputSchema,
   isAllowedMcpHttpHost,
   promptNames,
@@ -29,6 +32,10 @@ describe("MCP helpers", () => {
     expect(toolNames).toContain("deepthonk.status");
     expect(toolNames).toContain("deepthonk.result");
     expect(toolNames).toContain("deepthonk.cancel");
+    expect(toolNames).toContain("deepthonk.profile_list");
+    expect(toolNames).toContain("deepthonk.profile_show");
+    expect(toolNames).toContain("deepthonk.profile_save");
+    expect(toolNames).toContain("deepthonk.profile_delete");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/summary");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/usage");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/population/{generation}");
@@ -115,6 +122,53 @@ describe("MCP helpers", () => {
     }
   });
 
+  it("lists named profiles through profile_list", async () => {
+    await withProfilesDir(async (profilesDir) => {
+      await writeFile(join(profilesDir, "alpha.yaml"), validMcpProfileYaml());
+      await writeFile(join(profilesDir, "beta.yaml"), validMcpProfileYaml());
+      await expect(deepthonkProfileList({})).resolves.toEqual({ profiles: ["alpha", "beta"] });
+    });
+  });
+
+  it("saves a named profile through profile_save and lists it", async () => {
+    await withProfilesDir(async (profilesDir) => {
+      const saved = await deepthonkProfileSave(validMcpProfileArgs("round-trip"));
+      expect(saved.path).toBe(join(profilesDir, "round-trip.yaml"));
+      expect(await readFile(String(saved.path), "utf8")).toContain("prompt_style: general");
+      await expect(deepthonkProfileList({})).resolves.toEqual({ profiles: ["round-trip"] });
+    });
+  });
+
+  it("shows named profiles with secret-shaped values redacted", async () => {
+    await withProfilesDir(async () => {
+      await deepthonkProfileSave({
+        ...validMcpProfileArgs("with-redaction"),
+        providers: {
+          judge: {
+            provider: "fake",
+            model: "fake-model",
+            authorization: "Bearer raw-secret"
+          }
+        }
+      });
+      const shown = await deepthonkProfileShow({ name: "with-redaction" });
+      expect((shown.profile as { api_key_env?: string }).api_key_env).toBe("DEEPTHONK_API_KEY");
+      expect((shown.profile as { providers: { judge: { authorization: string } } }).providers.judge.authorization).toBe("[redacted]");
+      expect(JSON.stringify(shown)).not.toContain("raw-secret");
+    });
+  });
+
+  it("refuses raw api_key in profile_save payloads", async () => {
+    await withProfilesDir(async () => {
+      await expect(
+        deepthonkProfileSave({
+          ...validMcpProfileArgs("bad-secret"),
+          api_key: "raw-secret"
+        })
+      ).rejects.toMatchObject({ code: "config.profile_raw_api_key" });
+    });
+  });
+
   it("rejects profile_name combined with config_path", async () => {
     const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-profile-conflict-"));
     const configPath = join(root, "config.yaml");
@@ -138,9 +192,22 @@ describe("MCP helpers", () => {
     expect(isAllowedMcpHttpHost("evil.example:3333", ["127.0.0.1:3333", "localhost:3333"])).toBe(false);
   });
 
-  it("does not advertise deferred MCP Sampling as a provider", () => {
-    expect(runArgsSchema.safeParse({ task: "toy", provider: "sampling" }).success).toBe(false);
+  it("accepts MCP Sampling provider args and enforces client capability at run-start", async () => {
+    expect(runArgsSchema.safeParse({ task: "toy", provider: "sampling" }).success).toBe(true);
     expect(runArgsSchema.safeParse({ task: "toy", provider: "openrouter" }).success).toBe(true);
+    await expect(
+      deepthonkRun(
+        { task: "toy", provider: "sampling" },
+        {
+          getClientCapabilities: () => ({}),
+          createMessage: async () => ({
+            model: "unused",
+            role: "assistant",
+            content: { type: "text", text: "unused" }
+          })
+        }
+      )
+    ).rejects.toMatchObject({ code: "provider.sampling_capability_missing" });
   });
 
   it("describes per-phase prompt variables in MCP JSON schemas", () => {
@@ -293,4 +360,44 @@ function promptPhaseDescription(schema: Parameters<typeof zodToJsonSchema>[0], p
 interface JsonObject {
   properties?: Record<string, unknown>;
   description?: string;
+}
+
+async function withProfilesDir<T>(action: (profilesDir: string) => Promise<T>): Promise<T> {
+  const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-profile-tools-"));
+  const originalDir = process.env.DEEPTHONK_PROFILES_DIR;
+  process.env.DEEPTHONK_PROFILES_DIR = profilesDir;
+  try {
+    return await action(profilesDir);
+  } finally {
+    if (originalDir === undefined) delete process.env.DEEPTHONK_PROFILES_DIR;
+    else process.env.DEEPTHONK_PROFILES_DIR = originalDir;
+  }
+}
+
+function validMcpProfileArgs(name: string): Record<string, unknown> {
+  return {
+    name,
+    profile: "quick",
+    prompt_style: "general",
+    provider: "fake",
+    api_key_env: "DEEPTHONK_API_KEY",
+    models: {
+      generator: "fake-model",
+      mutator: "fake-model",
+      judge: "fake-model"
+    }
+  };
+}
+
+function validMcpProfileYaml(): string {
+  return [
+    "profile: quick",
+    "prompt_style: general",
+    "provider: fake",
+    "api_key_env: DEEPTHONK_API_KEY",
+    "models:",
+    "  generator: fake-model",
+    "  mutator: fake-model",
+    "  judge: fake-model"
+  ].join("\n");
 }
