@@ -1,6 +1,7 @@
 import pLimit from "p-limit";
 import { z } from "zod";
 import { fitBradleyTerry } from "./bradleyTerry.js";
+import { ConfigError } from "./errors.js";
 import { parseJsonObject } from "./json.js";
 import { comparePrompt, mutatePrompt } from "./prompts.js";
 import type { BtScore, Candidate, Comparison, ModelDriver, ModelTextResult, PromptOverrides, RunConfig } from "./schemas.js";
@@ -85,6 +86,16 @@ export async function rankCandidates(options: RankCandidatesOptions): Promise<Ra
           } catch {
             parsed = undefined;
           }
+          if (!parsed) {
+            throw new ConfigError(
+              `Judge produced invalid-JSON output for rank comparison rank-${i}-${j}. Refusing to synthesize a tie and pollute the ranking.`,
+              {
+                code: "judge.persistent_invalid_json",
+                retryable: false,
+                fix: "The judge model is producing unparseable output. Inspect the raw response, switch judge models, or use a different judge that returns strict JSON."
+              }
+            );
+          }
           const comparison: Comparison = {
             id: `rank-${i}-${j}`,
             runId: options.runId ?? "rank",
@@ -93,15 +104,14 @@ export async function rankCandidates(options: RankCandidatesOptions): Promise<Ra
             candidateBId: candidateB.id,
             presentedAOriginalId: candidateA.id,
             presentedBOriginalId: candidateB.id,
-            winner: parsed?.winner ?? "tie",
-            confidence: parsed?.confidence,
-            critiqueForA: parsed?.feedback_a ?? parsed?.critique_for_A ?? (parsed ? "" : "Invalid comparison JSON; recorded as tie."),
-            critiqueForB: parsed?.feedback_b ?? parsed?.critique_for_B ?? (parsed ? "" : "Invalid comparison JSON; recorded as tie."),
-            selectionReason: parsed?.selection_reason ?? "invalid_json_tie",
+            winner: parsed.winner,
+            confidence: parsed.confidence,
+            critiqueForA: parsed.feedback_a ?? parsed.critique_for_A ?? "",
+            critiqueForB: parsed.feedback_b ?? parsed.critique_for_B ?? "",
+            selectionReason: parsed.selection_reason ?? "",
             model: result.model,
             provider: result.provider,
             metadata: compactMetadata({
-              invalid_json_tie: parsed ? undefined : true,
               model_call_count: 1,
               provider_retry_count: result.retryCount || undefined
             })

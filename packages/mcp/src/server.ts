@@ -51,7 +51,7 @@ import { renderPrompt } from "./prompts.js";
 export function createDeepThonkMcpServer(): McpServer {
   const server = new McpServer({
     name: "deepthonk",
-    version: "0.1.1"
+    version: "0.1.2"
   });
   const samplingContext: McpSamplingContext = {
     getClientCapabilities: () => server.server.getClientCapabilities(),

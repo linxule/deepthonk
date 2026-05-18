@@ -17,7 +17,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const program = new Command();
-program.name("deepthonk").description("Thonk harder, not richer.").version("0.1.0").option("--json-errors", "Print machine-readable errors to stderr.");
+program.name("deepthonk").description("Thonk harder, not richer.").version("0.1.2").option("--json-errors", "Print machine-readable errors to stderr.");
 
 registerPlan(program);
 registerProfile(program);
