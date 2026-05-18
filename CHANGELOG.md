@@ -8,10 +8,10 @@ Initial public release. Independent TypeScript reimplementation of the OpenDeepT
 
 ### Added — agent-composable surface
 
-Every algorithm dimension is reachable inline through MCP arguments and CLI flags. No filesystem detours required.
+Every algorithm dimension is reachable inline through MCP arguments and CLI flags. No filesystem detours required for one-off agent prompt overrides.
 
 - `deepthonk.run` / `deepthonk.start` accept optional `n`, `k`, `t`, `m`, `lambda`, `sample_temperature`, `mutate_temperature`, `judge_temperature`, `prompt_style`, `concurrency`, and per-phase `prompts` overrides.
-- CLI mirrors with `--n`, `--k`, `--t`, `--m`, `--lambda`, per-phase `--*-temperature` flags, `--prompt-style`, and `--prompts <yaml>`.
+- CLI mirrors with `--n`, `--k`, `--t`, `--m`, `--lambda`, per-phase `--*-temperature` flags, `--prompt-style`, `--prompts <yaml>`, and `--prompts-json <json>`.
 - Per-phase prompt template overrides with `{task}`, `{rubric}`, `{candidate}`, `{candidateA}`, `{candidateB}`, `{critique}` variables, `{{` / `}}` escape, and fail-fast validation on unknown variables at run-start.
 - Documentation in `docs/customization.md`.
 

@@ -26,6 +26,16 @@ describe("deepthonk CLI", () => {
     expect(JSON.parse(stdout).profile).toBe("paper");
   });
 
+  it("prints plan from config with algorithm overrides", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-plan-config-"));
+    const configPath = join(configDir, "config.yaml");
+    await writeFile(configPath, ["profile: paper", "algorithm:", "  n: 8", "  k: 2", "  t: 1", "  m: 4"].join("\n"));
+    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "plan", "--config", configPath]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.profile).toBe("custom");
+    expect(parsed.calls).toBe(38);
+  });
+
   it("resolves run config paths from the original workspace cwd", async () => {
     const { stdout } = await execFileAsync(process.execPath, [
       "--import",
@@ -246,6 +256,32 @@ describe("deepthonk CLI", () => {
     const parsed = JSON.parse(stdout);
     expect(parsed.runConfig.promptOverrides.generate.system).toContain("attorney");
     expect(parsed.runConfig.promptOverrides.compare.user).toContain("enforceable");
+  });
+
+  it("loads prompt overrides from inline --prompts-json after YAML", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-prompts-json-"));
+    const promptsPath = join(configDir, "prompts.yaml");
+    await writeFile(promptsPath, ["generate:", "  system: 'YAML prompt'"].join("\n"));
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      cli,
+      "run",
+      "--provider",
+      "fake",
+      "--profile",
+      "quick",
+      "--task",
+      "toy",
+      "--prompts",
+      promptsPath,
+      "--prompts-json",
+      JSON.stringify({ generate: { system: "JSON prompt" }, compare: { system: "Judge from JSON" } }),
+      "--dry-run"
+    ]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig.promptOverrides.generate.system).toBe("JSON prompt");
+    expect(parsed.runConfig.promptOverrides.compare.system).toBe("Judge from JSON");
   });
 
   it("--prompt-style overrides profile-derived default", async () => {

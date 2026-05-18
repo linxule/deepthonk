@@ -177,6 +177,30 @@ describe("runDeepThonk", () => {
     expect(traceConfig).not.toContain("do-not-write");
     expect(traceConfig).toContain("[redacted]");
   });
+
+  it("traces bottom-quartile and rounding discards for non-divisible populations", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-discard-"));
+    const config: RunConfig = {
+      task: "solve toy",
+      profile: { ...builtInProfiles.quick, n: 6, k: 1, t: 1, m: 1 },
+      runDir,
+      seed: 1,
+      provider: "fake",
+      generatorModel: "fake-model",
+      mutatorModel: "fake-model",
+      judgeModel: "fake-model",
+      concurrency: { generate: 6, judge: 3, mutate: 4 },
+      retry: { httpRetries: 0, invalidJsonRetries: 1 },
+      output: { includeRawModelOutputs: false, includePrompts: false }
+    };
+    await runDeepThonk(config, new FakeDriver());
+    const candidates = (await readFile(join(runDir, "candidates.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { status?: string; metadata?: { discardReason?: string } });
+    const discarded = candidates.filter((candidate) => candidate.status === "discarded");
+    expect(discarded.map((candidate) => candidate.metadata?.discardReason).sort()).toEqual(["bottom_quartile", "rounding_trim"]);
+  });
 });
 
 class DelayedFakeDriver extends FakeDriver {

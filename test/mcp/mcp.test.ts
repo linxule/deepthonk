@@ -5,11 +5,13 @@ import { describe, expect, it } from "vitest";
 import {
   deepthonkCancel,
   deepthonkPlan,
+  deepthonkPlanAsync,
   deepthonkResult,
   deepthonkRun,
   deepthonkStart,
   deepthonkStatus,
   statusOutputSchema,
+  isAllowedMcpHttpHost,
   promptNames,
   readRunResource,
   resourceTemplates,
@@ -25,6 +27,8 @@ describe("MCP helpers", () => {
     expect(toolNames).toContain("deepthonk.result");
     expect(toolNames).toContain("deepthonk.cancel");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/summary");
+    expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/usage");
+    expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/population/{generation}");
     expect(promptNames).toContain("deepthonk/compare");
   });
 
@@ -73,6 +77,23 @@ describe("MCP helpers", () => {
     expect(summary).toContain(String(result.winner_id));
     const runs = await readRunResource("deepthonk://runs", join(runDir, ".."));
     expect(runs).toContain(String(result.run_id));
+    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/config`, join(runDir, ".."))).resolves.toContain("\"provider\": \"fake\"");
+    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/usage`, join(runDir, ".."))).resolves.toContain("\"role\"");
+    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/population/0`, join(runDir, ".."))).resolves.toContain("\"kind\"");
+  });
+
+  it("plans from config_path with algorithm overrides", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-plan-"));
+    const configPath = join(root, "config.yaml");
+    await writeFile(configPath, ["profile: paper", "algorithm:", "  n: 8", "  k: 2", "  t: 1", "  m: 4"].join("\n"));
+    const plan = await deepthonkPlanAsync({ config_path: configPath });
+    expect(plan.profile).toBe("custom");
+    expect(plan.calls).toBe(38);
+  });
+
+  it("validates HTTP Host allowlist before transport handling", () => {
+    expect(isAllowedMcpHttpHost("127.0.0.1:3333", ["127.0.0.1:3333", "localhost:3333"])).toBe(true);
+    expect(isAllowedMcpHttpHost("evil.example:3333", ["127.0.0.1:3333", "localhost:3333"])).toBe(false);
   });
 
   it("does not advertise deferred MCP Sampling as a provider", () => {

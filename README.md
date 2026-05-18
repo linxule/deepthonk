@@ -6,7 +6,7 @@ DeepThonk implements the OpenDeepThink algorithm (Zhou et al., 2026, [arXiv:2605
 
 DeepThonk runs a population of candidate answers through pairwise judging, Bradley-Terry ranking, critique-guided mutation, elite preservation, and a final dense ranking pass. The CLI and MCP server both call the same TypeScript core engine.
 
-**Designed for agents.** Every algorithm dimension — population shape (`n`, `k`, `t`, `m`), regularization (`lambda`), per-phase temperatures, prompt style, and per-phase prompt templates — is reachable inline through MCP arguments and CLI flags. No filesystem detours required. Every intermediate artifact (candidates, comparisons, scores, per-call usage, status) is exposed as a streaming MCP resource so an agent can inspect any step. See [Customization](https://github.com/linxule/deepthonk/blob/main/docs/customization.md) for the full agent-composable surface.
+**Designed for agents.** Every algorithm dimension — population shape (`n`, `k`, `t`, `m`), regularization (`lambda`), per-phase temperatures, prompt style, and per-phase prompt templates — is reachable inline through MCP arguments and CLI flags. CLI can load prompt files with `--prompts` or inline JSON with `--prompts-json`; MCP accepts inline structured prompt args. Every intermediate artifact (config, candidates, populations, comparisons, scores, per-call usage, status) is exposed as an MCP resource so an agent can inspect any step. See [Customization](https://github.com/linxule/deepthonk/blob/main/docs/customization.md) for the full agent-composable surface.
 
 Use it for hard, verifiable reasoning, coding, planning, and synthesis where breadth plus judgment can beat one expensive single shot. Avoid it for highly subjective tasks where judge noise dominates.
 
@@ -198,7 +198,9 @@ All tools accept inline provider/model fields, or `config_path` pointing at a De
 
 - `deepthonk://runs` — JSON index of all runs in `runs/`.
 - `deepthonk://runs/{run_id}/summary` — run summary (JSON).
-- `deepthonk://runs/{run_id}/{candidates|comparisons|scores|trace}` — per-phase NDJSON.
+- `deepthonk://runs/{run_id}/config` — redacted run config (JSON).
+- `deepthonk://runs/{run_id}/{candidates|comparisons|scores|usage|trace}` — per-phase and per-call NDJSON.
+- `deepthonk://runs/{run_id}/population/{generation}` — population snapshot for a generation (JSON).
 - `deepthonk://runs/{run_id}/{winner|final}` — text artifacts.
 - `deepthonk://runs/{run_id}/status` — run state (JSON).
 - `deepthonk://jobs/{job_id}/{status|result}?run_dir=...` — job-scoped lookup; the `run_dir` query param is required.
@@ -218,7 +220,7 @@ Every algorithm dimension is reachable through MCP arguments and CLI flags:
 - **Population shape**: `n`, `k`, `t`, `m` — override profile defaults inline.
 - **Algorithm constants**: `lambda`, `sample_temperature`, `mutate_temperature`, `judge_temperature`.
 - **Prompt style**: `general` or `paper-programming`.
-- **Per-phase prompt templates**: override `generate`, `compare`, `mutate`, or `finalize` with custom system/user templates and variable substitution (`{task}`, `{rubric}`, `{candidate}`, `{candidateA}`, `{candidateB}`, `{critique}`). Unknown variables throw a fail-fast error at run-start.
+- **Per-phase prompt templates**: override `generate`, `compare`, `mutate`, or `finalize` with custom system/user templates and variable substitution (`{task}`, `{rubric}`, `{candidate}`, `{candidateA}`, `{candidateB}`, `{critique}`). CLI supports `--prompts <yaml>` and `--prompts-json <json>`; MCP supports inline `prompts`. Unknown variables throw a fail-fast error at run-start.
 - **Concurrency**: per-phase caps for `generate`, `judge`, `mutate`.
 
 Example agent call (MCP), no YAML file required:
@@ -237,7 +239,7 @@ Example agent call (MCP), no YAML file required:
 }
 ```
 
-CLI accepts the same surface, except prompt overrides are loaded from a YAML file via `--prompts <yaml>` (shell-quoting multi-line templates is hostile). MCP and CLI both merge over any `--config`/`config_path` YAML defaults.
+CLI accepts the same surface. Use `--prompts <yaml>` for reusable prompt files or `--prompts-json <json>` for one-off inline overrides. MCP and CLI both merge over any `--config`/`config_path` YAML defaults.
 
 See the [Customization guide](https://github.com/linxule/deepthonk/blob/main/docs/customization.md) for the complete variable contract, the compare-phase JSON safety rule, and three worked examples. Per-role provider routing (`providers.judge.provider = openrouter`) and per-model pricing remain YAML-only — they're nested structured config, not inline ergonomics.
 

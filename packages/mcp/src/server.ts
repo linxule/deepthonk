@@ -7,6 +7,7 @@ import {
   deepthonkExport,
   deepthonkMutate,
   deepthonkPlan,
+  deepthonkPlanAsync,
   deepthonkRank,
   deepthonkResume,
   deepthonkRun,
@@ -49,7 +50,7 @@ export function createDeepThonkMcpServer(): McpServer {
       inputSchema: planArgsSchema.shape,
       outputSchema: z.object({}).passthrough().describe("Budget plan with total calls and sequential rounds.")
     },
-    async (args) => safeTool(() => toolResult(deepthonkPlan(args)))
+    async (args) => safeTool(async () => toolResult(args.config_path ? await deepthonkPlanAsync(args) : deepthonkPlan(args)))
   );
 
   server.registerTool(
@@ -180,6 +181,18 @@ export function createDeepThonkMcpServer(): McpServer {
   );
 
   server.registerResource(
+    "deepthonk-run-population",
+    new ResourceTemplate("deepthonk://runs/{run_id}/population/{generation}", {
+      list: async () => ({ resources: [] })
+    }),
+    {
+      title: "DeepThonk Run Population",
+      mimeType: "application/json"
+    },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: await readRunResource(uri.href) }] })
+  );
+
+  server.registerResource(
     "deepthonk-job-resource",
     new ResourceTemplate("deepthonk://jobs/{job_id}/{resource}", {
       list: async () => ({ resources: [] })
@@ -238,6 +251,11 @@ export async function serveMcp(options: { transport: "stdio" | "http"; port?: nu
 async function serveHttp(port: number): Promise<void> {
   const allowedHosts = [`127.0.0.1:${port}`, `localhost:${port}`];
   const httpServer = createServer(async (req, res) => {
+    if (!isAllowedMcpHttpHost(req.headers.host, allowedHosts)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden Host header." }, id: null }));
+      return;
+    }
     if (req.url !== "/mcp") {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "Not found" }));
@@ -286,6 +304,10 @@ async function serveHttp(port: number): Promise<void> {
   });
 }
 
+export function isAllowedMcpHttpHost(host: string | undefined, allowedHosts: string[]): boolean {
+  return Boolean(host && allowedHosts.includes(host));
+}
+
 function registerPrompt(server: McpServer, name: string, argsSchema: z.ZodRawShape): void {
   server.registerPrompt(
     name,
@@ -310,7 +332,14 @@ function registerPrompt(server: McpServer, name: string, argsSchema: z.ZodRawSha
 
 async function readJsonBody(req: import("node:http").IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  let size = 0;
+  const maxBytes = 1_000_000;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > maxBytes) throw new Error("Request body too large.");
+    chunks.push(buffer);
+  }
   const text = Buffer.concat(chunks).toString("utf8");
   return text.trim() ? JSON.parse(text) : undefined;
 }

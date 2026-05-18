@@ -1,15 +1,20 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ConfigError, detectResumeState, exportRun, listRunRecords, readRunArtifact, readRunStatus, recordRunIndex, resolveRunDir, type RunArtifactName } from "@deepthonk/core";
 
 export const resourceTemplates = [
   "deepthonk://runs",
   "deepthonk://runs/{run_id}/summary",
+  "deepthonk://runs/{run_id}/config",
   "deepthonk://runs/{run_id}/candidates",
   "deepthonk://runs/{run_id}/comparisons",
   "deepthonk://runs/{run_id}/scores",
+  "deepthonk://runs/{run_id}/usage",
   "deepthonk://runs/{run_id}/trace",
   "deepthonk://runs/{run_id}/final",
   "deepthonk://runs/{run_id}/winner",
   "deepthonk://runs/{run_id}/status",
+  "deepthonk://runs/{run_id}/population/{generation}",
   "deepthonk://jobs/{job_id}/status",
   "deepthonk://jobs/{job_id}/result"
 ] as const;
@@ -17,6 +22,12 @@ export const resourceTemplates = [
 export async function readRunResource(uri: string, runsRoot = "runs"): Promise<string> {
   if (uri === "deepthonk://runs") {
     return JSON.stringify(await listRunRecords(runsRoot), null, 2);
+  }
+  const populationMatch = uri.match(/^deepthonk:\/\/runs\/([^/]+)\/population\/([^/]+)$/);
+  if (populationMatch) {
+    const [, runId, generation] = populationMatch;
+    const base = await resolveRunDir(runId, runsRoot);
+    return readFile(join(base, `population-${generation}.json`), "utf8");
   }
   const match = uri.match(/^deepthonk:\/\/runs\/([^/]+)\/([^/]+)$/);
   if (!match) throw new Error(`Unsupported resource URI: ${uri}`);
@@ -58,7 +69,7 @@ export async function recordRunResource(runId: string, runDir: string, runsRoot 
 
 export async function listRunResources(runsRoot = "runs"): Promise<Array<{ uri: string; name: string; title: string; mimeType: string }>> {
   const records = await listRunRecords(runsRoot);
-  const resources = ["summary", "candidates", "comparisons", "scores", "trace", "final", "winner", "status"];
+  const resources = ["summary", "config", "candidates", "comparisons", "scores", "usage", "trace", "final", "winner", "status"];
   return records.flatMap((record) =>
     resources.map((resource) => ({
       uri: `deepthonk://runs/${record.run_id}/${resource}`,
@@ -71,7 +82,9 @@ export async function listRunResources(runsRoot = "runs"): Promise<Array<{ uri: 
 
 function resourceMimeType(resource: string): string {
   if (resource === "summary") return "application/json";
+  if (resource === "config") return "application/json";
   if (resource === "status") return "application/json";
+  if (resource === "population") return "application/json";
   if (resource === "final" || resource === "winner") return "text/plain";
   return "application/x-ndjson";
 }
@@ -84,12 +97,16 @@ function resourceArtifact(resource: string): RunArtifactName {
   switch (resource) {
     case "summary":
       return "summary";
+    case "config":
+      return "config";
     case "candidates":
       return "candidates";
     case "comparisons":
       return "comparisons";
     case "scores":
       return "scores";
+    case "usage":
+      return "usage";
     case "trace":
       return "trace";
     case "final":

@@ -59,7 +59,7 @@ export function fitBradleyTerry(
     fitLbfgs(scores, outcomes, lambda);
   }
 
-  return ids
+  const ranked = ids
     .map((candidateId, i) => {
       const count = counts.get(candidateId)!;
       return {
@@ -73,8 +73,17 @@ export function fitBradleyTerry(
         comparisons: count.comparisons
       };
     })
-    .sort((left, right) => right.score - left.score || left.candidateId.localeCompare(right.candidateId))
-    .map((score, i) => ({ ...score, rank: i + 1 }));
+    .sort((left, right) => right.score - left.score || left.candidateId.localeCompare(right.candidateId));
+
+  let tieGroup = 0;
+  let previousScore: number | undefined;
+  return ranked.map((score, i) => {
+    if (previousScore === undefined || Math.abs(score.score - previousScore) > 1e-9) {
+      tieGroup += 1;
+      previousScore = score.score;
+    }
+    return { ...score, rank: i + 1, tieGroup, tieBreakerRank: i + 1 };
+  });
 }
 
 function fitLbfgs(scores: number[], outcomes: Outcome[], lambda: number): void {

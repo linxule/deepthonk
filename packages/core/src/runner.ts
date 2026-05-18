@@ -143,6 +143,7 @@ export async function runDeepThonk(configInput: RunConfig, driver: ModelDriver, 
       const survivors = ranked.filter((candidate) => !discarded.has(candidate.id));
       const mutationParents = survivors.slice(0, config.profile.n - elites.length);
       const critiquesByCandidate = aggregateCritiques(population, comparisons);
+      await traceDiscardedCandidates(trace, ranked, new Set([...elites, ...mutationParents].map((candidate) => candidate.id)), discarded, gen);
 
       await assertNotCancelled(`generation ${gen} mutation`);
       await writeStatus("running", "generation_mutation", { generation: gen });
@@ -263,6 +264,29 @@ export function copyElites(elites: Candidate[], generation: number): Candidate[]
 
 export function keepPopulationSize(population: Candidate[], n: number): Candidate[] {
   return population.slice(0, n);
+}
+
+async function traceDiscardedCandidates(
+  trace: TraceStore,
+  ranked: Candidate[],
+  carriedIds: Set<string>,
+  bottomQuartileIds: Set<string>,
+  generation: number
+): Promise<void> {
+  for (const candidate of ranked) {
+    if (carriedIds.has(candidate.id)) continue;
+    const discardReason = bottomQuartileIds.has(candidate.id) ? "bottom_quartile" : "rounding_trim";
+    await trace.writeCandidate({
+      ...candidate,
+      status: "discarded",
+      metadata: {
+        ...candidate.metadata,
+        discardReason,
+        discardedAt: new Date().toISOString()
+      }
+    });
+    await trace.event({ type: "candidate.discarded", candidate_id: candidate.id, generation, reason: discardReason });
+  }
 }
 
 async function generateInitialPopulation(

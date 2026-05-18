@@ -36,6 +36,9 @@ export function registerRun(program: Command): void {
     .option("--judge-temperature <number>", "Temperature for pairwise judging")
     .option("--prompt-style <style>", "general|paper-programming")
     .option("--prompts <yaml>", "YAML file with per-phase prompt overrides")
+    .option("--prompts-json <json>", "Inline JSON object with per-phase prompt overrides")
+    .option("--include-prompts", "Store rendered prompts in candidate/comparison metadata")
+    .option("--include-raw-model-outputs", "Store raw provider responses in trace metadata")
     .option("--dry-run")
     .action(async (options) => {
       const resolved = await resolveRunConfig(options);

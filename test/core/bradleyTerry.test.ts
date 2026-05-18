@@ -30,6 +30,7 @@ describe("fitBradleyTerry", () => {
   it("handles ties with near equal scores", () => {
     const scores = fitBradleyTerry(["A", "B"], [comparison("A", "B", "tie")]);
     expect(Math.abs(scores[0].score - scores[1].score)).toBeLessThan(1e-6);
+    expect(scores[0].tieGroup).toBe(scores[1].tieGroup);
   });
 
   it("returns finite scores on disconnected graphs", () => {
@@ -38,7 +39,9 @@ describe("fitBradleyTerry", () => {
   });
 
   it("breaks exact ties by id", () => {
-    expect(fitBradleyTerry(["B", "A"], []).map((score) => score.candidateId)).toEqual(["A", "B"]);
+    const scores = fitBradleyTerry(["B", "A"], []);
+    expect(scores.map((score) => score.candidateId)).toEqual(["A", "B"]);
+    expect(scores.map((score) => score.tieGroup)).toEqual([1, 1]);
+    expect(scores.map((score) => score.tieBreakerRank)).toEqual([1, 2]);
   });
 });
-

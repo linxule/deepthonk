@@ -91,10 +91,13 @@ The blocking run response includes `summary_resource` and `trace_resource`; read
 
 - `deepthonk://runs`
 - `deepthonk://runs/{run_id}/summary`
+- `deepthonk://runs/{run_id}/config`
 - `deepthonk://runs/{run_id}/candidates`
 - `deepthonk://runs/{run_id}/comparisons`
 - `deepthonk://runs/{run_id}/scores`
+- `deepthonk://runs/{run_id}/usage`
 - `deepthonk://runs/{run_id}/trace`
+- `deepthonk://runs/{run_id}/population/{generation}`
 - `deepthonk://runs/{run_id}/final`
 - `deepthonk://runs/{run_id}/winner`
 - `deepthonk://runs/{run_id}/status`

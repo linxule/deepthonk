@@ -3,7 +3,7 @@ import { z } from "zod";
 import { fitBradleyTerry } from "./bradleyTerry.js";
 import { parseJsonObject } from "./json.js";
 import { comparePrompt, mutatePrompt } from "./prompts.js";
-import type { BtScore, Candidate, Comparison, ModelDriver, ModelTextResult } from "./schemas.js";
+import type { BtScore, Candidate, Comparison, ModelDriver, ModelTextResult, PromptOverrides, RunConfig } from "./schemas.js";
 
 export type CandidateInput = string | { id?: string; content: string };
 
@@ -18,6 +18,8 @@ export interface RankCandidatesOptions {
   temperature?: number;
   lambda?: number;
   concurrency?: number;
+  promptStyle?: RunConfig["promptStyle"];
+  promptOverrides?: Pick<PromptOverrides, "compare">;
 }
 
 export interface RankCandidatesResult {
@@ -34,6 +36,8 @@ export interface MutateCandidateOptions {
   driver: ModelDriver;
   mutatorModel: string;
   temperature?: number;
+  promptStyle?: RunConfig["promptStyle"];
+  promptOverrides?: Pick<PromptOverrides, "mutate">;
 }
 
 export interface MutateCandidateResult {
@@ -65,7 +69,7 @@ export async function rankCandidates(options: RankCandidatesOptions): Promise<Ra
         limit(async () => {
           const candidateA = candidates[i];
           const candidateB = candidates[j];
-          const prompt = comparePrompt(options.task, candidateA, candidateB, options.rubric);
+          const prompt = comparePrompt(options.task, candidateA, candidateB, options.rubric, options.promptStyle, options.promptOverrides?.compare);
           const result = await options.driver.compare({
             task: options.task,
             rubric: options.rubric,
@@ -125,7 +129,7 @@ export async function mutateCandidate(options: MutateCandidateOptions): Promise<
     temperature: options.temperature ?? 0.6,
     candidate,
     critique: options.critique,
-    prompt: mutatePrompt(options.task, candidate, options.critique, options.rubric)
+    prompt: mutatePrompt(options.task, candidate, options.critique, options.rubric, options.promptStyle, options.promptOverrides?.mutate)
   });
   return { mutated: result.text, model: result.model, provider: result.provider, usage: result.usage };
 }

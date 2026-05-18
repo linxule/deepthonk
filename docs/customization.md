@@ -13,7 +13,7 @@ DeepThonk exposes the same core run config through CLI, MCP, and YAML, with one 
 | Profile params | `--n`, `--k`, `--t`, `--m` | `n`, `k`, `t`, `m` | `algorithm.n`, `algorithm.k`, `algorithm.t`, `algorithm.m` |
 | Algorithm constants | `--lambda`, `--sample-temperature`, `--mutate-temperature`, `--judge-temperature` | `lambda`, `sample_temperature`, `mutate_temperature`, `judge_temperature` | `algorithm.lambda`, `algorithm.sample_temperature`, `algorithm.mutate_temperature`, `algorithm.judge_temperature` |
 | Prompt style | `--prompt-style` | `prompt_style` | `prompt_style` |
-| Per-phase prompts | `--prompts <yaml-path>` | `prompts` | `prompts` |
+| Per-phase prompts | `--prompts <yaml-path>`, `--prompts-json <json>` | `prompts` | `prompts` |
 | Concurrency | `--max-concurrency` | `concurrency.generate`, `concurrency.judge`, `concurrency.mutate` | `concurrency.generate`, `concurrency.judge`, `concurrency.mutate` |
 
 The built-in profiles are `quick`, `balanced`, and `paper`.
@@ -181,10 +181,10 @@ The built-in compare user template still supplies the task, rubric, candidates, 
 }
 ```
 
-## The CLI/MCP asymmetry
+## CLI prompt inputs
 
-CLI takes `--prompts <yaml-path>` only because shell-quoting multi-line prompts is hostile.
-The YAML file maps phase names to `{ system, user }` templates:
+CLI accepts prompt overrides either as reusable YAML via `--prompts <yaml-path>` or inline JSON via `--prompts-json <json>`.
+The YAML or JSON object maps phase names to `{ system, user }` templates:
 
 ```yaml
 generate:
@@ -197,11 +197,11 @@ compare:
 ```
 
 Use CLI prompt files when you would rather author, review, and reuse prompts in YAML.
-Use MCP inline `prompts` when an agent is constructing a one-off run and should not create a prompt file.
+Use `--prompts-json` or MCP inline `prompts` when an agent is constructing a one-off run and should not create a prompt file.
 MCP inline prompt args have the same phase names and `{ system, user }` fields as YAML.
 
 YAML config can also contain `prompts`.
-CLI `--prompts` merges over config `prompts`.
+CLI `--prompts` merges over config `prompts`, and `--prompts-json` merges over both.
 MCP inline `prompts` merges over config `prompts`.
 
 ## What stays YAML-only

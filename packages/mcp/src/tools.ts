@@ -21,7 +21,7 @@ import {
   type BuiltInProfileName,
   type CandidateInput
 } from "@deepthonk/core";
-import { createDriver, defaultPricesForProviderConfig, resolveProviderConfig, resolveProviderModels, type ProviderConfig } from "@deepthonk/providers";
+import { createDriver, defaultPricesForProviderConfig, loadDeepThonkEnv, resolveProviderConfig, resolveProviderModels, type ProviderConfig } from "@deepthonk/providers";
 import { recordRunResource } from "./resources.js";
 
 export const toolNames = [
@@ -38,6 +38,7 @@ export const toolNames = [
 ] as const;
 
 export const planArgsSchema = z.object({
+  config_path: z.string().optional().describe("Optional DeepThonk YAML config path."),
   profile: z.enum(["quick", "balanced", "paper"]).default("quick"),
   n: z.number().int().min(2).optional(),
   k: z.number().int().min(1).optional(),
@@ -80,6 +81,8 @@ export const runArgsSchema = z.object({
   sample_temperature: z.number().min(0).optional().describe("Temperature for initial candidate generation."),
   mutate_temperature: z.number().min(0).optional().describe("Temperature for critique-guided mutation."),
   judge_temperature: z.number().min(0).optional().describe("Temperature for pairwise judging."),
+  include_prompts: z.boolean().optional().describe("Store rendered prompts in candidate/comparison metadata."),
+  include_raw_model_outputs: z.boolean().optional().describe("Store raw provider responses in trace metadata."),
   concurrency: z.object({
     generate: z.number().int().min(1).optional(),
     judge: z.number().int().min(1).optional(),
@@ -112,14 +115,26 @@ const providerArgsSchema = z.object({
 export const rankArgsSchema = providerArgsSchema.extend({
   task: z.string().min(1).describe("Task text the candidates answer."),
   rubric: z.string().optional().describe("Optional judging rubric text."),
-  candidates: z.array(z.union([z.string(), z.object({ id: z.string().optional(), content: z.string() })])).min(2).describe("Candidate texts or {id, content} objects.")
+  candidates: z.array(z.union([z.string(), z.object({ id: z.string().optional(), content: z.string() })])).min(2).describe("Candidate texts or {id, content} objects."),
+  judge_temperature: z.number().min(0).optional().describe("Temperature for pairwise judging."),
+  lambda: z.number().min(0).optional().describe("Bradley-Terry L2 regularization."),
+  concurrency: z.number().int().min(1).optional().describe("Maximum concurrent pairwise comparisons."),
+  prompt_style: z.enum(["general", "paper-programming"]).optional(),
+  prompts: z.object({
+    compare: z.object({ system: z.string().optional(), user: z.string().optional() }).optional()
+  }).optional()
 });
 
 export const mutateArgsSchema = providerArgsSchema.extend({
   task: z.string().min(1).describe("Task text the candidate answers."),
   rubric: z.string().optional().describe("Optional rubric text."),
   candidate: z.string().describe("Candidate text to mutate."),
-  critique: z.string().default("").describe("Critique or guidance for mutation.")
+  critique: z.string().default("").describe("Critique or guidance for mutation."),
+  mutate_temperature: z.number().min(0).optional().describe("Temperature for mutation."),
+  prompt_style: z.enum(["general", "paper-programming"]).optional(),
+  prompts: z.object({
+    mutate: z.object({ system: z.string().optional(), user: z.string().optional() }).optional()
+  }).optional()
 });
 
 export const resumeArgsSchema = z.object({
@@ -185,8 +200,14 @@ export const mutateOutputSchema = z.object({
 
 export function deepthonkPlan(argsInput: unknown): Record<string, unknown> {
   const args = planArgsSchema.parse(argsInput);
-  if (args.n === undefined && args.k === undefined && args.t === undefined && args.m === undefined) {
+  if (args.config_path === undefined && args.n === undefined && args.k === undefined && args.t === undefined && args.m === undefined) {
     return planBudget(args.profile) as unknown as Record<string, unknown>;
+  }
+  if (args.config_path !== undefined) {
+    throw new ConfigError("deepthonk.plan with config_path is async; use deepthonkPlanAsync.", {
+      code: "mcp.plan_async_required",
+      retryable: false
+    });
   }
   const base = builtInProfiles[args.profile];
   return planBudget({
@@ -195,6 +216,24 @@ export function deepthonkPlan(argsInput: unknown): Record<string, unknown> {
     k: args.k ?? base.k,
     t: args.t ?? base.t,
     m: args.m ?? base.m
+  }) as unknown as Record<string, unknown>;
+}
+
+export async function deepthonkPlanAsync(argsInput: unknown): Promise<Record<string, unknown>> {
+  const args = planArgsSchema.parse(argsInput);
+  const config = await readMcpConfig(args.config_path);
+  const profileName = config.profile ?? args.profile;
+  const base = builtInProfiles[profileName];
+  return planBudget({
+    ...base,
+    n: args.n ?? config.algorithm?.n ?? base.n,
+    k: args.k ?? config.algorithm?.k ?? base.k,
+    t: args.t ?? config.algorithm?.t ?? base.t,
+    m: args.m ?? config.algorithm?.m ?? base.m,
+    lambda: config.algorithm?.lambda ?? base.lambda,
+    sampleTemperature: config.algorithm?.sample_temperature ?? base.sampleTemperature,
+    mutateTemperature: config.algorithm?.mutate_temperature ?? base.mutateTemperature,
+    judgeTemperature: config.algorithm?.judge_temperature ?? base.judgeTemperature
   }) as unknown as Record<string, unknown>;
 }
 
@@ -243,7 +282,7 @@ export async function deepthonkStart(argsInput: unknown): Promise<Record<string,
     .catch(async (error) => {
       try {
         const existing = await readRunStatus(runConfig.runDir);
-        if (existing && existing.state !== "pending") return;
+        if (existing && ["completed", "failed", "cancelled", "budget_exceeded"].includes(existing.state)) return;
         const serialized = serializeToolError(error, runConfig.runDir);
         await new TraceStore(runConfig.runDir).writeStatus({
           job_id: jobId,
@@ -379,8 +418,8 @@ async function resolveMcpRun(argsInput: unknown): Promise<{ runConfig: Parameter
         maxUsd: args.max_usd
       }, defaultPricesForProviderConfig(providerConfig)),
       output: {
-        includeRawModelOutputs: config.output?.includeRawModelOutputs ?? false,
-        includePrompts: config.output?.includePrompts ?? false
+        includeRawModelOutputs: args.include_raw_model_outputs ?? config.output?.includeRawModelOutputs ?? false,
+        includePrompts: args.include_prompts ?? config.output?.includePrompts ?? false
       }
     },
     providerConfig
@@ -393,7 +432,19 @@ export async function deepthonkRank(argsInput: unknown): Promise<Record<string, 
   const models = providerConfig.models;
   const driver = createDriver(providerConfig);
   const candidates: CandidateInput[] = args.candidates;
-  const result = await rankCandidates({ task: args.task, rubric: args.rubric, candidates, driver, judgeModel: models.judge, runId: "mcp-rank" });
+  const result = await rankCandidates({
+    task: args.task,
+    rubric: args.rubric,
+    candidates,
+    driver,
+    judgeModel: models.judge,
+    runId: "mcp-rank",
+    temperature: args.judge_temperature,
+    lambda: args.lambda,
+    concurrency: args.concurrency,
+    promptStyle: args.prompt_style,
+    promptOverrides: args.prompts
+  });
   return { scores: result.scores, comparisons: result.comparisons };
 }
 
@@ -408,8 +459,10 @@ export async function deepthonkMutate(argsInput: unknown): Promise<Record<string
       candidate: { id: "mcp-candidate", content: args.candidate },
       driver: createDriver(providerConfig),
       mutatorModel: models.mutator,
-      temperature: 0.6,
-      critique: args.critique
+      temperature: args.mutate_temperature,
+      critique: args.critique,
+      promptStyle: args.prompt_style,
+      promptOverrides: args.prompts
     }))
   };
 }
@@ -535,6 +588,7 @@ function mergeProfileOverrides(
 }
 
 async function readMcpConfig(path?: string): Promise<RawMcpConfig> {
+  await loadDeepThonkEnv();
   if (!path) return {};
   return YAML.parse(await readFile(resolveMcpPath(path), "utf8")) as RawMcpConfig;
 }

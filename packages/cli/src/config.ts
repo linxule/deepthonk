@@ -1,10 +1,18 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, extname, resolve } from "node:path";
 import YAML from "yaml";
 import { builtInProfiles, ConfigError, getProfile, planBudget, type BuiltInProfileName, type Profile, type RunConfig } from "@deepthonk/core";
-import { defaultPricesForProviderConfig, resolveProviderConfig, resolveProviderModels, type ProviderConfig, type ProviderRole } from "@deepthonk/providers";
+import {
+  defaultConfigPath,
+  defaultEnvPath,
+  defaultPricesForProviderConfig,
+  loadDeepThonkEnv,
+  resolveProviderConfig,
+  resolveProviderModels,
+  type ProviderConfig,
+  type ProviderRole
+} from "@deepthonk/providers";
 
 export interface ResolvedCliConfig {
   runConfig: RunConfig;
@@ -17,10 +25,9 @@ export interface ResolvedProviderConfig {
   models: ProviderConfig["models"];
 }
 
-export const defaultConfigPath = join(homedir(), ".config", "deepthonk", "config.yaml");
-export const defaultEnvPath = join(dirname(defaultConfigPath), "env");
+export { defaultConfigPath, defaultEnvPath, loadDeepThonkEnv };
 
-interface RawConfigFile {
+export interface RawConfigFile {
   profile?: BuiltInProfileName;
   provider?: string;
   base_url?: string;
@@ -41,7 +48,7 @@ interface RawConfigFile {
   prompts?: PromptOverridesFile;
 }
 
-interface AlgorithmOverrides {
+export interface AlgorithmOverrides {
   n?: number;
   k?: number;
   t?: number;
@@ -127,8 +134,8 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
     retry,
     budget,
     output: {
-      includeRawModelOutputs: fileConfig.output?.includeRawModelOutputs ?? false,
-      includePrompts: fileConfig.output?.includePrompts ?? false
+      includeRawModelOutputs: booleanOption(options.includeRawModelOutputs) ?? fileConfig.output?.includeRawModelOutputs ?? false,
+      includePrompts: booleanOption(options.includePrompts) ?? fileConfig.output?.includePrompts ?? false
     }
   };
   return {
@@ -170,7 +177,7 @@ export function profileFromOptions(options: Record<string, unknown>): Profile {
   return mergeAlgorithmOverrides(base, undefined, options);
 }
 
-async function loadPromptOverrides(
+export async function loadPromptOverrides(
   options: Record<string, unknown>,
   fileConfig: RawConfigFile
 ): Promise<RunConfig["promptOverrides"]> {
@@ -187,16 +194,22 @@ async function loadPromptOverrides(
     }
     fromFlag = YAML.parse(await readFile(resolved, "utf8")) as PromptOverridesFile;
   }
+  const fromJson = parsePromptOverridesJson(stringOption(options.promptsJson));
   const merged: PromptOverridesFile = { ...(fileConfig.prompts ?? {}) };
   if (fromFlag) {
     for (const phase of ["generate", "compare", "mutate", "finalize"] as const) {
       if (fromFlag[phase]) merged[phase] = { ...(merged[phase] ?? {}), ...fromFlag[phase] };
     }
   }
+  if (fromJson) {
+    for (const phase of ["generate", "compare", "mutate", "finalize"] as const) {
+      if (fromJson[phase]) merged[phase] = { ...(merged[phase] ?? {}), ...fromJson[phase] };
+    }
+  }
   return Object.keys(merged).length ? (merged as RunConfig["promptOverrides"]) : undefined;
 }
 
-function mergeAlgorithmOverrides(
+export function mergeAlgorithmOverrides(
   base: Profile,
   fileOverrides: AlgorithmOverrides | undefined,
   cliOptions: Record<string, unknown>
@@ -214,6 +227,17 @@ function mergeAlgorithmOverrides(
     judgeTemperature:
       numberOption(cliOptions.judgeTemperature) ?? fileOverrides?.judge_temperature ?? base.judgeTemperature
   };
+}
+
+export async function resolvePlanProfile(options: Record<string, unknown>): Promise<Profile | BuiltInProfileName> {
+  const configPath = resolveConfigPath(options);
+  const fileConfig = configPath ? await readConfig(configPath) : {};
+  const profileName = builtInProfileName(options.profile ?? fileConfig.profile ?? "quick");
+  const hasOverrides =
+    fileConfig.algorithm !== undefined ||
+    ["n", "k", "t", "m", "lambda", "sampleTemperature", "mutateTemperature", "judgeTemperature"].some((key) => options[key] !== undefined);
+  if (!hasOverrides) return profileName;
+  return mergeAlgorithmOverrides(getProfile(profileName), fileConfig.algorithm, options);
 }
 
 export async function readPathOrInline(value: string): Promise<string> {
@@ -246,36 +270,18 @@ function resolveConfigPath(options: Record<string, unknown>): string | undefined
   return stringOption(options.config) ?? process.env.DEEPTHONK_CONFIG ?? (existsSync(defaultConfigPath) ? defaultConfigPath : undefined);
 }
 
-export async function loadDeepThonkEnv(path = process.env.DEEPTHONK_ENV ?? defaultEnvPath): Promise<void> {
-  if (!existsSync(path)) return;
-  const text = await readFile(path, "utf8");
-  for (const line of text.split("\n")) {
-    const parsed = parseEnvLine(line);
-    if (!parsed) continue;
-    const [key, value] = parsed;
-    if (process.env[key] === undefined || process.env[key] === "") process.env[key] = value;
-  }
-}
-
-function parseEnvLine(line: string): [string, string] | undefined {
-  const trimmed = line.trim();
-  if (!trimmed || trimmed.startsWith("#")) return undefined;
-  const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-  if (!match) return undefined;
-  return [match[1], unquoteEnvValue(match[2].trim())];
-}
-
-function unquoteEnvValue(value: string): string {
-  if ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith('"') && value.endsWith('"'))) {
-    const inner = value.slice(1, -1);
-    return value.startsWith("'") ? inner.replace(/'\\''/g, "'") : inner.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-  }
-  return value;
-}
-
 function numberOption(value: unknown): number | undefined {
   if (value === undefined || value === null || value === "") return undefined;
   return Number(value);
+}
+
+function booleanOption(value: unknown): boolean | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "boolean") return value;
+  const text = String(value).toLowerCase();
+  if (text === "true" || text === "1") return true;
+  if (text === "false" || text === "0") return false;
+  return Boolean(value);
 }
 
 function mergeBudget(
@@ -306,6 +312,19 @@ function mergePrices(
 function stringOption(value: unknown): string | undefined {
   if (value === undefined || value === null || value === "") return undefined;
   return String(value);
+}
+
+function parsePromptOverridesJson(value: string | undefined): PromptOverridesFile | undefined {
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value) as PromptOverridesFile;
+  } catch (error) {
+    throw new ConfigError(`--prompts-json is not valid JSON: ${(error as Error).message}`, {
+      code: "config.prompts_json_invalid",
+      retryable: false,
+      fix: "Pass a JSON object with generate/compare/mutate/finalize phase keys."
+    });
+  }
 }
 
 function builtInProfileName(value: unknown): BuiltInProfileName {

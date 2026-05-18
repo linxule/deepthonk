@@ -93,6 +93,8 @@ export interface BtScore {
   generation: number | "final";
   score: number;
   rank: number;
+  tieGroup?: number;
+  tieBreakerRank?: number;
   wins: number;
   losses: number;
   ties: number;
