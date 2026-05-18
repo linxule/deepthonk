@@ -76,6 +76,19 @@ Default concurrency:
 | `judge` | `max(1, (n * max(k, m)) / 2)` |
 | `mutate` | `n - floor(n / 4)` |
 
+## MCP Sampling provider
+
+Use `provider: "sampling"` only inside an MCP host that can answer MCP Sampling `createMessage` requests. It lets DeepThonk use the host's model picker instead of a configured API key.
+Standalone CLI runs cannot use sampling; use `deepseek`, `openrouter`, or `openai-compatible` from the CLI.
+
+Sampling model fields are hints, not enforcement. `generator_model`, `mutator_model`, `judge_model`, and `finalizer_model` become per-role model hints, and MCP `sampling_model_hints` adds extra host-facing hints. A sampling-capable client may ignore any hint and choose another model.
+
+Before a sampling run starts, the MCP server checks `server.getClientCapabilities()`. If the connected client does not advertise `sampling`, `deepthonk.run` and `deepthonk.start` fail with `provider.sampling_capability_missing` before claiming the run directory or making model calls.
+
+Sampling adds a host round trip for every model call, so latency depends on both DeepThonk's phase concurrency and the host's sampling queue. DeepThonk caps sampling concurrency at `min(n, 4)` even when higher per-phase concurrency is configured.
+
+MCP Sampling responses do not provide standardized token usage. DeepThonk records `inputTokens` and `outputTokens` as unavailable for sampling calls. `maxCalls` still works; token and USD caps can warn or become unenforceable unless the host/provider supplies usage through a direct provider mode.
+
 ## Prompt template variables
 
 Prompt overrides are templates.

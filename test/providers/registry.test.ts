@@ -58,6 +58,25 @@ describe("provider registry", () => {
     expect(body.model).toBe("judge-model");
   });
 
+  it("creates the MCP Sampling driver when a transport is provided", async () => {
+    const createMessage = vi.fn(async () => ({
+      model: "host-model",
+      role: "assistant" as const,
+      content: { type: "text" as const, text: "answer" }
+    }));
+    const driver = createDriver({
+      provider: "sampling",
+      samplingTransport: createMessage,
+      models: { generator: "sampling", mutator: "sampling", judge: "sampling" }
+    });
+
+    const result = await driver.generate({ task: "x", model: "sampling", temperature: 0, prompt: { system: "s", user: "u" } });
+
+    expect(result.provider).toBe("sampling");
+    expect(result.model).toBe("host-model");
+    expect(createMessage).toHaveBeenCalledWith(expect.objectContaining({ systemPrompt: "s", temperature: 0 }));
+  });
+
   it("returns structured errors for unknown providers without a base URL", () => {
     expect(() =>
       createDriver({

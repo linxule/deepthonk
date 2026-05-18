@@ -111,6 +111,8 @@ The MCP server exposes the same engine the CLI runs. Once wired into an MCP host
 
 Provider API keys come from the host process's environment, not from DeepThonk's config alone. Each host handles env passthrough slightly differently — see the concrete patterns below.
 
+MCP Sampling is supported as `provider: "sampling"` when the connected host advertises the MCP sampling capability. Sampling is not available from standalone CLI runs; use `deepseek`, `openrouter`, or `openai-compatible` there.
+
 ### Claude Code
 
 ```bash
@@ -211,7 +213,7 @@ Four templates mirror the core loop: `deepthonk/generate`, `deepthonk/compare`, 
 
 ### Limits
 
-MCP Sampling is deferred and not exposed as a provider mode — direct provider mode is the only option in v0.1. `deepthonk.resume` reports trace state and safe phase boundaries but does not replay interrupted runs. The HTTP transport is loopback-only by design.
+`deepthonk.resume` reports trace state and safe phase boundaries but does not replay interrupted runs. The HTTP transport is loopback-only by design. MCP Sampling depends on the host's sampling implementation; model hints are preferences, token usage may be unavailable, and sampling concurrency is capped at 4.
 
 ## Customization
 
@@ -284,7 +286,7 @@ This repository is source-only. Generated run traces, paper notes, build output,
 Known limits for this release:
 
 - Conservative resume reports trace state and safe phase boundaries, but does not replay interrupted runs yet.
-- MCP Sampling is deferred until there is a real host-backed Sampling driver.
+- MCP Sampling is MCP-host-only. Standalone CLI runs need a direct provider.
 - `maxUsd` requires known model pricing; add explicit prices in YAML for custom providers and model IDs. Optional fields `longContextThresholdTokens`, `inputUsdPerMillionLong`, and `outputUsdPerMillionLong` enable tiered pricing for models with a long-context surcharge (e.g., Gemini at 200K input tokens). Cache hit/miss rates remain flat.
 
 ## Acknowledgments

@@ -8,6 +8,8 @@ All notable changes to DeepThonk are documented here. The format follows [Keep a
 
 - CLI profile registry CRUD: `deepthonk profile list`, `deepthonk profile show <name>`, `deepthonk profile save <name>`, and `deepthonk profile delete <name>`.
 - MCP profile registry CRUD tools: `deepthonk.profile_list`, `deepthonk.profile_show`, `deepthonk.profile_save`, and `deepthonk.profile_delete`.
+- Real resume replay. `deepthonk resume <run-dir> --continue` replays an interrupted run from the last durable phase boundary; MCP `deepthonk.resume` gains optional `continue: boolean`. Phase recovery is driven by new `phase.completed` events written at each phase boundary inside `runDeepThonk`. Cross-version and provider-mismatch refusals are explicit (`resume.version_mismatch`, `resume.provider_mismatch`). Default behavior unchanged — without `--continue`, resume only reports trace state.
+- MCP Sampling provider. It is MCP-only, requires a sampling-capable client, treats model hints as preferences rather than enforcement, records missing token usage as unavailable, and caps sampling concurrency at 4.
 
 ## [0.1.1] — 2026-05-18
 

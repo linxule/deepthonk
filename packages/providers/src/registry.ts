@@ -1,6 +1,7 @@
 import { FakeDriver } from "./fake.js";
 import { createDeepSeekDriver, OpenAiCompatibleDriver } from "./openaiCompatible.js";
-import { ProviderError } from "@deepthonk/core";
+import { ConfigError, ProviderError } from "@deepthonk/core";
+import { SamplingDriver } from "./sampling.js";
 import type { CompareInput, FinalizeInput, GenerateInput, ModelDriver, MutateInput, ProviderConfig, ProviderRole, RoleProviderConfig } from "./types.js";
 
 export function createDriver(config: ProviderConfig): ModelDriver {
@@ -11,6 +12,16 @@ export function createDriver(config: ProviderConfig): ModelDriver {
 
 function createSingleDriver(config: ProviderConfig): ModelDriver {
   if (config.provider === "fake") return new FakeDriver();
+  if (config.provider === "sampling") {
+    if (!config.samplingTransport) {
+      throw new ConfigError("MCP Sampling provider requires running as an MCP server. Use a direct provider mode (deepseek, openrouter, openai-compatible) for CLI runs.", {
+        code: "provider.sampling_requires_mcp",
+        retryable: false,
+        fix: "Run DeepThonk through an MCP host that advertises sampling, or choose a direct provider for CLI runs."
+      });
+    }
+    return new SamplingDriver(config.samplingTransport, config);
+  }
   if (config.provider === "deepseek") return createDeepSeekDriver(config);
   if (config.provider === "openai-compatible") return new OpenAiCompatibleDriver(config);
   if (config.baseUrl) return new OpenAiCompatibleDriver(config);

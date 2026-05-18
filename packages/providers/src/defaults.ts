@@ -47,6 +47,7 @@ export function defaultModel(provider: string, role: ProviderRole): string {
   if (role === "finalizer") return defaultModel(provider, "judge");
   if (provider === "deepseek") return role === "judge" ? "deepseek-v4-pro" : "deepseek-v4-flash";
   if (provider === "fake") return "fake-model";
+  if (provider === "sampling") return "sampling";
   if (provider === "openrouter") return "openrouter/auto";
   return role === "judge" ? "provider/model-large" : "provider/model-small";
 }

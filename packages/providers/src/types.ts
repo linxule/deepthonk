@@ -1,3 +1,5 @@
+import type { SamplingDriverConfig, SamplingTransport } from "./sampling.js";
+
 export type {
   CompareInput,
   FinalizeInput,
@@ -22,11 +24,12 @@ export interface RoleProviderConfig {
   supportsJsonMode?: boolean;
 }
 
-export interface ProviderConfig {
+export interface BaseProviderConfig extends SamplingDriverConfig {
   provider: "fake" | "openai-compatible" | "deepseek" | string;
   baseUrl?: string;
   apiKeyEnv?: string;
   apiKey?: string;
+  samplingTransport?: SamplingTransport;
   models: {
     generator: string;
     mutator: string;
@@ -40,3 +43,11 @@ export interface ProviderConfig {
   supportsJsonMode?: boolean;
   roleProviders?: Partial<Record<ProviderRole, RoleProviderConfig>>;
 }
+
+export type SamplingProviderConfig = BaseProviderConfig &
+  SamplingDriverConfig & {
+    provider: "sampling";
+    samplingTransport?: SamplingTransport;
+  };
+
+export type ProviderConfig = BaseProviderConfig | SamplingProviderConfig;

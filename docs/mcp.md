@@ -25,7 +25,7 @@ The tools are implemented over the shared core and provider interfaces. Use `sta
 
 `resume` is conservative: it reports completed, running, cancel-requested, cancelled, failed, budget-stopped, missing, or interrupted trace state and marks unsafe traces with `safe_to_continue: false`. It never reuses partial in-flight model outputs and does not replay runs yet.
 
-MCP Sampling is intentionally deferred. It is not advertised as a provider option until a host-negotiated Sampling driver is implemented.
+MCP Sampling is available as `provider: "sampling"` for `deepthonk.run` and `deepthonk.start` when the connected client advertises the MCP sampling capability. If the client does not advertise sampling, the tool fails before claiming a run directory with `provider.sampling_capability_missing`. Standalone CLI runs cannot use sampling; choose a direct provider there.
 
 Tool handlers return `structuredContent` with a matching broad output schema, plus a text rendering for clients that display only content blocks. Tool failures are structured as `isError: true` with stable `code`, `message`, `retryable`, `fix`, and optional `run_dir` fields.
 
