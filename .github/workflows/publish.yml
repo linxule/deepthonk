@@ -1,0 +1,85 @@
+name: Publish
+
+# Tokenless publish via npm Trusted Publishing (OIDC). No NPM_TOKEN.
+#
+# This is a pnpm WORKSPACE monorepo: 3 of 4 published packages declare internal
+# deps as `workspace:*`, and only `pnpm publish` (not `npm publish`) rewrites
+# those to the concrete version on pack. So this uses `pnpm publish`, in
+# dependency (topological) order, so each downstream package's workspace:*
+# specs resolve against an upstream version already on npm:
+#     @deepthonk/core -> @deepthonk/providers -> @deepthonk/mcp -> deepthonk (cli)
+#
+# pnpm must be >= 11 (native publish flow with OIDC trusted publishing /
+# fetchTokenAndProvenanceByOidc; the repo's pinned 10.11.0 predates it). pnpm
+# emits provenance automatically under OIDC. npm-only — no server.json, so no
+# MCP Registry step.
+#
+# Per-package one-time setup (npmjs.com): a Trusted Publisher on EACH of the
+# four packages pointing at owner=linxule, repo=deepthonk, workflow=publish.yml.
+#
+# Release flow: bump all 4 packages/*/package.json to the SAME new version
+# (>= 0.1.3; 0.1.2 already published) -> commit -> `git tag vX.Y.Z && git push`.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: build + verify + pnpm publish (OIDC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 11+ is required for native OIDC trusted publishing. The repo pins
+      # 10.11.0 (too old), so override here. `11` resolves to latest 11.x.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run build
+
+      - run: pnpm run typecheck
+
+      - run: pnpm test
+
+      - name: Guard — tag must match every package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          fail=0
+          for pkg in core providers mcp cli; do
+            V="$(node -p "require('./packages/$pkg/package.json').version")"
+            if [ "$V" != "$TAG" ]; then
+              echo "::error::packages/$pkg version $V != tag $TAG"
+              fail=1
+            fi
+          done
+          [ "$fail" = "0" ] || { echo "Version guard failed for tag v$TAG"; exit 1; }
+
+      # Topological publish order. `pnpm publish` (NOT npm publish) rewrites
+      # workspace:* -> concrete versions. --no-git-checks: tag checkout is
+      # detached and prepack copies README/LICENSE (dirty tree).
+      - name: Publish @deepthonk/core
+        run: pnpm --filter @deepthonk/core publish --no-git-checks
+
+      - name: Publish @deepthonk/providers
+        run: pnpm --filter @deepthonk/providers publish --no-git-checks
+
+      - name: Publish @deepthonk/mcp
+        run: pnpm --filter @deepthonk/mcp publish --no-git-checks
+
+      - name: Publish deepthonk (cli)
+        run: pnpm --filter deepthonk publish --no-git-checks

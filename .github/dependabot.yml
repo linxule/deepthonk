@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Single npm block: the root pnpm-lock.yaml is the only lockfile and covers
+  # every packages/* workspace member. Do NOT add per-package npm blocks —
+  # packages/* have no own lockfile, so per-dir blocks would error/duplicate.
+  # Grouped (patterns: ["*"]) so a refresh is ~one PR, not one per dependency.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 2
+    groups:
+      npm-deps:
+        patterns: ["*"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns: ["*"]
