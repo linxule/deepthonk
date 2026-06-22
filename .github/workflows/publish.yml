@@ -35,11 +35,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # pnpm 11+ is required for native OIDC trusted publishing. The repo pins
-      # 10.11.0 (too old), so override here. `11` resolves to latest 11.x.
+      # pnpm version is read from package.json "packageManager" (pnpm@11.8.0).
+      # pnpm 11+ is required for native OIDC trusted publishing. Do NOT also set
+      # a `version:` here — action-setup errors on a mismatch with packageManager.
       - uses: pnpm/action-setup@v4
         with:
-          version: 11
           run_install: false
 
       - uses: actions/setup-node@v4
