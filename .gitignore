@@ -7,3 +7,7 @@ runs/
 coverage/
 *.log
 notes/
+
+# prepack copies these from repo root for publishing; not source
+packages/*/README.md
+packages/*/LICENSE
