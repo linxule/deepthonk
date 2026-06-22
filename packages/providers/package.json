@@ -34,8 +34,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepack": "cp ../../README.md ./README.md && cp ../../LICENSE ./LICENSE",
-    "postpack": "rm -f ./README.md ./LICENSE"
+    "prepack": "cp ../../README.md ./README.md && cp ../../LICENSE ./LICENSE"
   },
   "dependencies": {
     "@deepthonk/core": "workspace:*",
