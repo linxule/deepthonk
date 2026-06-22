@@ -13,14 +13,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22]
+        node: [22, 24] # pnpm 11 (packageManager) requires Node >= 22.13
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 10.11.0
           run_install: false
 
       - uses: actions/setup-node@v4
