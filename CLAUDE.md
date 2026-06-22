@@ -8,7 +8,7 @@ DeepThonk implements OpenDeepThink as a provider-neutral TypeScript CLI + MCP se
 
 ## Toolchain
 
-Uses `pnpm` workspaces (not bun) — pinned to `pnpm@10.11.0`. Node ESM (`"type": "module"`). TypeScript with project references; tests use Vitest with path aliases that resolve `@deepthonk/*` to `packages/*/src` so tests run against source, not built `dist/`.
+Uses `pnpm` workspaces (not bun) — pinned to `pnpm@11.8.0` via the root `packageManager` field (pnpm 11 requires **Node ≥ 22.13** and is needed for OIDC trusted publishing). Node ESM (`"type": "module"`). TypeScript with project references; tests use Vitest with path aliases that resolve `@deepthonk/*` to `packages/*/src` so tests run against source, not built `dist/`. `pnpm-workspace.yaml` sets `allowBuilds: { esbuild: true }` (pnpm 11 errors on unapproved build scripts).
 
 ## Commands
 
@@ -77,3 +77,16 @@ pnpm --silent --filter deepthonk deepthonk run \
   --task examples/tasks/toy-math.txt --out runs/test-quick
 pnpm --silent --filter deepthonk deepthonk inspect runs/test-quick
 ```
+
+## Release (tokenless OIDC)
+
+npm-only (no `server.json` → not on the MCP Registry). CI (`.github/workflows/publish.yml`) publishes on a `v*` tag via **`pnpm publish`** (NOT `npm publish` — only pnpm rewrites the `workspace:*` internal deps), in topological order: `@deepthonk/core → @deepthonk/providers → @deepthonk/mcp → deepthonk`. Tokenless OIDC Trusted Publishing with provenance (pnpm 11 does the exchange natively, no npm CLI). Since v0.1.3.
+
+1. Bump **all four** `packages/*/package.json` to the SAME new version (root stays `private` at 0.1.0). npm rejects duplicates.
+2. `pnpm install` (if deps changed) + `pnpm run build` + `pnpm test`.
+3. Commit + push (PRs run `ci.yml` on Node 22/24).
+4. `git tag vX.Y.Z && git push origin vX.Y.Z` → `publish.yml` runs the version guard (tag must equal every package version) then publishes the four in order.
+
+**One-time (done 2026-06-22):** a Trusted Publisher on **each of the 4 packages** — the scoped three live under the `@deepthonk` npm **org**, not your personal package list. Per package: owner `linxule`, repo `deepthonk`, workflow `publish.yml`, Environment blank, allow publish. CLI: `npm trust github <pkg> --repo linxule/deepthonk --file publish.yml --allow-publish --yes` (npm ≥ 11.5.1; 2FA required each call).
+
+**pnpm-11 publish gotchas (this repo hit all of them):** pin pnpm via `packageManager`, not action-setup's `version:` (it errors on mismatch); `allowBuilds: { esbuild: true }` in `pnpm-workspace.yaml` (pnpm 11 errors on ignored build scripts); no `postpack` rm of README/LICENSE (pnpm 11's native publish stats `files` *after* postpack → `ENOENT` — `prepack` copies persist instead, gitignored).
