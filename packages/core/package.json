@@ -1,6 +1,6 @@
 {
   "name": "@deepthonk/core",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Core OpenDeepThink execution engine for DeepThonk.",
   "license": "MIT",
   "author": "Xule Lin",
