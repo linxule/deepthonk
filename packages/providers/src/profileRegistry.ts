@@ -114,6 +114,7 @@ function validateNamedProfileValue(value: unknown, name: string): NamedProfileBu
   }
   const config = value as NamedProfileBundle;
   rejectRawApiKeyFields(config, name);
+  rejectAllSecretShapedFields(config, name);
   validateRequiredFields(config, name);
   return config;
 }

@@ -26,6 +26,7 @@ export class OpenAiCompatibleDriver implements ModelDriver {
   readonly httpRetries: number;
   readonly requestTimeoutMs?: number;
   readonly supportsJsonMode: boolean;
+  private jsonModeSupported: boolean;
 
   constructor(private readonly config: ProviderConfig) {
     this.provider = config.provider;
@@ -34,6 +35,7 @@ export class OpenAiCompatibleDriver implements ModelDriver {
     this.httpRetries = config.retry?.httpRetries ?? 12;
     this.requestTimeoutMs = config.retry?.requestTimeoutMs ?? 120_000;
     this.supportsJsonMode = config.supportsJsonMode ?? true;
+    this.jsonModeSupported = this.supportsJsonMode;
     if (!this.apiKey) {
       throw new ProviderError(`Missing API key. Set ${config.apiKeyEnv ?? "apiKey"} for provider ${config.provider}.`, {
         code: "provider.missing_api_key",
@@ -72,7 +74,7 @@ export class OpenAiCompatibleDriver implements ModelDriver {
           temperature,
           max_tokens: 4096
         };
-        if (jsonMode && this.supportsJsonMode) body.response_format = { type: "json_object" };
+        if (jsonMode && this.jsonModeSupported) body.response_format = { type: "json_object" };
         const controller = this.requestTimeoutMs ? new AbortController() : undefined;
         timeout = controller ? setTimeout(() => controller.abort(), this.requestTimeoutMs) : undefined;
         const response = await fetch(`${this.baseUrl}/chat/completions`, {
@@ -93,8 +95,9 @@ export class OpenAiCompatibleDriver implements ModelDriver {
             await sleep(retryDelay(response, attempt));
             continue;
           }
-          if (jsonMode && this.supportsJsonMode && rejectsJsonMode(response.status, text)) {
-            return new OpenAiCompatibleDriver({ ...this.config, supportsJsonMode: false }).chat(model, temperature, messagesValue, false);
+          if (jsonMode && this.jsonModeSupported && rejectsJsonMode(response.status, text)) {
+            this.jsonModeSupported = false;
+            return this.chat(model, temperature, messagesValue, false);
           }
           throw providerHttpError(this.provider, response.status);
         }
@@ -179,7 +182,7 @@ function normalizeBaseUrl(baseUrl?: string): string {
 }
 
 function rejectsJsonMode(status: number, body: string): boolean {
-  return status === 400 && /response_format|json/i.test(body);
+  return (status === 400 || status === 422) && /response_format|json/i.test(body);
 }
 
 function isRetryableError(error: unknown): boolean {

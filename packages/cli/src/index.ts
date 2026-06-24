@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { DeepThonkError } from "@deepthonk/core";
 import { registerExport } from "./commands/export.js";
@@ -17,7 +18,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const program = new Command();
-program.name("deepthonk").description("Thonk harder, not richer.").version("0.1.2").option("--json-errors", "Print machine-readable errors to stderr.");
+program.name("deepthonk").description("Thonk harder, not richer.").version(packageVersion()).option("--json-errors", "Print machine-readable errors to stderr.");
 
 registerPlan(program);
 registerProfile(program);
@@ -54,4 +55,9 @@ function serializeError(error: unknown): Record<string, unknown> {
     message: error instanceof Error ? error.message : String(error),
     retryable: false
   };
+}
+
+function packageVersion(): string {
+  const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: string };
+  return packageJson.version ?? "0.0.0";
 }

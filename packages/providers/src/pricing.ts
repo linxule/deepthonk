@@ -23,7 +23,7 @@ export const defaultProviderPricing: ModelPrice[] = [
     inputCacheMissUsdPerMillion: 0.14,
     outputUsdPerMillion: 0.28,
     source: "https://api-docs.deepseek.com/quick_start/pricing/",
-    note: "Official DeepSeek pricing page, checked 2026-05-18. Input uses cache-hit/cache-miss fields when provider usage reports them."
+    note: "Official DeepSeek pricing page, checked 2026-06-24. Input uses cache-hit/cache-miss fields when provider usage reports them."
   },
   {
     provider: "deepseek",
@@ -33,7 +33,7 @@ export const defaultProviderPricing: ModelPrice[] = [
     inputCacheMissUsdPerMillion: 0.435,
     outputUsdPerMillion: 0.87,
     source: "https://api-docs.deepseek.com/quick_start/pricing/",
-    note: "Official DeepSeek V4-Pro discounted pricing, checked 2026-05-18; DeepSeek says the 75% discount is extended until 2026-05-31 15:59 UTC."
+    note: "Official DeepSeek pricing page, checked 2026-06-24. Input uses cache-hit/cache-miss fields when provider usage reports them."
   }
 ];
 

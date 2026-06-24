@@ -36,7 +36,7 @@ export class TraceStore {
   }
 
   async writeScores(generation: number | "final", scores: BtScore[]): Promise<void> {
-    for (const score of scores) await this.appendJsonl(runArtifactFiles.scores, score);
+    await this.appendJsonlMany(runArtifactFiles.scores, scores);
     await this.event({ type: "scores.computed", generation });
   }
 
@@ -79,9 +79,14 @@ export class TraceStore {
   }
 
   private async appendJsonl(fileName: string, value: unknown): Promise<void> {
+    await this.appendJsonlMany(fileName, [value]);
+  }
+
+  private async appendJsonlMany(fileName: string, values: readonly unknown[]): Promise<void> {
+    if (values.length === 0) return;
     await mkdir(this.runDir, { recursive: true });
     const next = this.writeQueue.then(() =>
-      writeFile(join(this.runDir, fileName), `${JSON.stringify(value)}\n`, { encoding: "utf8", flag: "a" })
+      writeFile(join(this.runDir, fileName), values.map((value) => JSON.stringify(value)).join("\n") + "\n", { encoding: "utf8", flag: "a" })
     );
     // Keep the queue alive even if one write rejects, so subsequent appends are not blocked.
     this.writeQueue = next.then(
@@ -114,10 +119,15 @@ function redactConfig(config: Record<string, unknown>): Record<string, unknown> 
 }
 
 function redactValue(value: unknown, key = ""): unknown {
-  if (/apiKey|api_key|token|secret|password/i.test(key)) return "[redacted]";
+  if (isSecretValueKey(key)) return "[redacted]";
   if (Array.isArray(value)) return value.map((item) => redactValue(item));
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [entryKey, redactValue(entryValue, entryKey)]));
   }
   return value;
+}
+
+function isSecretValueKey(key: string): boolean {
+  if (/^(apiKeyEnv|api_key_env|apiKeyFile|api_key_file|apiKeyStdin|api_key_stdin)$/i.test(key)) return false;
+  return /apiKey|api_key|token|secret|password|authorization|bearer|cookie|credential/i.test(key);
 }

@@ -1,8 +1,8 @@
-import pLimit from "p-limit";
 import { z } from "zod";
 import { fitBradleyTerry } from "./bradleyTerry.js";
 import { ConfigError } from "./errors.js";
 import { parseJsonObject } from "./json.js";
+import { runLimitedPhase } from "./phaseRunner.js";
 import { comparePrompt, mutatePrompt } from "./prompts.js";
 import type { BtScore, Candidate, Comparison, ModelDriver, ModelTextResult, PromptOverrides, RunConfig } from "./schemas.js";
 
@@ -60,69 +60,64 @@ const compareOutputSchema = z.object({
 
 export async function rankCandidates(options: RankCandidatesOptions): Promise<RankCandidatesResult> {
   const candidates = normalizeCandidates(options.candidates);
-  const comparisons: Comparison[] = [];
-  const limit = pLimit(options.concurrency ?? 1);
-  const tasks: Array<Promise<Comparison>> = [];
+  const jobs: Array<() => Promise<Comparison>> = [];
 
   for (let i = 0; i < candidates.length; i += 1) {
     for (let j = i + 1; j < candidates.length; j += 1) {
-      tasks.push(
-        limit(async () => {
-          const candidateA = candidates[i];
-          const candidateB = candidates[j];
-          const prompt = comparePrompt(options.task, candidateA, candidateB, options.rubric, options.promptStyle, options.promptOverrides?.compare);
-          const result = await options.driver.compare({
-            task: options.task,
-            rubric: options.rubric,
-            model: options.judgeModel,
-            temperature: options.temperature ?? 0,
-            candidateA,
-            candidateB,
-            prompt
-          });
-          let parsed: z.infer<typeof compareOutputSchema> | undefined;
-          try {
-            parsed = compareOutputSchema.parse(parseJsonObject(result.text));
-          } catch {
-            parsed = undefined;
-          }
-          if (!parsed) {
-            throw new ConfigError(
-              `Judge produced invalid-JSON output for rank comparison rank-${i}-${j}. Refusing to synthesize a tie and pollute the ranking.`,
-              {
-                code: "judge.persistent_invalid_json",
-                retryable: false,
-                fix: "The judge model is producing unparseable output. Inspect the raw response, switch judge models, or use a different judge that returns strict JSON."
-              }
-            );
-          }
-          const comparison: Comparison = {
-            id: `rank-${i}-${j}`,
-            runId: options.runId ?? "rank",
-            generation: options.generation ?? "final",
-            candidateAId: candidateA.id,
-            candidateBId: candidateB.id,
-            presentedAOriginalId: candidateA.id,
-            presentedBOriginalId: candidateB.id,
-            winner: parsed.winner,
-            confidence: parsed.confidence,
-            critiqueForA: parsed.feedback_a ?? parsed.critique_for_A ?? "",
-            critiqueForB: parsed.feedback_b ?? parsed.critique_for_B ?? "",
-            selectionReason: parsed.selection_reason ?? "",
-            model: result.model,
-            provider: result.provider,
-            metadata: compactMetadata({
-              model_call_count: 1,
-              provider_retry_count: result.retryCount || undefined
-            })
-          };
-          return comparison;
-        })
-      );
+      jobs.push(async () => {
+        const candidateA = candidates[i];
+        const candidateB = candidates[j];
+        const prompt = comparePrompt(options.task, candidateA, candidateB, options.rubric, options.promptStyle, options.promptOverrides?.compare);
+        const result = await options.driver.compare({
+          task: options.task,
+          rubric: options.rubric,
+          model: options.judgeModel,
+          temperature: options.temperature ?? 0,
+          candidateA,
+          candidateB,
+          prompt
+        });
+        let parsed: z.infer<typeof compareOutputSchema> | undefined;
+        try {
+          parsed = compareOutputSchema.parse(parseJsonObject(result.text));
+        } catch {
+          parsed = undefined;
+        }
+        if (!parsed) {
+          throw new ConfigError(
+            `Judge produced invalid-JSON output for rank comparison rank-${i}-${j}. Refusing to synthesize a tie and pollute the ranking.`,
+            {
+              code: "judge.persistent_invalid_json",
+              retryable: false,
+              fix: "The judge model is producing unparseable output. Inspect the raw response, switch judge models, or use a different judge that returns strict JSON."
+            }
+          );
+        }
+        return {
+          id: `rank-${i}-${j}`,
+          runId: options.runId ?? "rank",
+          generation: options.generation ?? "final",
+          candidateAId: candidateA.id,
+          candidateBId: candidateB.id,
+          presentedAOriginalId: candidateA.id,
+          presentedBOriginalId: candidateB.id,
+          winner: parsed.winner,
+          confidence: parsed.confidence,
+          critiqueForA: parsed.feedback_a ?? parsed.critique_for_A ?? "",
+          critiqueForB: parsed.feedback_b ?? parsed.critique_for_B ?? "",
+          selectionReason: parsed.selection_reason ?? "",
+          model: result.model,
+          provider: result.provider,
+          metadata: compactMetadata({
+            model_call_count: 1,
+            provider_retry_count: result.retryCount || undefined
+          })
+        };
+      });
     }
   }
 
-  comparisons.push(...(await Promise.all(tasks)));
+  const comparisons = await runLimitedPhase(jobs, options.concurrency ?? 1);
   return {
     candidates,
     comparisons,

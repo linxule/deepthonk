@@ -14,7 +14,8 @@ DeepThonk exposes the same core run config through CLI, MCP, and YAML, with one 
 | Algorithm constants | `--lambda`, `--sample-temperature`, `--mutate-temperature`, `--judge-temperature` | `lambda`, `sample_temperature`, `mutate_temperature`, `judge_temperature` | `algorithm.lambda`, `algorithm.sample_temperature`, `algorithm.mutate_temperature`, `algorithm.judge_temperature` |
 | Prompt style | `--prompt-style` | `prompt_style` | `prompt_style` |
 | Per-phase prompts | `--prompts <yaml-path>`, `--prompts-json <json>` | `prompts` | `prompts` |
-| Concurrency | `--max-concurrency` | `concurrency.generate`, `concurrency.judge`, `concurrency.mutate` | `concurrency.generate`, `concurrency.judge`, `concurrency.mutate` |
+| Concurrency | `--max-concurrency`, `--generate-concurrency`, `--judge-concurrency`, `--mutate-concurrency` | `concurrency.generate`, `concurrency.judge`, `concurrency.mutate` | `concurrency.generate`, `concurrency.judge`, `concurrency.mutate` |
+| JSON-mode support | `--supports-json-mode <true|false>` | `supports_json_mode` | `supports_json_mode`, `providers.<role>.supports_json_mode` |
 
 The built-in profiles are `quick`, `balanced`, and `paper`.
 The `paper` profile defaults to `paper-programming` prompt style.
@@ -66,7 +67,9 @@ The built-in default is `0` because judge stability matters more than judge crea
 Concurrency does not change the algorithm result definition.
 It changes how many provider calls can run at once in each phase.
 CLI `--max-concurrency` applies one cap to generate, judge, and mutate phases.
+Phase-specific CLI flags override it: `--generate-concurrency`, `--judge-concurrency`, and `--mutate-concurrency`.
 MCP and YAML can set per-phase caps.
+CLI precedence is phase-specific flag, then `--max-concurrency`, then YAML `concurrency.*`, then profile-derived defaults.
 
 Default concurrency:
 
@@ -75,6 +78,18 @@ Default concurrency:
 | `generate` | `n` |
 | `judge` | `max(1, (n * max(k, m)) / 2)` |
 | `mutate` | `n - floor(n / 4)` |
+
+## Provider JSON mode and replay
+
+OpenAI-compatible providers use `response_format: { "type": "json_object" }` for pairwise comparison calls when JSON mode is enabled.
+Set top-level `supports_json_mode: false` in YAML, or pass `--supports-json-mode false`, to disable that request shape for the base provider.
+Per-role provider routes can set `supports_json_mode` under `providers.generator`, `providers.mutator`, `providers.judge`, or `providers.finalizer`; role settings override the top-level value.
+
+If a provider returns a `400` or `422` response that rejects `response_format` or JSON mode, DeepThonk retries that call without JSON mode and remembers the provider does not support JSON mode for later comparison calls in the same process.
+
+CLI runs store a redacted `providerReplay` block in `config.json` so `deepthonk resume --continue` can reconstruct provider connection settings.
+The block contains provider label, base URL, API-key environment variable name, JSON-mode support, models, and role-provider routes.
+It never stores raw API-key values.
 
 ## MCP Sampling provider
 
@@ -245,9 +260,9 @@ A named profile must declare enough to fully describe a run:
 | `concurrency` | optional | Per-phase concurrency caps. |
 | `base_url`, `api_key_env` | optional | Required only when the provider needs them. |
 
-Named profiles must never contain a raw `api_key` value.
+Named profiles must never contain a raw `api_key` value or other secret-shaped fields such as `token`, `secret`, `password`, `authorization`, `bearer`, `cookie`, or `credential`.
 Use `api_key_env` to point at an environment variable name; DeepThonk will read that env var at run time.
-The CLI rejects profiles that contain a top-level or per-role `api_key` field.
+The CLI rejects profiles that contain those keys at the top level, inside per-role provider routes, prompts, algorithm blocks, or other nested profile fields.
 
 Example profile (also shipped at `examples/profiles/legal-drafting.yaml`):
 
@@ -307,9 +322,8 @@ The CLI and MCP surfaces expose the same registry operations:
 | Overwrite | Add `--force` | Add `"force": true` |
 | Delete | `deepthonk profile delete legal-drafting --yes` | `deepthonk.profile_delete` with `{ "name": "legal-drafting" }` |
 
-`profile show` and `deepthonk.profile_show` redact secret-shaped values such as `token`, `secret`, `password`, `authorization`, and `api_key`.
-They keep `api_key_env` visible because it is metadata naming where the runtime secret lives.
-`profile save` and `deepthonk.profile_save` reject raw `api_key` fields; use `api_key_env` instead.
+`profile show` and `deepthonk.profile_show` keep `api_key_env` visible because it is metadata naming where the runtime secret lives.
+Named profile load and save paths reject raw `api_key` fields and other secret-shaped values such as `token`, `secret`, `password`, `authorization`, `bearer`, `cookie`, and `credential`; use `api_key_env` instead.
 Creating a profile uses create-or-fail writes, and overwriting uses a temporary file plus rename.
 
 ## What stays YAML-only

@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -45,13 +48,15 @@ import {
   toolResult,
   type McpSamplingContext
 } from "./tools.js";
-import { listRunResources, readJobResource, readRunResource, runResourceMimeType } from "./resources.js";
+import { jobResourceMimeType, jobResourceName, listRunResources, readJobResource, readRunResource, runResourceMimeType } from "./resources.js";
 import { renderPrompt } from "./prompts.js";
+
+const packageVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../package.json"), "utf8")) as { version: string };
 
 export function createDeepThonkMcpServer(): McpServer {
   const server = new McpServer({
     name: "deepthonk",
-    version: "0.1.2"
+    version: packageVersion.version
   });
   const samplingContext: McpSamplingContext = {
     getClientCapabilities: () => server.server.getClientCapabilities(),
@@ -132,7 +137,7 @@ export function createDeepThonkMcpServer(): McpServer {
       inputSchema: rankArgsSchema.shape,
       outputSchema: rankOutputSchema.shape
     },
-    async (args) => safeTool(async () => toolResult(await deepthonkRank(args)))
+    async (args) => safeTool(async () => toolResult(await deepthonkRank(args, samplingContext)))
   );
 
   server.registerTool(
@@ -143,7 +148,7 @@ export function createDeepThonkMcpServer(): McpServer {
       inputSchema: mutateArgsSchema.shape,
       outputSchema: mutateOutputSchema.shape
     },
-    async (args) => safeTool(async () => toolResult(await deepthonkMutate(args)))
+    async (args) => safeTool(async () => toolResult(await deepthonkMutate(args, samplingContext)))
   );
 
   server.registerTool(
@@ -217,6 +222,21 @@ export function createDeepThonkMcpServer(): McpServer {
       title: "DeepThonk Job Resource",
       mimeType: "application/json"
     },
+    async (uri) => {
+      const resource = jobResourceName(uri.href);
+      return { contents: [{ uri: uri.href, mimeType: jobResourceMimeType(resource), text: await readJobResource(uri.href) }] };
+    }
+  );
+
+  server.registerResource(
+    "deepthonk-job-population",
+    new ResourceTemplate("deepthonk://jobs/{job_id}/population/{generation}", {
+      list: async () => ({ resources: [] })
+    }),
+    {
+      title: "DeepThonk Job Population",
+      mimeType: "application/json"
+    },
     async (uri) => ({
       contents: [{ uri: uri.href, mimeType: "application/json", text: await readJobResource(uri.href) }]
     })
@@ -256,7 +276,7 @@ export function createDeepThonkMcpServer(): McpServer {
     "deepthonk.profile_show",
     {
       title: "Show DeepThonk Profile",
-      description: "Show a saved named profile with secret-shaped values redacted.",
+      description: "Show a saved named profile; manually edited secret-shaped values are rejected on load.",
       inputSchema: profileNameArgsSchema.shape,
       outputSchema: profileShowOutputSchema.shape
     },
@@ -326,6 +346,21 @@ async function serveHttp(port: number): Promise<void> {
       res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null }));
       return;
     }
+    if (!isApplicationJsonContentType(req.headers["content-type"])) {
+      res.writeHead(415, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Content-Type must be application/json." }, id: null }));
+      return;
+    }
+    if (!isAllowedLoopbackOrigin(req.headers.origin)) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden Origin header." }, id: null }));
+      return;
+    }
+    if (!isAllowedSecFetchSite(req.headers["sec-fetch-site"])) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden cross-site request." }, id: null }));
+      return;
+    }
 
     try {
       const body = await readJsonBody(req);
@@ -366,6 +401,28 @@ async function serveHttp(port: number): Promise<void> {
 
 export function isAllowedMcpHttpHost(host: string | undefined, allowedHosts: string[]): boolean {
   return Boolean(host && allowedHosts.includes(host));
+}
+
+export function isApplicationJsonContentType(contentType: string | string[] | undefined): boolean {
+  const value = Array.isArray(contentType) ? contentType[0] : contentType;
+  return value?.split(";")[0]?.trim().toLowerCase() === "application/json";
+}
+
+export function isAllowedLoopbackOrigin(origin: string | string[] | undefined): boolean {
+  const value = Array.isArray(origin) ? origin[0] : origin;
+  if (!value) return true;
+  try {
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+export function isAllowedSecFetchSite(secFetchSite: string | string[] | undefined): boolean {
+  const value = Array.isArray(secFetchSite) ? secFetchSite[0] : secFetchSite;
+  return value?.trim().toLowerCase() !== "cross-site";
 }
 
 function registerPrompt(server: McpServer, name: string, argsSchema: z.ZodRawShape): void {

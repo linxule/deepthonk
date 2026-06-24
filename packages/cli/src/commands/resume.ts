@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { detectResumeState, resumeDeepThonk, runConfigSchema } from "@deepthonk/core";
 import { createDriver, resolveProviderConfig } from "@deepthonk/providers";
 import { resolveCliPath } from "../config.js";
+import { parseProviderReplay, providerConfigFromReplay } from "../providerReplay.js";
 
 export function registerResume(program: Command): void {
   program
@@ -30,15 +31,23 @@ export function registerResume(program: Command): void {
 async function resumeDriverFromRunConfig(runDir: string, providerOverride?: string): Promise<{ driver: ReturnType<typeof createDriver>; provider: string }> {
   const raw = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as unknown;
   const config = runConfigSchema.parse(raw);
-  const provider = providerOverride ?? config.provider;
-  const providerConfig = resolveProviderConfig({
-    provider,
-    models: {
-      generator: config.generatorModel,
-      mutator: config.mutatorModel,
-      judge: config.judgeModel,
-      finalizer: config.finalizerModel
-    }
-  });
+  const replay = parseProviderReplay(isRecord(raw) ? raw.providerReplay : undefined);
+  const provider = providerOverride ?? replay?.provider ?? config.provider;
+  const providerConfig = replay
+    ? providerConfigFromReplay({ ...replay, provider }, config.retry)
+    : resolveProviderConfig({
+        provider,
+        models: {
+          generator: config.generatorModel,
+          mutator: config.mutatorModel,
+          judge: config.judgeModel,
+          finalizer: config.finalizerModel
+        },
+        retry: config.retry
+      });
   return { driver: createDriver(providerConfig), provider };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }

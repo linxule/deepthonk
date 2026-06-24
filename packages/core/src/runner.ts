@@ -1,4 +1,3 @@
-import pLimit from "p-limit";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
@@ -20,6 +19,7 @@ import {
   type UsageRecord
 } from "./lifecycle.js";
 import { makeKRegularPairs, type Pair } from "./pairScheduler.js";
+import { runLimitedPhase } from "./phaseRunner.js";
 import { comparePrompt, finalizePrompt, generatePrompt, mutatePrompt } from "./prompts.js";
 import { createRng, type Rng } from "./rng.js";
 import {
@@ -66,6 +66,7 @@ const compareOutputSchema = z.object({
 
 export interface RunControl {
   jobId?: string;
+  lockClaimed?: boolean;
   shouldCancel?: () => boolean | Promise<boolean>;
 }
 
@@ -129,18 +130,20 @@ export async function runDeepThonk(
   const rng = createRng(config.seed);
   const tracker = resumeState?.tracker ?? new BudgetTracker(config);
   const startedAt = resumeState?.startedAt ?? new Date().toISOString();
-  if (!resumeState) {
-    await trace.init({ ...config, version: await currentPackageVersion() }, runId);
-  } else {
-    await trace.event({
-      type: "run.resumed",
-      run_id: runId,
-      resumed_at: new Date().toISOString(),
-      next_phase: resumeState.nextPhase.phase,
-      generation: resumeState.nextPhase.generation
-    });
+  let ownsLock = false;
+  if (!resumeState && !control.lockClaimed) {
+    const claimed = await claimRunLock(config.runDir, control.jobId ?? runId);
+    if (!claimed) {
+      throw new ConfigError(`Run directory is already claimed: ${config.runDir}`, {
+        code: "run.directory_locked",
+        retryable: false,
+        fix: "Wait for the active run to finish, or choose a fresh run directory."
+      });
+    }
+    ownsLock = true;
   }
   let stopped = false;
+  let caughtError: unknown;
   const writeStatus = async (
     state: RunLifecycleState,
     phase: string,
@@ -174,7 +177,9 @@ export async function runDeepThonk(
     } catch (error) {
       if (error instanceof BudgetExceededError) {
         stopped = true;
-        await trace.event({ type: "budget.exceeded", phase, usage: cloneUsage(tracker.usage), error: serializeRunError(error) });
+        await bestEffortTraceWrite("budget exceeded event", () =>
+          trace.event({ type: "budget.exceeded", phase, usage: cloneUsage(tracker.usage), error: serializeRunError(error) })
+        );
       }
       throw error;
     }
@@ -192,6 +197,17 @@ export async function runDeepThonk(
   };
 
   try {
+    if (!resumeState) {
+      await trace.init({ ...config, version: await currentPackageVersion() }, runId);
+    } else {
+      await trace.event({
+        type: "run.resumed",
+        run_id: runId,
+        resumed_at: new Date().toISOString(),
+        next_phase: resumeState.nextPhase.phase,
+        generation: resumeState.nextPhase.generation
+      });
+    }
     await writeStatus("running", resumeState ? "resume_replay" : "initialized");
     let population: Candidate[];
     if (isResumePhaseCompleted(resumeState, "initial_generation")) {
@@ -346,12 +362,27 @@ export async function runDeepThonk(
       calls: tracker.usage.calls
     };
   } catch (error) {
+    caughtError = error;
     const serialized = serializeRunError(error);
     const state: RunLifecycleState =
       error instanceof CancelledError ? "cancelled" : error instanceof BudgetExceededError ? "budget_exceeded" : "failed";
-    await trace.event({ type: `run.${state}`, run_id: runId, error: serialized, updated_at: new Date().toISOString() });
-    await writeStatus(state, state, { error: serialized });
+    await bestEffortTraceWrite("run failure event", () =>
+      trace.event({ type: `run.${state}`, run_id: runId, error: serialized, updated_at: new Date().toISOString() })
+    );
+    await bestEffortTraceWrite("run failure status", () => writeStatus(state, state, { error: serialized }));
     throw error;
+  } finally {
+    if (ownsLock) {
+      try {
+        await releaseRunLock(config.runDir);
+      } catch (error) {
+        if (caughtError !== undefined) {
+          process.stderr.write(`deepthonk: failed to release run lock: ${(error as Error).message}\n`);
+        } else {
+          throw error;
+        }
+      }
+    }
   }
 }
 
@@ -742,15 +773,13 @@ async function generateInitialPopulation(
   tracker: BudgetTracker,
   guards: RunGuards
 ): Promise<Candidate[]> {
-  const limit = pLimit(config.concurrency.generate);
   const jobs = Array.from({ length: config.profile.n }, (_, index) => ({
     index,
     id: `g0_c${index}_${rng.id("c")}`,
     prompt: generatePrompt(config.task, config.rubric, config.promptStyle, config.promptOverrides?.generate)
   }));
-  const candidates = await Promise.all(
-    jobs.map((job) =>
-      limit(async () => {
+  const candidates = await runLimitedPhase(
+    jobs.map((job) => async () => {
         await guards.beforeCall("initial population call");
         const result = await driver.generate({
           task: config.task,
@@ -781,8 +810,8 @@ async function generateInitialPopulation(
         await trace.writeCandidate(candidate);
         await trace.event({ type: "candidate.generated", run_id: runId, candidate_id: candidate.id });
         return candidate;
-      })
-    )
+      }),
+    config.concurrency.generate
   );
   return candidates;
 }
@@ -800,7 +829,6 @@ async function judgePairs(args: {
   guards: RunGuards;
 }): Promise<Comparison[]> {
   const byId = new Map(args.population.map((candidate) => [candidate.id, candidate]));
-  const limit = pLimit(args.config.concurrency.judge);
   const jobs = args.pairs.map((pair, pairIndex) => {
     const originalA = byId.get(pair.a);
     const originalB = byId.get(pair.b);
@@ -818,9 +846,8 @@ async function judgePairs(args: {
       prompt: comparePrompt(args.config.task, presentedA, presentedB, args.config.rubric, args.config.promptStyle, args.config.promptOverrides?.compare)
     };
   });
-  const comparisons = await Promise.all(
-    jobs.map((job) =>
-      limit(async () => {
+  const comparisons = await runLimitedPhase(
+    jobs.map((job) => async () => {
         let parsed: z.infer<typeof compareOutputSchema> | undefined;
         let rawOutput: unknown;
         let invalidJson = false;
@@ -924,8 +951,8 @@ async function judgePairs(args: {
           generation: args.generation
         });
         return comparison;
-      })
-    )
+      }),
+    args.config.concurrency.judge
   );
   return comparisons;
 }
@@ -940,10 +967,8 @@ async function mutateSurvivors(args: {
   tracker: BudgetTracker;
   guards: RunGuards;
 }): Promise<Candidate[]> {
-  const limit = pLimit(args.config.concurrency.mutate);
-  const mutants = await Promise.all(
-    args.survivors.map((candidate, index) =>
-      limit(async () => {
+  const mutants = await runLimitedPhase(
+    args.survivors.map((candidate, index) => async () => {
         const critique = args.critiquesByCandidate.get(candidate.id) ?? "";
         const prompt = mutatePrompt(args.config.task, candidate, critique, args.config.rubric, args.config.promptStyle, args.config.promptOverrides?.mutate);
         await args.guards.beforeCall(`generation ${args.generation} mutation call`);
@@ -978,8 +1003,8 @@ async function mutateSurvivors(args: {
         await args.trace.writeCandidate(mutant);
         await args.trace.event({ type: "candidate.mutated", candidate_id: mutant.id, parent_id: mutant.parentId });
         return mutant;
-      })
-    )
+      }),
+    args.config.concurrency.mutate
   );
   return mutants;
 }
@@ -1135,6 +1160,14 @@ function cloneUsage(usage: BudgetUsage): BudgetUsage {
     ...emptyUsage(),
     ...usage
   };
+}
+
+async function bestEffortTraceWrite(label: string, action: () => Promise<void>): Promise<void> {
+  try {
+    await action();
+  } catch (error) {
+    process.stderr.write(`deepthonk: failed to persist ${label}: ${(error as Error).message}\n`);
+  }
 }
 
 function serializeRunError(error: unknown): RunStatus["error"] {

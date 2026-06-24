@@ -29,8 +29,17 @@ describe("deepthonk profile CLI", () => {
     expect(JSON.parse(json.stdout)).toEqual(["alpha", "beta"]);
   });
 
-  it("shows a profile with secret-shaped values redacted and api_key_env visible", async () => {
+  it("shows a valid profile with api_key_env visible", async () => {
     const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-cli-profiles-show-"));
+    await writeFile(join(profilesDir, "valid.yaml"), validProfileYaml());
+
+    const shown = await runProfile(["show", "valid"], profilesDir);
+    const parsed = JSON.parse(shown.stdout);
+    expect(parsed.api_key_env).toBe("DEEPTHONK_API_KEY");
+  });
+
+  it("rejects manually edited profile secret-shaped fields on load", async () => {
+    const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-cli-profiles-show-secret-"));
     await writeFile(
       join(profilesDir, "with-secret.yaml"),
       [
@@ -43,11 +52,9 @@ describe("deepthonk profile CLI", () => {
       ].join("\n")
     );
 
-    const shown = await runProfile(["show", "with-secret"], profilesDir);
-    const parsed = JSON.parse(shown.stdout);
-    expect(parsed.api_key_env).toBe("DEEPTHONK_API_KEY");
-    expect(parsed.providers.judge.authorization).toBe("[redacted]");
-    expect(shown.stdout).not.toContain("raw-secret");
+    await expect(runCli(["--json-errors", "profile", "show", "with-secret"], profilesDir)).rejects.toMatchObject({
+      stderr: expect.stringContaining("config.profile_raw_secret")
+    });
   });
 
   it("saves a profile from --from-config", async () => {

@@ -146,4 +146,54 @@ describe("OpenAiCompatibleDriver", () => {
       })
     ).rejects.toMatchObject({ code: "provider.output_truncated" });
   });
+
+  it("caches JSON-mode fallback after provider rejection", async () => {
+    process.env.TEST_PROVIDER_KEY = "secret";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("response_format is not supported", { status: 422 }))
+      .mockImplementation(async () =>
+        new Response(JSON.stringify({ model: "m", choices: [{ message: { content: "{\"winner\":\"A\"}" } }] }), { status: 200 })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = new OpenAiCompatibleDriver({
+      provider: "openai-compatible",
+      baseUrl: "https://example.test/v1",
+      apiKeyEnv: "TEST_PROVIDER_KEY",
+      models: { generator: "m", mutator: "m", judge: "m" },
+      retry: { httpRetries: 0 }
+    });
+    await driver.compare({
+      task: "x",
+      model: "m",
+      temperature: 0,
+      candidateA: candidate("A"),
+      candidateB: candidate("B"),
+      prompt: { system: "s", user: "u" }
+    });
+    await driver.compare({
+      task: "x",
+      model: "m",
+      temperature: 0,
+      candidateA: candidate("A"),
+      candidateB: candidate("B"),
+      prompt: { system: "s", user: "u" }
+    });
+
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { response_format?: unknown });
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0].response_format).toEqual({ type: "json_object" });
+    expect(bodies[1].response_format).toBeUndefined();
+    expect(bodies[2].response_format).toBeUndefined();
+  });
 });
+
+function candidate(id: string) {
+  return {
+    id,
+    generation: 0,
+    kind: "user-supplied" as const,
+    content: `candidate ${id}`,
+    metadata: { createdAt: "2026-01-01T00:00:00.000Z" }
+  };
+}

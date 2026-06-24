@@ -13,17 +13,28 @@ import {
   type ProviderConfig,
   type ProviderRole
 } from "@deepthonk/providers";
+import { booleanOption, numberOption, stringOption } from "./options.js";
 import { loadNamedProfile } from "./profileRegistry.js";
+import { providerReplayFromConfig, type ProviderReplay } from "./providerReplay.js";
 
 export interface ResolvedCliConfig {
   runConfig: RunConfig;
   providerConfig: ProviderConfig;
+  providerReplay: ProviderReplay;
   plan: ReturnType<typeof planBudget>;
 }
 
 export interface ResolvedProviderConfig {
   providerConfig: ProviderConfig;
   models: ProviderConfig["models"];
+}
+
+export interface ResolvedOneShotConfig extends ResolvedProviderConfig {
+  profile: Profile;
+  retry: RunConfig["retry"];
+  promptStyle: RunConfig["promptStyle"];
+  promptOverrides?: RunConfig["promptOverrides"];
+  concurrency: RunConfig["concurrency"];
 }
 
 export { defaultConfigPath, defaultEnvPath, loadDeepThonkEnv };
@@ -33,6 +44,7 @@ export interface RawConfigFile {
   provider?: string;
   base_url?: string;
   api_key_env?: string;
+  supports_json_mode?: boolean;
   models?: {
     generator?: string;
     mutator?: string;
@@ -89,65 +101,64 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
     judge: stringOption(options.judgeModel) ?? fileConfig.models?.judge,
     finalizer: stringOption(options.finalizerModel) ?? fileConfig.models?.finalizer
   });
-  const maxConcurrency = numberOption(options.maxConcurrency);
-  const retry = {
-    httpRetries: fileConfig.retry?.httpRetries ?? 2,
-    invalidJsonRetries: fileConfig.retry?.invalidJsonRetries ?? 1,
-    requestTimeoutMs: numberOption(options.requestTimeoutMs) ?? fileConfig.retry?.requestTimeoutMs
-  };
+  const maxConcurrency = numberOption(options.maxConcurrency, "--max-concurrency", { integer: true, min: 1 });
+  const retry = resolveRetry(options, fileConfig);
+  const supportsJsonMode = booleanOption(options.supportsJsonMode, "--supports-json-mode") ?? fileConfig.supports_json_mode;
   const providerConfig: ProviderConfig = resolveProviderConfig({
     provider,
     baseUrl: stringOption(options.baseUrl) ?? fileConfig.base_url,
     apiKeyEnv: stringOption(options.apiKeyEnv) ?? fileConfig.api_key_env,
+    supportsJsonMode,
     models,
-    roleProviders: normalizeRoleProviders(fileConfig.providers, models),
+    roleProviders: normalizeRoleProviders(fileConfig.providers, models, supportsJsonMode),
     retry
   });
   const budget = mergeBudget(fileConfig.budget, {
-    maxCalls: numberOption(options.maxCalls),
-    maxInputTokens: numberOption(options.maxInputTokens),
-    maxOutputTokens: numberOption(options.maxOutputTokens),
-    maxUsd: numberOption(options.maxUsd)
+    maxCalls: numberOption(options.maxCalls, "--max-calls", { integer: true, min: 1 }),
+    maxInputTokens: numberOption(options.maxInputTokens, "--max-input-tokens", { integer: true, min: 1 }),
+    maxOutputTokens: numberOption(options.maxOutputTokens, "--max-output-tokens", { integer: true, min: 1 }),
+    maxUsd: numberOption(options.maxUsd, "--max-usd", { min: 0 })
   }, defaultPricesForProviderConfig(providerConfig));
   const promptOverrides = await loadPromptOverrides(options, fileConfig);
+  const providerReplay = providerReplayFromConfig(providerConfig);
   const runConfig: RunConfig = {
     task,
     rubric,
     promptStyle:
       (stringOption(options.promptStyle) as RunConfig["promptStyle"] | undefined) ??
       fileConfig.prompt_style ??
-      (profileName === "paper" ? "paper-programming" : "general"),
+      defaultPromptStyle(profileName),
     promptOverrides,
     profile,
     runDir: resolveCliPath(String(options.out ?? `runs/${new Date().toISOString().replace(/[:.]/g, "-")}`)),
-    seed: numberOption(options.seed) ?? 1,
+    seed: numberOption(options.seed, "--seed", { integer: true }) ?? 1,
     provider,
+    providerReplay,
     generatorModel: models.generator,
     mutatorModel: models.mutator,
     judgeModel: models.judge,
     finalizerModel: models.finalizer,
-    concurrency: {
-      generate: maxConcurrency ?? fileConfig.concurrency?.generate ?? profile.n,
-      judge: maxConcurrency ?? fileConfig.concurrency?.judge ?? Math.max(1, (profile.n * Math.max(profile.k, profile.m)) / 2),
-      mutate: maxConcurrency ?? fileConfig.concurrency?.mutate ?? profile.n - Math.floor(profile.n / 4)
-    },
+    concurrency: resolveRunConcurrency(profile, fileConfig, options, maxConcurrency),
     retry,
     budget,
     output: {
-      includeRawModelOutputs: booleanOption(options.includeRawModelOutputs) ?? fileConfig.output?.includeRawModelOutputs ?? false,
-      includePrompts: booleanOption(options.includePrompts) ?? fileConfig.output?.includePrompts ?? false
+      includeRawModelOutputs: booleanOption(options.includeRawModelOutputs, "--include-raw-model-outputs") ?? fileConfig.output?.includeRawModelOutputs ?? false,
+      includePrompts: booleanOption(options.includePrompts, "--include-prompts") ?? fileConfig.output?.includePrompts ?? false
     }
   };
   return {
     runConfig,
     providerConfig,
+    providerReplay,
     plan: planBudget(profile)
   };
 }
 
-export async function resolveProviderOnlyConfig(options: Record<string, unknown>): Promise<ResolvedProviderConfig> {
+export async function resolveOneShotConfig(options: Record<string, unknown>): Promise<ResolvedOneShotConfig> {
   await loadDeepThonkEnv();
   const fileConfig = await resolveBaseConfig(options);
+  const profileName = builtInProfileName(options.profile ?? fileConfig.profile ?? "quick");
+  const profile = mergeAlgorithmOverrides(getProfile(profileName), fileConfig.algorithm, options);
   const provider = String(options.provider ?? fileConfig.provider ?? "fake");
   const models = resolveProviderModels(provider, {
     generator: stringOption(options.generatorModel) ?? fileConfig.models?.generator,
@@ -155,19 +166,44 @@ export async function resolveProviderOnlyConfig(options: Record<string, unknown>
     judge: stringOption(options.judgeModel) ?? fileConfig.models?.judge,
     finalizer: stringOption(options.finalizerModel) ?? fileConfig.models?.finalizer
   });
+  const retry = resolveRetry(options, fileConfig);
+  const supportsJsonMode = booleanOption(options.supportsJsonMode, "--supports-json-mode") ?? fileConfig.supports_json_mode;
+  const providerConfig = resolveProviderConfig({
+    provider,
+    baseUrl: stringOption(options.baseUrl) ?? fileConfig.base_url,
+    apiKeyEnv: stringOption(options.apiKeyEnv) ?? fileConfig.api_key_env,
+    supportsJsonMode,
+    models,
+    roleProviders: normalizeRoleProviders(fileConfig.providers, models, supportsJsonMode),
+    retry
+  });
   return {
     models,
-    providerConfig: resolveProviderConfig({
-      provider,
-      baseUrl: stringOption(options.baseUrl) ?? fileConfig.base_url,
-      apiKeyEnv: stringOption(options.apiKeyEnv) ?? fileConfig.api_key_env,
-      models,
-      roleProviders: normalizeRoleProviders(fileConfig.providers, models),
-      retry: {
-        httpRetries: fileConfig.retry?.httpRetries ?? 2,
-        requestTimeoutMs: numberOption(options.requestTimeoutMs) ?? fileConfig.retry?.requestTimeoutMs
-      }
-    })
+    providerConfig,
+    profile,
+    retry,
+    promptStyle:
+      (stringOption(options.promptStyle) as RunConfig["promptStyle"] | undefined) ??
+      fileConfig.prompt_style ??
+      defaultPromptStyle(profileName),
+    promptOverrides: await loadPromptOverrides(options, fileConfig),
+    concurrency: resolveRunConcurrency(profile, fileConfig, options)
+  };
+}
+
+export async function resolveProviderOnlyConfig(options: Record<string, unknown>): Promise<ResolvedProviderConfig> {
+  const resolved = await resolveOneShotConfig(options);
+  return {
+    models: resolved.models,
+    providerConfig: resolved.providerConfig
+  };
+}
+
+function resolveRetry(options: Record<string, unknown>, fileConfig: RawConfigFile): RunConfig["retry"] {
+  return {
+    httpRetries: fileConfig.retry?.httpRetries ?? 2,
+    invalidJsonRetries: fileConfig.retry?.invalidJsonRetries ?? 1,
+    requestTimeoutMs: numberOption(options.requestTimeoutMs, "--request-timeout-ms", { integer: true, min: 1 }) ?? fileConfig.retry?.requestTimeoutMs
   };
 }
 
@@ -214,17 +250,17 @@ export function mergeAlgorithmOverrides(
   cliOptions: Record<string, unknown>
 ): Profile {
   return {
-    n: numberOption(cliOptions.n) ?? fileOverrides?.n ?? base.n,
-    k: numberOption(cliOptions.k) ?? fileOverrides?.k ?? base.k,
-    t: numberOption(cliOptions.t) ?? fileOverrides?.t ?? base.t,
-    m: numberOption(cliOptions.m) ?? fileOverrides?.m ?? base.m,
-    lambda: numberOption(cliOptions.lambda) ?? fileOverrides?.lambda ?? base.lambda,
+    n: numberOption(cliOptions.n, "--n", { integer: true, min: 2 }) ?? fileOverrides?.n ?? base.n,
+    k: numberOption(cliOptions.k, "--k", { integer: true, min: 1 }) ?? fileOverrides?.k ?? base.k,
+    t: numberOption(cliOptions.t, "--t", { integer: true, min: 0 }) ?? fileOverrides?.t ?? base.t,
+    m: numberOption(cliOptions.m, "--m", { integer: true, min: 1 }) ?? fileOverrides?.m ?? base.m,
+    lambda: numberOption(cliOptions.lambda, "--lambda", { min: 0 }) ?? fileOverrides?.lambda ?? base.lambda,
     sampleTemperature:
-      numberOption(cliOptions.sampleTemperature) ?? fileOverrides?.sample_temperature ?? base.sampleTemperature,
+      numberOption(cliOptions.sampleTemperature, "--sample-temperature", { min: 0 }) ?? fileOverrides?.sample_temperature ?? base.sampleTemperature,
     mutateTemperature:
-      numberOption(cliOptions.mutateTemperature) ?? fileOverrides?.mutate_temperature ?? base.mutateTemperature,
+      numberOption(cliOptions.mutateTemperature, "--mutate-temperature", { min: 0 }) ?? fileOverrides?.mutate_temperature ?? base.mutateTemperature,
     judgeTemperature:
-      numberOption(cliOptions.judgeTemperature) ?? fileOverrides?.judge_temperature ?? base.judgeTemperature
+      numberOption(cliOptions.judgeTemperature, "--judge-temperature", { min: 0 }) ?? fileOverrides?.judge_temperature ?? base.judgeTemperature
   };
 }
 
@@ -284,20 +320,6 @@ async function resolveBaseConfig(options: Record<string, unknown>): Promise<RawC
   return configPath ? await readConfig(configPath) : {};
 }
 
-function numberOption(value: unknown): number | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  return Number(value);
-}
-
-function booleanOption(value: unknown): boolean | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  if (typeof value === "boolean") return value;
-  const text = String(value).toLowerCase();
-  if (text === "true" || text === "1") return true;
-  if (text === "false" || text === "0") return false;
-  return Boolean(value);
-}
-
 function mergeBudget(
   fileBudget: RunConfig["budget"],
   overrides: Partial<NonNullable<RunConfig["budget"]>>,
@@ -323,11 +345,6 @@ function mergePrices(
   return [...byKey.values()];
 }
 
-function stringOption(value: unknown): string | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  return String(value);
-}
-
 function parsePromptOverridesJson(value: string | undefined): PromptOverridesFile | undefined {
   if (!value) return undefined;
   try {
@@ -347,6 +364,35 @@ function builtInProfileName(value: unknown): BuiltInProfileName {
   throw new ConfigError(`Unknown profile: ${profile}. Use quick, balanced, or paper.`);
 }
 
+function defaultPromptStyle(profileName: BuiltInProfileName): RunConfig["promptStyle"] {
+  return profileName === "paper" ? "paper-programming" : "general";
+}
+
+function resolveRunConcurrency(
+  profile: Profile,
+  fileConfig: RawConfigFile,
+  options: Record<string, unknown>,
+  maxConcurrency = numberOption(options.maxConcurrency, "--max-concurrency", { integer: true, min: 1 })
+): RunConfig["concurrency"] {
+  return {
+    generate:
+      numberOption(options.generateConcurrency, "--generate-concurrency", { integer: true, min: 1 }) ??
+      maxConcurrency ??
+      fileConfig.concurrency?.generate ??
+      profile.n,
+    judge:
+      numberOption(options.judgeConcurrency, "--judge-concurrency", { integer: true, min: 1 }) ??
+      maxConcurrency ??
+      fileConfig.concurrency?.judge ??
+      Math.max(1, (profile.n * Math.max(profile.k, profile.m)) / 2),
+    mutate:
+      numberOption(options.mutateConcurrency, "--mutate-concurrency", { integer: true, min: 1 }) ??
+      maxConcurrency ??
+      fileConfig.concurrency?.mutate ??
+      profile.n - Math.floor(profile.n / 4)
+  };
+}
+
 function looksPathLike(value: string): boolean {
   if (value.startsWith("/") || value.startsWith("./") || value.startsWith("../") || value.startsWith("~/")) return true;
   if (value.includes("/") || value.includes("\\")) return true;
@@ -356,7 +402,8 @@ function looksPathLike(value: string): boolean {
 
 function normalizeRoleProviders(
   providers: RawConfigFile["providers"],
-  models: ProviderConfig["models"]
+  models: ProviderConfig["models"],
+  baseSupportsJsonMode?: boolean
 ): Parameters<typeof resolveProviderConfig>[0]["roleProviders"] {
   if (!providers) return undefined;
   const normalized: Parameters<typeof resolveProviderConfig>[0]["roleProviders"] = {};
@@ -370,7 +417,7 @@ function normalizeRoleProviders(
       baseUrl: provider.base_url,
       apiKeyEnv: provider.api_key_env,
       model,
-      supportsJsonMode: provider.supports_json_mode
+      supportsJsonMode: provider.supports_json_mode ?? baseSupportsJsonMode
     };
   }
   return Object.keys(normalized).length ? normalized : undefined;

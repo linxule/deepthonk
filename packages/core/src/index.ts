@@ -7,6 +7,7 @@ export * from "./errors.js";
 export * from "./json.js";
 export * from "./lifecycle.js";
 export * from "./pairScheduler.js";
+export * from "./phaseRunner.js";
 export * from "./prompts.js";
 export * from "./rng.js";
 export * from "./runner.js";

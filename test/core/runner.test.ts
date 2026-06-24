@@ -1,8 +1,8 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { builtInProfiles, readRunStatus, runDeepThonk, TraceStore, type RunConfig } from "@deepthonk/core";
+import { builtInProfiles, claimRunLock, readRunStatus, releaseRunLock, runDeepThonk, TraceStore, type RunConfig } from "@deepthonk/core";
 import { FakeDriver, type GenerateInput, type ModelTextResult } from "@deepthonk/providers";
 
 describe("runDeepThonk", () => {
@@ -138,6 +138,49 @@ describe("runDeepThonk", () => {
     await expect(runDeepThonk(config, new FakeDriver())).rejects.toThrow(/already contains/);
   });
 
+  it("claims and releases the fresh-run lock", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-lock-release-"));
+    const config: RunConfig = {
+      task: "solve toy",
+      profile: builtInProfiles.quick,
+      runDir,
+      seed: 1,
+      provider: "fake",
+      generatorModel: "fake-model",
+      mutatorModel: "fake-model",
+      judgeModel: "fake-model",
+      concurrency: { generate: 4, judge: 4, mutate: 3 },
+      retry: { httpRetries: 0, invalidJsonRetries: 1 },
+      output: { includeRawModelOutputs: false, includePrompts: false }
+    };
+    await runDeepThonk(config, new FakeDriver());
+    await expect(stat(join(runDir, "run.lock"))).rejects.toThrow(/ENOENT/);
+  });
+
+  it("rejects a fresh run when the run directory is already locked", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-lock-held-"));
+    const claimed = await claimRunLock(runDir, "external");
+    expect(claimed).toBe(true);
+    const config: RunConfig = {
+      task: "solve toy",
+      profile: builtInProfiles.quick,
+      runDir,
+      seed: 1,
+      provider: "fake",
+      generatorModel: "fake-model",
+      mutatorModel: "fake-model",
+      judgeModel: "fake-model",
+      concurrency: { generate: 4, judge: 4, mutate: 3 },
+      retry: { httpRetries: 0, invalidJsonRetries: 1 },
+      output: { includeRawModelOutputs: false, includePrompts: false }
+    };
+    try {
+      await expect(runDeepThonk(config, new FakeDriver())).rejects.toMatchObject({ code: "run.directory_locked" });
+    } finally {
+      await releaseRunLock(runDir);
+    }
+  });
+
   it("stops at a phase boundary when runtime budget is exceeded", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-budget-"));
     const config: RunConfig = {
@@ -190,6 +233,29 @@ describe("runDeepThonk", () => {
     expect(status?.error?.code).toBe("run.cancelled");
   });
 
+  it("drains failed phase work before recording run failure", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-failed-drain-"));
+    const config: RunConfig = {
+      task: "solve toy",
+      profile: builtInProfiles.quick,
+      runDir,
+      seed: 1,
+      provider: "fake",
+      generatorModel: "fake-model",
+      mutatorModel: "fake-model",
+      judgeModel: "fake-model",
+      concurrency: { generate: 4, judge: 4, mutate: 3 },
+      retry: { httpRetries: 0, invalidJsonRetries: 0 },
+      output: { includeRawModelOutputs: false, includePrompts: false }
+    };
+    await expect(runDeepThonk(config, new InvalidJudgeDriver())).rejects.toMatchObject({ code: "judge.persistent_invalid_json" });
+    const events = (await readFile(join(runDir, "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string });
+    expect(events.at(-1)?.type).toBe("run.failed");
+  });
+
   it("redacts key-like fields before writing config traces", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-redact-"));
     const config = {
@@ -211,6 +277,49 @@ describe("runDeepThonk", () => {
     const traceConfig = await readFile(join(runDir, "config.json"), "utf8");
     expect(traceConfig).not.toContain("do-not-write");
     expect(traceConfig).toContain("[redacted]");
+  });
+
+  it("keeps providerReplay env var pointers while redacting secret values", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-replay-redact-"));
+    const config = {
+      task: "solve toy",
+      profile: builtInProfiles.quick,
+      runDir,
+      seed: 1,
+      provider: "openai-compatible",
+      generatorModel: "fake-model",
+      mutatorModel: "fake-model",
+      judgeModel: "fake-model",
+      providerReplay: {
+        provider: "openai-compatible",
+        baseUrl: "https://example.test/v1",
+        apiKeyEnv: "TEST_PROVIDER_KEY",
+        supportsJsonMode: false,
+        models: { generator: "fake-model", mutator: "fake-model", judge: "fake-model" },
+        roleProviders: {
+          judge: {
+            provider: "deepseek",
+            apiKeyEnv: "JUDGE_KEY",
+            model: "deepseek-v4-pro",
+            supportsJsonMode: true
+          }
+        }
+      },
+      apiKey: "do-not-write",
+      authorization: "Bearer do-not-write",
+      concurrency: { generate: 4, judge: 4, mutate: 3 },
+      retry: { httpRetries: 0, invalidJsonRetries: 1 },
+      output: { includeRawModelOutputs: false, includePrompts: false }
+    } as RunConfig & { apiKey: string; authorization: string };
+    await new TraceStore(runDir).init(config, "redaction-test");
+
+    const traceConfigText = await readFile(join(runDir, "config.json"), "utf8");
+    const traceConfig = JSON.parse(traceConfigText) as typeof config;
+    expect(traceConfigText).not.toContain("do-not-write");
+    expect(traceConfig.providerReplay.apiKeyEnv).toBe("TEST_PROVIDER_KEY");
+    expect(traceConfig.providerReplay.roleProviders?.judge?.apiKeyEnv).toBe("JUDGE_KEY");
+    expect((traceConfig as { apiKey: string }).apiKey).toBe("[redacted]");
+    expect((traceConfig as { authorization: string }).authorization).toBe("[redacted]");
   });
 
   it("traces bottom-quartile and rounding discards for non-divisible populations", async () => {
@@ -242,5 +351,12 @@ class DelayedFakeDriver extends FakeDriver {
   override async generate(input: GenerateInput): Promise<ModelTextResult> {
     await new Promise((resolve) => setTimeout(resolve, (4 - (input.candidateIndex ?? 0)) * 2));
     return super.generate(input);
+  }
+}
+
+class InvalidJudgeDriver extends FakeDriver {
+  override async compare(): Promise<ModelTextResult> {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return { text: "not json" };
   }
 }

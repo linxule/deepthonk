@@ -42,6 +42,21 @@ describe("provider defaults", () => {
     });
   });
 
+  it("lets role providers override base JSON-mode support", () => {
+    const config = resolveProviderConfig({
+      provider: "openai-compatible",
+      supportsJsonMode: false,
+      roleProviders: {
+        generator: { provider: "openai-compatible", model: "fast-model" },
+        judge: { provider: "openai-compatible", model: "judge-model", supportsJsonMode: true }
+      }
+    });
+
+    expect(config.supportsJsonMode).toBe(false);
+    expect(config.roleProviders?.generator?.supportsJsonMode).toBe(false);
+    expect(config.roleProviders?.judge?.supportsJsonMode).toBe(true);
+  });
+
   it("ships official DeepSeek V4 pricing defaults", () => {
     expect(defaultProviderPricing).toContainEqual(
       expect.objectContaining({

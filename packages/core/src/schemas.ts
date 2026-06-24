@@ -116,6 +116,28 @@ const promptOverridesSchema = z.object({
 export type PromptOverride = z.infer<typeof promptOverrideSchema>;
 export type PromptOverrides = z.infer<typeof promptOverridesSchema>;
 
+const providerReplayRoleSchema = z.object({
+  provider: z.string().min(1),
+  baseUrl: z.string().optional(),
+  apiKeyEnv: z.string().optional(),
+  model: z.string().min(1),
+  supportsJsonMode: z.boolean().optional()
+});
+
+const providerReplaySchema = z.object({
+  provider: z.string().min(1),
+  baseUrl: z.string().optional(),
+  apiKeyEnv: z.string().optional(),
+  supportsJsonMode: z.boolean().optional(),
+  models: z.object({
+    generator: z.string().min(1),
+    mutator: z.string().min(1),
+    judge: z.string().min(1),
+    finalizer: z.string().optional()
+  }),
+  roleProviders: z.record(providerReplayRoleSchema).optional()
+});
+
 export const runConfigSchema = z.object({
   version: z.string().optional(),
   runId: z.string().optional(),
@@ -127,6 +149,7 @@ export const runConfigSchema = z.object({
   runDir: z.string().min(1),
   seed: z.number().int(),
   provider: z.string().min(1),
+  providerReplay: providerReplaySchema.optional(),
   generatorModel: z.string().min(1),
   mutatorModel: z.string().min(1),
   judgeModel: z.string().min(1),

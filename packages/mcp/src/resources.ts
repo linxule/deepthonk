@@ -1,6 +1,9 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { ConfigError, detectResumeState, exportRun, listRunRecords, readRunArtifact, readRunStatus, recordRunIndex, resolveRunDir, type RunArtifactName } from "@deepthonk/core";
+
+const runResources = ["summary", "config", "candidates", "comparisons", "scores", "usage", "trace", "final", "winner", "status"] as const;
+const jobResources = ["status", "result", "config", "candidates", "comparisons", "scores", "usage", "trace", "final", "winner"] as const;
 
 export const resourceTemplates = [
   "deepthonk://runs",
@@ -16,8 +19,25 @@ export const resourceTemplates = [
   "deepthonk://runs/{run_id}/status",
   "deepthonk://runs/{run_id}/population/{generation}",
   "deepthonk://jobs/{job_id}/status",
-  "deepthonk://jobs/{job_id}/result"
+  "deepthonk://jobs/{job_id}/result",
+  "deepthonk://jobs/{job_id}/config",
+  "deepthonk://jobs/{job_id}/candidates",
+  "deepthonk://jobs/{job_id}/comparisons",
+  "deepthonk://jobs/{job_id}/scores",
+  "deepthonk://jobs/{job_id}/usage",
+  "deepthonk://jobs/{job_id}/trace",
+  "deepthonk://jobs/{job_id}/final",
+  "deepthonk://jobs/{job_id}/winner",
+  "deepthonk://jobs/{job_id}/population/{generation}"
 ] as const;
+
+export function jobArtifactResources(jobId: string, runDir: string): Record<string, string> {
+  const encodedRunDir = encodeURIComponent(runDir);
+  return {
+    ...Object.fromEntries(jobResources.map((resource) => [resource, `deepthonk://jobs/${jobId}/${resource}?run_dir=${encodedRunDir}`])),
+    population_template: `deepthonk://jobs/${jobId}/population/{generation}?run_dir=${encodedRunDir}`
+  };
+}
 
 export async function readRunResource(uri: string, runsRoot = "runs"): Promise<string> {
   if (uri === "deepthonk://runs") {
@@ -38,9 +58,10 @@ export async function readRunResource(uri: string, runsRoot = "runs"): Promise<s
 
 export async function readJobResource(uri: string): Promise<string> {
   const parsed = new URL(uri);
-  const requestedJobId = parsed.hostname === "jobs" ? parsed.pathname.replace(/^\/+/, "").split("/")[0] : undefined;
+  const segments = parsed.pathname.replace(/^\/+/, "").split("/");
+  const requestedJobId = parsed.hostname === "jobs" ? segments[0] : undefined;
   const runDir = parsed.searchParams.get("run_dir");
-  const [, resource] = parsed.pathname.replace(/^\/+/, "").split("/");
+  const [, resource, generation] = segments;
   if (!runDir) throw new Error(`Job resource requires run_dir query: ${uri}`);
   const status = await readRunStatus(runDir);
   if (requestedJobId && status?.job_id && requestedJobId !== status.job_id) {
@@ -60,6 +81,11 @@ export async function readJobResource(uri: string): Promise<string> {
     }
     return JSON.stringify({ complete: true, run_dir: runDir, summary: await exportRun(runDir, "json") }, null, 2);
   }
+  if (resource === "population") {
+    if (!generation) throw new Error(`Job population resource requires generation: ${uri}`);
+    return readFile(join(runDir, `population-${generation}.json`), "utf8");
+  }
+  if (isRunResource(resource)) return readRunArtifact(runDir, resourceArtifact(resource));
   throw new Error(`Unsupported job resource: ${resource}`);
 }
 
@@ -69,15 +95,24 @@ export async function recordRunResource(runId: string, runDir: string, runsRoot 
 
 export async function listRunResources(runsRoot = "runs"): Promise<Array<{ uri: string; name: string; title: string; mimeType: string }>> {
   const records = await listRunRecords(runsRoot);
-  const resources = ["summary", "config", "candidates", "comparisons", "scores", "usage", "trace", "final", "winner", "status"];
-  return records.flatMap((record) =>
-    resources.map((resource) => ({
+  const listed: Array<{ uri: string; name: string; title: string; mimeType: string }> = [];
+  for (const record of records) {
+    listed.push(...runResources.map((resource) => ({
       uri: `deepthonk://runs/${record.run_id}/${resource}`,
       name: `${record.run_id}/${resource}`,
       title: `DeepThonk ${resource} for ${record.run_id}`,
       mimeType: resourceMimeType(resource)
-    }))
-  );
+    })));
+    listed.push(...(await listRunPopulationResourcesForRecord(record.run_id, record.run_dir)));
+  }
+  return listed;
+}
+
+export async function listRunPopulationResources(runsRoot = "runs"): Promise<Array<{ uri: string; name: string; title: string; mimeType: string }>> {
+  const records = await listRunRecords(runsRoot);
+  const listed: Array<{ uri: string; name: string; title: string; mimeType: string }> = [];
+  for (const record of records) listed.push(...(await listRunPopulationResourcesForRecord(record.run_id, record.run_dir)));
+  return listed;
 }
 
 function resourceMimeType(resource: string): string {
@@ -91,6 +126,16 @@ function resourceMimeType(resource: string): string {
 
 export function runResourceMimeType(resource: string): string {
   return resourceMimeType(resource);
+}
+
+export function jobResourceMimeType(resource: string): string {
+  if (resource === "result") return "application/json";
+  return resourceMimeType(resource);
+}
+
+export function jobResourceName(uri: string): string {
+  const parsed = new URL(uri);
+  return parsed.pathname.replace(/^\/+/, "").split("/")[1] ?? "status";
 }
 
 function resourceArtifact(resource: string): RunArtifactName {
@@ -118,4 +163,25 @@ function resourceArtifact(resource: string): RunArtifactName {
     default:
       throw new Error(`Unsupported run resource: ${resource}`);
   }
+}
+
+function isRunResource(resource: string | undefined): resource is (typeof runResources)[number] {
+  return Boolean(resource && (runResources as readonly string[]).includes(resource));
+}
+
+async function listRunPopulationResourcesForRecord(
+  runId: string,
+  runDir: string
+): Promise<Array<{ uri: string; name: string; title: string; mimeType: string }>> {
+  const files = await readdir(runDir).catch(() => []);
+  return files
+    .map((file) => /^population-(\d+)\.json$/.exec(file)?.[1])
+    .filter((generation): generation is string => generation !== undefined)
+    .sort((left, right) => Number(left) - Number(right))
+    .map((generation) => ({
+      uri: `deepthonk://runs/${runId}/population/${generation}`,
+      name: `${runId}/population/${generation}`,
+      title: `DeepThonk population ${generation} for ${runId}`,
+      mimeType: "application/json"
+    }));
 }

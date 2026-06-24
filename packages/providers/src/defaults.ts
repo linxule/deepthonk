@@ -42,7 +42,7 @@ export function resolveProviderConfig(options: ProviderConfigOptions): ProviderC
     retry: options.retry,
     supportsJsonMode: options.supportsJsonMode,
     samplingTransport: options.samplingTransport,
-    roleProviders: resolveRoleProviders(options.provider, models, options.roleProviders, options.retry)
+    roleProviders: resolveRoleProviders(options.provider, models, options.roleProviders, options.retry, options.supportsJsonMode)
   };
 }
 
@@ -72,7 +72,8 @@ function resolveRoleProviders(
   baseProvider: string,
   models: ProviderConfig["models"],
   roleProviders?: ProviderConfigOptions["roleProviders"],
-  baseRetry?: ProviderConfig["retry"]
+  baseRetry?: ProviderConfig["retry"],
+  baseSupportsJsonMode?: boolean
 ): ProviderConfig["roleProviders"] {
   if (!roleProviders) return undefined;
   const resolved: ProviderConfig["roleProviders"] = {};
@@ -88,7 +89,7 @@ function resolveRoleProviders(
       apiKey: input.apiKey,
       model,
       retry: input.retry ?? baseRetry,
-      supportsJsonMode: input.supportsJsonMode
+      supportsJsonMode: input.supportsJsonMode ?? baseSupportsJsonMode
     };
   }
   return Object.keys(resolved).length ? resolved : undefined;

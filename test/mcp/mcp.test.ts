@@ -15,8 +15,13 @@ import {
   deepthonkProfileSave,
   deepthonkProfileShow,
   statusOutputSchema,
+  isAllowedLoopbackOrigin,
   isAllowedMcpHttpHost,
+  isAllowedSecFetchSite,
+  isApplicationJsonContentType,
+  listRunResources,
   promptNames,
+  readJobResource,
   readRunResource,
   resourceTemplates,
   mutateArgsSchema,
@@ -39,6 +44,8 @@ describe("MCP helpers", () => {
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/summary");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/usage");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/population/{generation}");
+    expect(resourceTemplates).toContain("deepthonk://jobs/{job_id}/config");
+    expect(resourceTemplates).toContain("deepthonk://jobs/{job_id}/population/{generation}");
     expect(promptNames).toContain("deepthonk/compare");
   });
 
@@ -52,16 +59,50 @@ describe("MCP helpers", () => {
       run_dir: runDir
     });
     expect(started.job_id).toBeTruthy();
+    const artifactResources = started.artifact_resources as Record<string, string>;
+    expect(artifactResources.status).toBe(started.status_resource);
+    expect(artifactResources.result).toBe(started.result_resource);
+    expect(artifactResources.config).toContain("deepthonk://jobs/");
+    await expect(readJobResource(artifactResources.status)).resolves.toContain(String(started.job_id));
     let result = await deepthonkResult({ run_dir: runDir });
-    for (let attempt = 0; attempt < 20 && !result.complete; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    for (let attempt = 0; attempt < 100 && !result.complete; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
       result = await deepthonkResult({ run_dir: runDir });
     }
     expect(result.complete).toBe(true);
     expect(result.run_id).toBeTruthy();
     const status = await deepthonkStatus({ run_dir: runDir });
     expect(status.state).toBe("completed");
+    await expect(readJobResource(artifactResources.config)).resolves.toContain("\"provider\": \"fake\"");
+    await expect(readJobResource(artifactResources.candidates)).resolves.toContain("\"kind\"");
+    await expect(readJobResource(artifactResources.population_template.replace("{generation}", "0"))).resolves.toContain("\"kind\"");
+    expect(await readdir(runDir)).not.toContain("run.lock");
     await expect(deepthonkStatus({ run_dir: runDir, job_id: "wrong-job" })).rejects.toMatchObject({ code: "mcp.job_mismatch" });
+  });
+
+  it("marks background provider construction failures and releases run.lock", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-driver-fail-"));
+    const missingEnv = `DEEPTHONK_TEST_MISSING_${Date.now()}`;
+    delete process.env[missingEnv];
+    const started = await deepthonkStart({
+      task: "toy",
+      profile: "quick",
+      provider: "custom-openai-compatible",
+      base_url: "https://example.test/v1",
+      api_key_env: missingEnv,
+      run_dir: runDir
+    });
+    expect(started.state).toBe("pending");
+
+    let status = await deepthonkStatus({ run_dir: runDir });
+    for (let attempt = 0; attempt < 100 && status.state !== "failed"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      status = await deepthonkStatus({ run_dir: runDir });
+    }
+
+    expect(status.state).toBe("failed");
+    expect((status.error as { code?: string } | undefined)?.code).toBe("provider.missing_api_key");
+    expect(await readdir(runDir)).not.toContain("run.lock");
   });
 
   it("records cancellation requests in the run directory", async () => {
@@ -90,6 +131,16 @@ describe("MCP helpers", () => {
     await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/config`, join(runDir, ".."))).resolves.toContain("\"provider\": \"fake\"");
     await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/usage`, join(runDir, ".."))).resolves.toContain("\"role\"");
     await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/population/0`, join(runDir, ".."))).resolves.toContain("\"kind\"");
+    await expect(listRunResources(join(runDir, ".."))).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          uri: `deepthonk://runs/${String(result.run_id)}/population/0`,
+          mimeType: "application/json"
+        })
+      ])
+    );
+    const listedResources = await listRunResources(join(runDir, ".."));
+    expect(new Set(listedResources.map((resource) => resource.uri)).size).toBe(listedResources.length);
   });
 
   it("loads a named profile via profile_name", async () => {
@@ -139,7 +190,15 @@ describe("MCP helpers", () => {
     });
   });
 
-  it("shows named profiles with secret-shaped values redacted", async () => {
+  it("shows valid named profiles with api_key_env visible", async () => {
+    await withProfilesDir(async (profilesDir) => {
+      await writeFile(join(profilesDir, "valid.yaml"), validMcpProfileYaml());
+      const shown = await deepthonkProfileShow({ name: "valid" });
+      expect((shown.profile as { api_key_env?: string }).api_key_env).toBe("DEEPTHONK_API_KEY");
+    });
+  });
+
+  it("rejects manually edited named profiles with secret-shaped fields on load", async () => {
     await withProfilesDir(async (profilesDir) => {
       await writeFile(
         join(profilesDir, "with-redaction.yaml"),
@@ -152,10 +211,7 @@ describe("MCP helpers", () => {
           "    authorization: Bearer raw-secret"
         ].join("\n")
       );
-      const shown = await deepthonkProfileShow({ name: "with-redaction" });
-      expect((shown.profile as { api_key_env?: string }).api_key_env).toBe("DEEPTHONK_API_KEY");
-      expect((shown.profile as { providers: { judge: { authorization: string } } }).providers.judge.authorization).toBe("[redacted]");
-      expect(JSON.stringify(shown)).not.toContain("raw-secret");
+      await expect(deepthonkProfileShow({ name: "with-redaction" })).rejects.toMatchObject({ code: "config.profile_raw_secret" });
     });
   });
 
@@ -252,6 +308,23 @@ describe("MCP helpers", () => {
   it("validates HTTP Host allowlist before transport handling", () => {
     expect(isAllowedMcpHttpHost("127.0.0.1:3333", ["127.0.0.1:3333", "localhost:3333"])).toBe(true);
     expect(isAllowedMcpHttpHost("evil.example:3333", ["127.0.0.1:3333", "localhost:3333"])).toBe(false);
+  });
+
+  it("validates HTTP pre-body request guards", () => {
+    expect(isApplicationJsonContentType("application/json")).toBe(true);
+    expect(isApplicationJsonContentType("application/json; charset=utf-8")).toBe(true);
+    expect(isApplicationJsonContentType("text/plain")).toBe(false);
+    expect(isApplicationJsonContentType(undefined)).toBe(false);
+
+    expect(isAllowedLoopbackOrigin(undefined)).toBe(true);
+    expect(isAllowedLoopbackOrigin("http://127.0.0.1:3333")).toBe(true);
+    expect(isAllowedLoopbackOrigin("http://localhost:3333")).toBe(true);
+    expect(isAllowedLoopbackOrigin("https://evil.example")).toBe(false);
+    expect(isAllowedLoopbackOrigin("null")).toBe(false);
+
+    expect(isAllowedSecFetchSite(undefined)).toBe(true);
+    expect(isAllowedSecFetchSite("same-origin")).toBe(true);
+    expect(isAllowedSecFetchSite("cross-site")).toBe(false);
   });
 
   it("accepts MCP Sampling provider args and enforces client capability at run-start", async () => {

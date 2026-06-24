@@ -9,16 +9,15 @@ name: Publish
 # specs resolve against an upstream version already on npm:
 #     @deepthonk/core -> @deepthonk/providers -> @deepthonk/mcp -> deepthonk (cli)
 #
-# pnpm must be >= 11 (native publish flow with OIDC trusted publishing /
-# fetchTokenAndProvenanceByOidc; the repo's pinned 10.11.0 predates it). pnpm
-# emits provenance automatically under OIDC. npm-only — no server.json, so no
-# MCP Registry step.
+# pnpm must be >= 11 for the native OIDC trusted publishing flow. The repo pins
+# pnpm@11.8.0 through packageManager. npm-only — no server.json, so no MCP
+# Registry step.
 #
 # Per-package one-time setup (npmjs.com): a Trusted Publisher on EACH of the
 # four packages pointing at owner=linxule, repo=deepthonk, workflow=publish.yml.
 #
-# Release flow: bump all 4 packages/*/package.json to the SAME new version
-# (>= 0.1.3; 0.1.2 already published) -> commit -> `git tag vX.Y.Z && git push`.
+# Release flow: follow docs/release.md. Bump all 4 packages/*/package.json to
+# the SAME unused version -> commit -> `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
 on:
   push:

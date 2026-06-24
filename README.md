@@ -31,7 +31,7 @@ deepthonk plan --profile paper
 
 The paper profile plans 285 model calls and 8 sequential rounds. Confirm budget and provider pricing before pointing it at paid models. The short alias `dt` is installed alongside `deepthonk`. Develop from source: see [Development](#development).
 
-> v0.1 scope: an independent TypeScript reimplementation of the OpenDeepThink algorithm as a CLI + MCP server. The published algorithm is the load-bearing part; this release is a practical integration layer with explicit limits documented below. Cost guarantees rely on provider pricing being present in config; resume only inspects trace state, it does not replay; the MCP HTTP transport is loopback-only. The included acceptance smoke uses the deterministic fake provider and a toy task — it is not a CF-73 / HLE reproduction; see `docs/` and [Acknowledgments](#acknowledgments) for the canonical paper and Python reference.
+> v0.1 scope: an independent TypeScript reimplementation of the OpenDeepThink algorithm as a CLI + MCP server. The published algorithm is the load-bearing part; this release is a practical integration layer with explicit limits documented below. Cost guarantees rely on provider pricing being present in config; resume inspects trace state by default and can replay from validated phase boundaries with `--continue` / MCP `continue: true`; the MCP HTTP transport is loopback-only. The included acceptance smoke uses the deterministic fake provider and a toy task — it is not a CF-73 / HLE reproduction; see `docs/` and [Acknowledgments](#acknowledgments) for the canonical paper and Python reference.
 
 ## Setup
 
@@ -177,22 +177,26 @@ For local web hosts, or when stdio isn't available:
 deepthonk serve-mcp --transport http --port 3333
 ```
 
-The server binds `127.0.0.1:3333` only (loopback) and the endpoint is `POST http://127.0.0.1:3333/mcp`. DNS rebinding protection is on (CVE-2025-66414): requests with `Host` headers outside `127.0.0.1:3333` / `localhost:3333` are rejected. Do not expose this port through a reverse proxy without re-evaluating that trust boundary.
+The server binds `127.0.0.1:3333` only (loopback) and the endpoint is `POST http://127.0.0.1:3333/mcp`. DNS rebinding protection is on (CVE-2025-66414): requests with `Host` headers outside `127.0.0.1:3333` / `localhost:3333` are rejected. The HTTP wrapper also rejects non-`application/json` POSTs, non-loopback `Origin` headers, and `Sec-Fetch-Site: cross-site` before reading the body. It has no bearer auth. Do not expose this port through a reverse proxy without re-evaluating that trust boundary.
 
 ### Tools
 
 | Tool | Purpose |
 |---|---|
 | `deepthonk.plan` | Estimate calls and sequential rounds for a profile (no model calls). Use before paid runs. |
-| `deepthonk.start` | Start a run in the background; returns `run_dir` + `job_id`. |
+| `deepthonk.start` | Start a run in the background; returns `run_dir`, `job_id`, and job-scoped artifact resources. |
 | `deepthonk.status` | Poll job status from a `run_dir`. |
 | `deepthonk.result` | Return final summary + winner once a job is complete. |
 | `deepthonk.cancel` | Request cancellation by writing `cancel.json` into the run directory. |
 | `deepthonk.run` | Blocking convenience: start + await completion in one call. Prefer `start` + polling for long-running jobs. |
 | `deepthonk.rank` | Rank a user-supplied candidate set with pairwise judging + Bradley-Terry (skip generation). |
 | `deepthonk.mutate` | Mutate one supplied candidate with critique (one-shot). |
-| `deepthonk.resume` | Detect whether a run can be resumed. Reports state only; does not replay yet. |
+| `deepthonk.resume` | Detect whether a run can be resumed; with `continue: true`, replay from the last validated phase boundary. |
 | `deepthonk.export` | Export run summary or full trace in JSON or markdown. |
+| `deepthonk.profile_list` | List saved named profile bundles. |
+| `deepthonk.profile_show` | Show one saved profile; manually edited secret-shaped values are rejected on load. |
+| `deepthonk.profile_save` | Save a reusable named profile bundle. |
+| `deepthonk.profile_delete` | Delete a saved named profile bundle. |
 
 All tools accept inline provider/model fields, or `config_path` pointing at a DeepThonk YAML config.
 
@@ -205,7 +209,8 @@ All tools accept inline provider/model fields, or `config_path` pointing at a De
 - `deepthonk://runs/{run_id}/population/{generation}` — population snapshot for a generation (JSON).
 - `deepthonk://runs/{run_id}/{winner|final}` — text artifacts.
 - `deepthonk://runs/{run_id}/status` — run state (JSON).
-- `deepthonk://jobs/{job_id}/{status|result}?run_dir=...` — job-scoped lookup; the `run_dir` query param is required.
+- `deepthonk://jobs/{job_id}/{status|result|config|candidates|comparisons|scores|usage|trace|final|winner}?run_dir=...` — job-scoped lookup; the `run_dir` query param is required.
+- `deepthonk://jobs/{job_id}/population/{generation}?run_dir=...` — job-scoped population snapshots before or after completion.
 
 ### Prompts
 
@@ -213,7 +218,7 @@ Four templates mirror the core loop: `deepthonk/generate`, `deepthonk/compare`, 
 
 ### Limits
 
-`deepthonk.resume` reports trace state and safe phase boundaries but does not replay interrupted runs. The HTTP transport is loopback-only by design. MCP Sampling depends on the host's sampling implementation; model hints are preferences, token usage may be unavailable, and sampling concurrency is capped at 4.
+`deepthonk.resume` reports trace state by default. With `continue: true`, it validates the stored config/version/provider, prunes to the last completed phase boundary, and replays from there without reusing partial in-flight outputs. The HTTP transport is loopback-only by design. MCP Sampling depends on the host's sampling implementation; model hints are preferences, token usage may be unavailable, and sampling concurrency is capped at 4.
 
 ## Customization
 
@@ -259,6 +264,8 @@ runs/{run_id}/
   comparisons.jsonl
   scores.jsonl
   usage.jsonl
+  population-0.json
+  population-{generation}.json
   summary.json
   artifacts/winner.txt
   artifacts/final.txt
@@ -283,9 +290,11 @@ pnpm run lint
 
 This repository is source-only. Generated run traces, paper notes, build output, coverage, logs, and `node_modules` are intentionally ignored.
 
+Release publishing is tag-triggered through npm Trusted Publishing. See [docs/release.md](https://github.com/linxule/deepthonk/blob/main/docs/release.md) before bumping versions or pushing a `v*` tag.
+
 Known limits for this release:
 
-- Conservative resume reports trace state and safe phase boundaries, but does not replay interrupted runs yet.
+- Conservative resume reports trace state by default; replay requires an explicit `--continue` / MCP `continue: true` and only starts from validated phase boundaries.
 - MCP Sampling is MCP-host-only. Standalone CLI runs need a direct provider.
 - `maxUsd` requires known model pricing; add explicit prices in YAML for custom providers and model IDs. Optional fields `longContextThresholdTokens`, `inputUsdPerMillionLong`, and `outputUsdPerMillionLong` enable tiered pricing for models with a long-context surcharge (e.g., Gemini at 200K input tokens). Cache hit/miss rates remain flat.
 

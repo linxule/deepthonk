@@ -20,10 +20,14 @@ The newer split `@modelcontextprotocol/server` package was alpha at implementati
 - `deepthonk.mutate`
 - `deepthonk.resume`
 - `deepthonk.export`
+- `deepthonk.profile_list`
+- `deepthonk.profile_show`
+- `deepthonk.profile_save`
+- `deepthonk.profile_delete`
 
 The tools are implemented over the shared core and provider interfaces. Use `start/status/result/cancel` for long runs so agents can poll trace-backed state without blocking the MCP call. `run` is still available as a blocking wrapper.
 
-`resume` is conservative: it reports completed, running, cancel-requested, cancelled, failed, budget-stopped, missing, or interrupted trace state and marks unsafe traces with `safe_to_continue: false`. It never reuses partial in-flight model outputs and does not replay runs yet.
+`resume` is conservative by default: it reports completed, running, cancel-requested, cancelled, failed, budget-stopped, missing, resumable, or interrupted trace state and marks unsafe traces with `safe_to_continue: false`. With `continue: true`, it validates the stored config/version/provider, prunes to the last completed phase boundary, and replays from there. It never reuses partial in-flight model outputs.
 
 MCP Sampling is available as `provider: "sampling"` for `deepthonk.run` and `deepthonk.start` when the connected client advertises the MCP sampling capability. If the client does not advertise sampling, the tool fails before claiming a run directory with `provider.sampling_capability_missing`. Standalone CLI runs cannot use sampling; choose a direct provider there.
 
@@ -85,7 +89,7 @@ For OpenRouter:
 }
 ```
 
-The blocking run response includes `summary_resource` and `trace_resource`; read those resources instead of asking the tool to inline full traces. The async start response includes job status/result resource URIs with the run directory embedded as a query parameter.
+The blocking run response includes `summary_resource` and `trace_resource`; read those resources instead of asking the tool to inline full traces. The async start response includes job status/result resource URIs with the run directory embedded as a query parameter, plus `artifact_resources` for job-scoped config, candidates, comparisons, scores, usage, trace, status, final, winner, and a `population_template` URI.
 
 ## Resources
 
@@ -103,8 +107,11 @@ The blocking run response includes `summary_resource` and `trace_resource`; read
 - `deepthonk://runs/{run_id}/status`
 - `deepthonk://jobs/{job_id}/status?run_dir=...`
 - `deepthonk://jobs/{job_id}/result?run_dir=...`
+- `deepthonk://jobs/{job_id}/{config|candidates|comparisons|scores|usage|trace|final|winner}?run_dir=...`
+- `deepthonk://jobs/{job_id}/population/{generation}?run_dir=...`
 
 Resources are keyed by the recorded `run_id`. For MCP runs that write to custom absolute directories, the server records a local run index so the advertised resource URI can still resolve.
+Job-scoped resources resolve directly from the required `run_dir` query parameter, so agents can inspect files as soon as they are written and before `summary.json` exists.
 
 ## Prompts
 
@@ -125,6 +132,6 @@ The endpoint is `http://127.0.0.1:3333/mcp`.
 
 ## Security defaults
 
-The HTTP transport binds to `127.0.0.1` only and runs with the MCP SDK's DNS rebinding protection enabled, with `Host` validated against `127.0.0.1:<port>` and `localhost:<port>`. Loopback bind alone does not protect against browser-pivoted attackers (see CVE-2025-66414 / GHSA-w48q-cv73-mx4w), so do not remove the rebinding guard when adding new transport features. The HTTP transport currently has no authentication — treat it as trusted-local-host-only and prefer `stdio` for MCP host integration.
+The HTTP transport binds to `127.0.0.1` only and runs with the MCP SDK's DNS rebinding protection enabled, with `Host` validated against `127.0.0.1:<port>` and `localhost:<port>`. Before reading request bodies, it also rejects non-`application/json` POSTs, non-loopback `Origin` headers, and `Sec-Fetch-Site: cross-site`. Loopback bind alone does not protect against browser-pivoted attackers (see CVE-2025-66414 / GHSA-w48q-cv73-mx4w), so do not remove the rebinding guard when adding new transport features. The HTTP transport has no bearer auth — treat it as trusted-local-host-only and prefer `stdio` for MCP host integration.
 
-API keys are read from `process.env` and never logged or written into trace files. The background `deepthonk.start` runner wraps its failure-path file writes so a transient I/O error cannot surface as an unhandled rejection in the server process.
+API keys are read from `process.env` and never logged or written into trace files. The background `deepthonk.start` runner wraps driver construction, status writes, resource recording, and lock release so transient I/O errors cannot surface as unhandled rejections in the server process.

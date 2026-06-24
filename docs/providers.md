@@ -64,7 +64,7 @@ models:
   judge: deepseek-v4-pro
 ```
 
-DeepThonk includes default USD pricing for `deepseek-v4-flash` and `deepseek-v4-pro` from the official DeepSeek pricing page, checked 2026-05-18:
+DeepThonk includes default USD pricing for `deepseek-v4-flash` and `deepseek-v4-pro` from the official DeepSeek pricing page, checked 2026-06-24:
 
 ```yaml
 budget:
@@ -83,7 +83,7 @@ budget:
 
 Source: https://api-docs.deepseek.com/quick_start/pricing/
 
-The driver records DeepSeek `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` when returned, so `usage.usd` uses cache-aware input pricing. The V4-Pro numbers are discounted rates that DeepSeek says run until 2026-05-31 15:59 UTC. Edit model names and prices in config as the provider surface changes.
+The driver records DeepSeek `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` when returned, so `usage.usd` uses cache-aware input pricing. Edit model names and prices in config as the provider surface changes.
 
 ## OpenRouter
 

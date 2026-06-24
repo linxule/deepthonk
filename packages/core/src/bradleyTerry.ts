@@ -174,7 +174,9 @@ function gradient(scores: number[], outcomes: Outcome[], lambda: number): number
 }
 
 function loss(scores: number[], outcomes: Outcome[], lambda: number): number {
-  let total = 0.5 * lambda * scores.reduce((sum, score) => sum + score * score, 0);
+  let scoreNorm = 0;
+  for (let i = 0; i < scores.length; i += 1) scoreNorm += scores[i] * scores[i];
+  let total = 0.5 * lambda * scoreNorm;
   for (const outcome of outcomes) {
     const diff = scores[outcome.i] - scores[outcome.j];
     total += softplus(diff) - outcome.y * diff;
@@ -196,7 +198,9 @@ function softplus(value: number): number {
 }
 
 function center(values: number[]): void {
-  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  let total = 0;
+  for (let i = 0; i < values.length; i += 1) total += values[i];
+  const mean = total / values.length;
   for (let i = 0; i < values.length; i += 1) values[i] -= mean;
 }
 
@@ -207,7 +211,9 @@ function center(values: number[]): void {
 // step. We adopt it so logged `score:` values are directly comparable to the
 // reference's outputs.
 function zScore(values: number[]): void {
-  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  let total = 0;
+  for (let i = 0; i < values.length; i += 1) total += values[i];
+  const mean = total / values.length;
   let variance = 0;
   for (let i = 0; i < values.length; i += 1) {
     const centered = values[i] - mean;
@@ -221,7 +227,9 @@ function zScore(values: number[]): void {
 }
 
 function dot(left: number[], right: number[]): number {
-  return left.reduce((sum, value, i) => sum + value * right[i], 0);
+  let total = 0;
+  for (let i = 0; i < left.length; i += 1) total += left[i] * right[i];
+  return total;
 }
 
 function addScaled(target: number[], vector: number[], scale: number): void {
@@ -229,7 +237,9 @@ function addScaled(target: number[], vector: number[], scale: number): void {
 }
 
 function vectorNorm(values: number[]): number {
-  return Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
+  let total = 0;
+  for (let i = 0; i < values.length; i += 1) total += values[i] * values[i];
+  return Math.sqrt(total);
 }
 
 function finite(value: number): number {

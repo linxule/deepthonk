@@ -4,11 +4,18 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { resolveOneShotConfig } from "../../packages/cli/src/config.js";
 
 const execFileAsync = promisify(execFile);
 const cli = resolve("packages/cli/src/index.ts");
 
 describe("deepthonk CLI", () => {
+  it("prints the package metadata version", async () => {
+    const expected = JSON.parse(await readFile(resolve("packages/cli/package.json"), "utf8")) as { version: string };
+    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "--version"]);
+    expect(stdout.trim()).toBe(expected.version);
+  });
+
   it("prints paper plan", async () => {
     const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "plan", "--profile", "paper"]);
     expect(JSON.parse(stdout).calls).toBe(285);
@@ -97,6 +104,101 @@ describe("deepthonk CLI", () => {
     expect(parsed.providerConfig.roleProviders.judge).toMatchObject({ provider: "deepseek", model: "deepseek-v4-pro" });
   });
 
+  it("applies concurrency precedence and JSON-mode support config", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-concurrency-config-"));
+    const configPath = join(configDir, "mixed.yaml");
+    await writeFile(
+      configPath,
+      [
+        "profile: quick",
+        "provider: fake",
+        "supports_json_mode: false",
+        "models:",
+        "  generator: fake-model",
+        "  mutator: fake-model",
+        "  judge: fake-model",
+        "providers:",
+        "  judge:",
+        "    provider: openai-compatible",
+        "    base_url: https://judge.example.test/v1",
+        "    api_key_env: JUDGE_KEY",
+        "    model: judge-model",
+        "    supports_json_mode: true",
+        "concurrency:",
+        "  generate: 2",
+        "  judge: 3",
+        "  mutate: 4"
+      ].join("\n")
+    );
+
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      cli,
+      "run",
+      "--config",
+      configPath,
+      "--task",
+      "toy",
+      "--max-concurrency",
+      "5",
+      "--judge-concurrency",
+      "7",
+      "--dry-run"
+    ]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig.concurrency).toEqual({ generate: 5, judge: 7, mutate: 5 });
+    expect(parsed.providerConfig.supportsJsonMode).toBe(false);
+    expect(parsed.providerConfig.roleProviders.judge.supportsJsonMode).toBe(true);
+    expect(parsed.providerReplay).toMatchObject({
+      provider: "fake",
+      supportsJsonMode: false,
+      roleProviders: { judge: { supportsJsonMode: true, apiKeyEnv: "JUDGE_KEY" } }
+    });
+  });
+
+  it("rejects invalid numeric and boolean CLI options", async () => {
+    await expect(
+      execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--provider", "fake", "--task", "toy", "--n", "3.5", "--dry-run"])
+    ).rejects.toMatchObject({ stderr: expect.stringContaining("--n must be an integer >= 2") });
+
+    await expect(
+      execFileAsync(process.execPath, [
+        "--import",
+        "tsx",
+        cli,
+        "run",
+        "--provider",
+        "fake",
+        "--task",
+        "toy",
+        "--supports-json-mode",
+        "maybe",
+        "--dry-run"
+      ])
+    ).rejects.toMatchObject({ stderr: expect.stringContaining("--supports-json-mode must be true or false") });
+
+    await expect(
+      execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--provider", "fake", "--task", "toy", "--n", "", "--dry-run"])
+    ).rejects.toMatchObject({ stderr: expect.stringContaining("--n must be a decimal number") });
+
+    await expect(
+      execFileAsync(process.execPath, [
+        "--import",
+        "tsx",
+        cli,
+        "run",
+        "--provider",
+        "fake",
+        "--task",
+        "toy",
+        "--supports-json-mode",
+        "",
+        "--dry-run"
+      ])
+    ).rejects.toMatchObject({ stderr: expect.stringContaining("--supports-json-mode must be true or false") });
+  });
+
   it("sets up reusable provider config and env file", async () => {
     const configDir = await mkdtemp(join(tmpdir(), "deepthonk-setup-"));
     const configPath = join(configDir, "config.yaml");
@@ -180,6 +282,128 @@ describe("deepthonk CLI", () => {
       "--json"
     ]);
     expect(JSON.parse(mutated.stdout).mutated).toContain("FAKE_QUALITY:8");
+  });
+
+  it("resolves one-shot command defaults from config/profile before inline overrides", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-one-shot-defaults-"));
+    const configPath = join(configDir, "config.yaml");
+    await writeFile(
+      configPath,
+      [
+        "profile: quick",
+        "prompt_style: paper-programming",
+        "provider: fake",
+        "models:",
+        "  generator: fake-model",
+        "  mutator: fake-model",
+        "  judge: fake-model",
+        "algorithm:",
+        "  lambda: 0.2",
+        "  mutate_temperature: 0.4",
+        "  judge_temperature: 0.3",
+        "retry:",
+        "  requestTimeoutMs: 1234",
+        "prompts:",
+        "  compare:",
+        "    system: Config judge",
+        "  mutate:",
+        "    system: Config mutate"
+      ].join("\n")
+    );
+
+    const resolved = await resolveOneShotConfig({
+      config: configPath,
+      requestTimeoutMs: "5678",
+      judgeTemperature: "0.5",
+      promptsJson: JSON.stringify({ compare: { system: "Inline judge" } })
+    });
+
+    expect(resolved.profile.lambda).toBe(0.2);
+    expect(resolved.profile.mutateTemperature).toBe(0.4);
+    expect(resolved.profile.judgeTemperature).toBe(0.5);
+    expect(resolved.retry.requestTimeoutMs).toBe(5678);
+    expect(resolved.promptStyle).toBe("paper-programming");
+    expect(resolved.promptOverrides?.compare?.system).toBe("Inline judge");
+    expect(resolved.promptOverrides?.mutate?.system).toBe("Config mutate");
+  });
+
+  it("writes redacted providerReplay into run config", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-replay-config-"));
+    await execFileAsync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        cli,
+        "run",
+        "--provider",
+        "fake",
+        "--base-url",
+        "https://example.test/v1",
+        "--api-key-env",
+        "TEST_PROVIDER_KEY",
+        "--supports-json-mode",
+        "false",
+        "--profile",
+        "quick",
+        "--task",
+        "toy",
+        "--out",
+        runDir
+      ],
+      { env: { ...process.env, TEST_PROVIDER_KEY: "secret-test-key" } }
+    );
+
+    const stored = JSON.parse(await readFile(join(runDir, "config.json"), "utf8"));
+    expect(stored.providerReplay).toMatchObject({
+      provider: "fake",
+      baseUrl: "https://example.test/v1",
+      apiKeyEnv: "TEST_PROVIDER_KEY",
+      supportsJsonMode: false,
+      models: { generator: "fake-model", mutator: "fake-model", judge: "fake-model" }
+    });
+    expect(JSON.stringify(stored)).not.toContain("secret-test-key");
+    expect(stored.providerReplay.apiKey).toBeUndefined();
+    expect(stored.providerReplay.roleProviders?.judge?.apiKey).toBeUndefined();
+  });
+
+  it("resumes with providerReplay when the legacy config shape lacks provider connection fields", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-replay-"));
+    const version = await currentCoreVersion();
+    await writeFile(
+      join(runDir, "config.json"),
+      JSON.stringify(
+        {
+          version,
+          task: "toy",
+          promptStyle: "general",
+          profile: { n: 4, k: 2, t: 1, m: 2, lambda: 0.01, sampleTemperature: 1, mutateTemperature: 1, judgeTemperature: 0 },
+          runDir,
+          seed: 1,
+          provider: "openai-compatible",
+          generatorModel: "m",
+          mutatorModel: "m",
+          judgeModel: "m",
+          concurrency: { generate: 1, judge: 1, mutate: 1 },
+          retry: { httpRetries: 0, invalidJsonRetries: 1 },
+          output: { includeRawModelOutputs: false, includePrompts: false },
+          providerReplay: {
+            provider: "openai-compatible",
+            baseUrl: "https://example.test/v1",
+            apiKeyEnv: "TEST_PROVIDER_KEY",
+            supportsJsonMode: false,
+            models: { generator: "m", mutator: "m", judge: "m" }
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "resume", runDir, "--continue", "--dry-run"], {
+      env: { ...process.env, TEST_PROVIDER_KEY: "secret-test-key" }
+    });
+    expect(JSON.parse(stdout)).toMatchObject({ status: "resumable", phase: "initial_generation", safe_to_continue: true });
   });
 
   it("rejects unsupported export formats", async () => {
@@ -435,3 +659,8 @@ describe("deepthonk CLI", () => {
     expect(JSON.parse(inspected.stdout).summary.winner_id).toBe(parsed.winner_id);
   });
 });
+
+async function currentCoreVersion(): Promise<string> {
+  const packageJson = JSON.parse(await readFile(resolve("packages/core/package.json"), "utf8")) as { version: string };
+  return packageJson.version;
+}
