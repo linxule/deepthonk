@@ -388,7 +388,17 @@ describe("runDeepThonk", () => {
   ])("rejects absurd %s concurrency during config validation", async (_label, mutate) => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-concurrency-cap-"));
     const driver = new CountingGenerateDriver();
-    await expect(runDeepThonk(mutate(baseConfig(runDir)), driver)).rejects.toThrow(/less than or equal to 1024/i);
+    // Assert the bound and the too-big semantics, not zod's exact phrasing: zod 3 said
+    // "Number must be less than or equal to 1024", zod 4 says "Too big: expected number
+    // to be <=1024" and serializes issues as JSON. The contract under test is that the
+    // 1024 cap rejects before any provider call, not how zod words it.
+    const error: unknown = await runDeepThonk(mutate(baseConfig(runDir)), driver).then(
+      () => undefined,
+      (caught: unknown) => caught
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(String((error as Error).message)).toMatch(/too_big|too big|less than or equal to/i);
+    expect(String((error as Error).message)).toMatch(/1024/);
     expect(driver.generateCalls).toBe(0);
   });
 
