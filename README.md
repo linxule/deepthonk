@@ -109,7 +109,9 @@ Optional `finalizer_model` / `--finalizer-model` can post-process the ranked win
 
 The MCP server exposes the same engine the CLI runs. Once wired into an MCP host, the host can plan budgets, kick off background runs, poll status, fetch winners, and stream structured trace artifacts — all through MCP tools, resources, and prompts.
 
-Provider API keys come from the host process's environment, not from DeepThonk's config alone. Each host handles env passthrough slightly differently — see the concrete patterns below.
+DeepThonk is listed on the [MCP Registry](https://registry.modelcontextprotocol.io) as **`io.github.linxule/deepthonk`** (since v0.2.1). Hosts that install by registry name resolve it to `npx deepthonk serve-mcp` automatically. For hosts that don't, the explicit configs below do the same thing by hand.
+
+Provider API keys come from the host process's environment, not from DeepThonk's config alone. Each host handles env passthrough slightly differently — see the concrete patterns below. No key is required to start the server: with a sampling-capable host you can run `provider: "sampling"`, and the `fake` provider needs no network at all.
 
 MCP Sampling is supported as `provider: "sampling"` when the connected host advertises the MCP sampling capability. Blocking `run`, `rank`, and `mutate` work over stdio and stateful Streamable HTTP. HTTP background `start` rejects Sampling because nested Sampling must remain attached to the initiating request; stdio background runs and direct-provider HTTP background runs remain available. Sampling is not available from standalone CLI runs.
 

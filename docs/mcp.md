@@ -35,7 +35,9 @@ Successful tool handlers return `structuredContent` with a matching broad output
 
 ## Host Configuration
 
-Launch stdio from an installed binary:
+DeepThonk is published to the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.linxule/deepthonk`. Hosts that resolve servers by registry name need no manual config; they read the packaged `deepthonk` npm entry and launch `npx deepthonk serve-mcp`.
+
+For hosts configured by hand, launch stdio from an installed binary:
 
 ```json
 {
@@ -46,6 +48,8 @@ Launch stdio from an installed binary:
   }
 }
 ```
+
+The `serve-mcp` argument is required. The `deepthonk` bin has no default action, so invoking it bare prints usage to stderr and exits non-zero instead of speaking MCP.
 
 MCP tools do not automatically read CLI setup unless a tool call includes `config_path`. Use provider fields inline or pass a config path:
 
