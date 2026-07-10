@@ -26,6 +26,9 @@ importers:
       vitest:
         specifier: ^4.1.10
         version: 4.1.10(@types/node@22.19.19)(vite@7.3.3(@types/node@22.19.19)(tsx@4.23.0)(yaml@2.9.0))
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
 
   packages/cli:
     dependencies:
