@@ -10,8 +10,8 @@ import { traceSchemaVersion } from "./checkpointStore.js";
 export class TraceStore {
   readonly runDir: string;
   // Single-writer queue: every appendJsonl chains onto this promise so concurrent
-  // writes (e.g. from pLimit closures writing candidates/comparisons as each
-  // call completes) cannot interleave on disk.
+  // writes (e.g. from phaseRunner's worker pool writing candidates/comparisons as
+  // each call completes) cannot interleave on disk.
   private readonly appendHandles = new Map<string, Promise<FileHandle>>();
   private readonly pendingBatches = new Map<
     string,
