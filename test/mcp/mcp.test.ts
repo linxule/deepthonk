@@ -421,7 +421,12 @@ describe("MCP helpers", () => {
 
   it("plans and runs with fake provider", async () => {
     expect(deepthonkPlan({ profile: "paper" }).calls).toBe(285);
-    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-"));
+    // Nest the run inside a dedicated runs-root. Passing `join(runDir, "..")` would make
+    // os.tmpdir() the runs-root, so listRunRecords() readdir()s every sibling temp dir any
+    // other test (or prior run) left behind, and listRunResources() truncates at
+    // MAX_LISTED_RESOURCES — dropping this run from the list.
+    const runsRoot = await mkdtemp(join(tmpdir(), "deepthonk-mcp-root-"));
+    const runDir = join(runsRoot, "run");
     const result = await deepthonkRun({
       task: "toy",
       profile: "quick",
@@ -430,14 +435,14 @@ describe("MCP helpers", () => {
       run_dir: runDir
     });
     expect(result.winner_id).toBeTruthy();
-    const summary = await readRunResource(String(result.summary_resource), join(runDir, ".."));
+    const summary = await readRunResource(String(result.summary_resource), runsRoot);
     expect(summary).toContain(String(result.winner_id));
-    const runs = await readRunResource("deepthonk://runs", join(runDir, ".."));
+    const runs = await readRunResource("deepthonk://runs", runsRoot);
     expect(runs).toContain(String(result.run_id));
-    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/config`, join(runDir, ".."))).resolves.toContain("\"provider\": \"fake\"");
-    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/usage`, join(runDir, ".."))).resolves.toContain("\"role\"");
-    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/population/0`, join(runDir, ".."))).resolves.toContain("\"kind\"");
-    await expect(listRunResources(join(runDir, ".."))).resolves.toEqual(
+    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/config`, runsRoot)).resolves.toContain("\"provider\": \"fake\"");
+    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/usage`, runsRoot)).resolves.toContain("\"role\"");
+    await expect(readRunResource(`deepthonk://runs/${String(result.run_id)}/population/0`, runsRoot)).resolves.toContain("\"kind\"");
+    await expect(listRunResources(runsRoot)).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           uri: `deepthonk://runs/${String(result.run_id)}/population/0`,
@@ -445,7 +450,7 @@ describe("MCP helpers", () => {
         })
       ])
     );
-    const listedResources = await listRunResources(join(runDir, ".."));
+    const listedResources = await listRunResources(runsRoot);
     expect(new Set(listedResources.map((resource) => resource.uri)).size).toBe(listedResources.length);
   });
 
