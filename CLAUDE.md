@@ -80,12 +80,15 @@ pnpm --silent --filter deepthonk deepthonk inspect runs/test-quick
 
 ## Release (tokenless OIDC)
 
-npm-only (no `server.json` → not on the MCP Registry). CI (`.github/workflows/publish.yml`) publishes on a `v*` tag via **`pnpm publish`** (NOT `npm publish` — only pnpm rewrites the `workspace:*` internal deps), in topological order: `@deepthonk/core → @deepthonk/providers → @deepthonk/mcp → deepthonk`. Tokenless OIDC Trusted Publishing with provenance (pnpm 11 does the exchange natively, no npm CLI). Since v0.1.3.
+CI (`.github/workflows/publish.yml`) publishes on a `v*` tag via **`pnpm publish`** (NOT `npm publish` — only pnpm rewrites the `workspace:*` internal deps), in topological order: `@deepthonk/core → @deepthonk/providers → @deepthonk/mcp → deepthonk`. Tokenless OIDC Trusted Publishing with provenance (pnpm 11 does the exchange natively, no npm CLI). Since v0.1.3. Since v0.2.1 the same workflow also publishes to the **MCP Registry** from `server.json`.
 
 1. Bump **all four** `packages/*/package.json` to the SAME new version (root stays `private` at 0.1.0). npm rejects duplicates.
-2. `pnpm install` (if deps changed) + `pnpm run build` + `pnpm test`.
-3. Commit + push (PRs run `ci.yml` on Node 22/24).
-4. `git tag vX.Y.Z && git push origin vX.Y.Z` → `publish.yml` runs the version guard (tag must equal every package version) then publishes the four in order.
+2. Bump `server.json` `version` **and** `packages[0].version` to that same version. A guard in `publish.yml` fails the release if they drift.
+3. `pnpm install` (if deps changed) + `pnpm run build` + `pnpm test`.
+4. Commit + push (PRs run `ci.yml` on Node 22/24).
+5. `git tag vX.Y.Z && git push origin vX.Y.Z` → `publish.yml` runs both guards, publishes the four to npm in order, cuts the GitHub release, then publishes to the MCP Registry.
+
+**MCP Registry (since v0.2.1).** `server.json` declares `io.github.linxule/deepthonk`, referencing the published **`deepthonk`** CLI package — not the private `deepthonk-monorepo` root, and not `@deepthonk/mcp`, which ships no `bin`. The registry proves npm ownership by reading **`mcpName` from the published `packages/cli/package.json`**, which must exactly equal `server.json` `name`. npm versions are immutable, so **`mcpName` can never be backfilled into an already-published version** — a release that forgets it needs a new version. The `deepthonk` bin has no default action, so `server.json` passes `serve-mcp` as a positional `packageArguments` entry; without it clients would spawn a help page instead of a server. No API key is required (MCP Sampling and the `fake` provider need none), so every `environmentVariables` entry is `isRequired: false`. Registry publish runs **last**, after the GitHub release, so a failure there is recoverable with a bare `mcp-publisher publish` — never a re-run of the npm steps, which would die on `EPUBLISHCONFLICT`. Validate locally with `mcp-publisher validate`. Auth in CI is `mcp-publisher login github-oidc` (no secret; needs `id-token: write`).
 
 **One-time (done 2026-06-22):** a Trusted Publisher on **each of the 4 packages** — the scoped three live under the `@deepthonk` npm **org**, not your personal package list. Per package: owner `linxule`, repo `deepthonk`, workflow `publish.yml`, Environment blank, allow publish. CLI: `npm trust github <pkg> --repo linxule/deepthonk --file publish.yml --allow-publish --yes` (npm ≥ 11.5.1; 2FA required each call).
 

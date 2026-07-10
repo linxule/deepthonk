@@ -10,8 +10,14 @@ name: Publish
 #     @deepthonk/core -> @deepthonk/providers -> @deepthonk/mcp -> deepthonk (cli)
 #
 # pnpm must be >= 11 for the native OIDC trusted publishing flow. The repo pins
-# pnpm@11.8.0 through packageManager. npm-only — no server.json, so no MCP
-# Registry step.
+# pnpm@11.8.0 through packageManager.
+#
+# After npm, this also publishes to the MCP Registry from server.json via
+# `mcp-publisher login github-oidc` (no secret — uses the id-token below). The
+# registry proves npm ownership by reading `mcpName` from the PUBLISHED
+# packages/cli/package.json, which must equal server.json `name`. That is why
+# the npm publish must land first, and why `mcpName` can never be backfilled
+# into an already-published version.
 #
 # Per-package one-time setup (npmjs.com): a Trusted Publisher on EACH of the
 # four packages pointing at owner=linxule, repo=deepthonk, workflow=publish.yml.
@@ -74,6 +80,24 @@ jobs:
           done
           [ "$fail" = "0" ] || { echo "Version guard failed for tag v$TAG"; exit 1; }
 
+      # server.json drifting from the packages is silent at npm-publish time and
+      # only explodes later, inside mcp-publisher, after npm is already immutable.
+      - name: Guard — server.json must match tag, cli package, and mcpName
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          fail=0
+          SRV_NAME="$(node -p "require('./server.json').name")"
+          SRV_VER="$(node -p "require('./server.json').version")"
+          PKG_ID="$(node -p "require('./server.json').packages[0].identifier")"
+          PKG_VER="$(node -p "require('./server.json').packages[0].version")"
+          MCP_NAME="$(node -p "require('./packages/cli/package.json').mcpName ?? ''")"
+          CLI_NAME="$(node -p "require('./packages/cli/package.json').name")"
+          [ "$SRV_VER" = "$TAG" ] || { echo "::error::server.json version $SRV_VER != tag $TAG"; fail=1; }
+          [ "$PKG_VER" = "$TAG" ] || { echo "::error::server.json packages[0].version $PKG_VER != tag $TAG"; fail=1; }
+          [ "$PKG_ID" = "$CLI_NAME" ] || { echo "::error::server.json identifier $PKG_ID != cli package $CLI_NAME"; fail=1; }
+          [ "$MCP_NAME" = "$SRV_NAME" ] || { echo "::error::cli mcpName '$MCP_NAME' != server.json name '$SRV_NAME' — registry ownership check will fail"; fail=1; }
+          [ "$fail" = "0" ] || { echo "server.json guard failed for tag v$TAG"; exit 1; }
+
       # Topological publish order. `pnpm publish` (NOT npm publish) rewrites
       # workspace:* -> concrete versions. --no-git-checks: tag checkout is
       # detached and prepack copies README/LICENSE (dirty tree).
@@ -93,3 +117,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "DeepThonk $GITHUB_REF_NAME"
+
+      # MCP Registry publish runs LAST and deliberately after the GitHub release.
+      # npm versions are immutable, so a failure here must stay recoverable with a
+      # bare `mcp-publisher publish` from a clone — never a re-run of the steps
+      # above, which would die on EPUBLISHCONFLICT.
+      - name: Wait for deepthonk to be resolvable on npm
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 30); do
+            if npm view "deepthonk@$TAG" version >/dev/null 2>&1; then
+              echo "deepthonk@$TAG is live on npm"; exit 0
+            fi
+            echo "attempt $i: deepthonk@$TAG not visible yet; sleeping 10s"; sleep 10
+          done
+          echo "::error::deepthonk@$TAG never became visible on npm; registry ownership check would fail"
+          exit 1
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      # Uses the workflow's OIDC id-token to prove the io.github.linxule namespace.
+      # No secret required.
+      - name: Authenticate to MCP Registry (OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish

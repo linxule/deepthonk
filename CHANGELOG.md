@@ -2,6 +2,20 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
+## [0.2.1] — 2026-07-10
+
+Packaging release. There are **no runtime or algorithm changes** to any package; the version bump exists because npm versions are immutable and the MCP Registry requires an `mcpName` field inside the published manifest, which could not be added to `0.2.0` after the fact.
+
+### Added
+
+- DeepThonk is now published to the **MCP Registry** as `io.github.linxule/deepthonk`. A root `server.json` points at the published `deepthonk` CLI package and passes `serve-mcp` as a positional argument, since the bin has no default action.
+- `mcpName` in `packages/cli/package.json`, which the registry reads from the published manifest to verify npm ownership.
+- `publish.yml` publishes to the registry via GitHub OIDC (`mcp-publisher login github-oidc`, no secret) after npm and the GitHub release, plus a guard that rejects any drift between the tag, `server.json`, the CLI package name, and `mcpName`.
+
+### Fixed
+
+- `test/mcp/mcp.test.ts` passed `os.tmpdir()` as a runs-root, so `listRunRecords` enumerated every sibling temp directory left by other tests and prior runs. Once enough accumulated, `listRunResources`' `MAX_LISTED_RESOURCES` cap dropped the test's own run and the suite failed. Green on a clean `TMPDIR` (so CI never caught it), reproducible on any long-lived developer machine.
+
 ## [0.2.0] — 2026-07-10
 
 ### Added

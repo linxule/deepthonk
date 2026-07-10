@@ -1,6 +1,6 @@
 {
   "name": "@deepthonk/providers",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Provider drivers and routing for DeepThonk.",
   "license": "MIT",
   "author": "Xule Lin",
