@@ -37,7 +37,6 @@
     "prepack": "cp ../../README.md ./README.md && cp ../../LICENSE ./LICENSE"
   },
   "dependencies": {
-    "p-limit": "^6.2.0",
     "zod": "^3.25.28"
   }
 }
