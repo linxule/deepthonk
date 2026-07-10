@@ -2,11 +2,11 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
-## [Unreleased]
+## [0.3.0] — 2026-07-10
 
 ### Changed — BREAKING
 
-- **Zod 3 → 4** across all four published packages. `packages/core` re-exports its schemas (`runConfigSchema`, `profileSchema`, `candidateSchema`, …), so the published type surface and the runtime `ZodError` class both change. Consumers composing these schemas with their own Zod 3 must upgrade in step. This must ship as `0.3.0`, not a patch.
+- **Zod 3 → 4** across all four published packages. `packages/core` re-exports its schemas (`runConfigSchema`, `profileSchema`, `candidateSchema`, …), so the published type surface and the runtime `ZodError` class both change. Consumers composing these schemas with their own Zod 3 must upgrade in step.
 - Validation error text now follows Zod 4's wording (e.g. `Too big: expected number to be <=1024` rather than `Number must be less than or equal to 1024`). This reaches MCP tool error strings through `formatZodIssues`. The `{ code, message, retryable, fix }` error shape is unchanged.
 - `deepthonk` (CLI) now declares `"engines": { "node": ">=22.13" }`. Commander 15 requires Node ≥ 22.12; previously nothing stopped installation on an unsupported Node.
 

@@ -1,6 +1,6 @@
 {
   "name": "deepthonk",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "mcpName": "io.github.linxule/deepthonk",
   "description": "Provider-neutral OpenDeepThink CLI and MCP server. Population-based reasoning via pairwise judging and Bradley-Terry ranking.",
   "license": "MIT",
