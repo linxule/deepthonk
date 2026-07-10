@@ -3,15 +3,27 @@ updates:
   # Single npm block: the root pnpm-lock.yaml is the only lockfile and covers
   # every packages/* workspace member. Do NOT add per-package npm blocks —
   # packages/* have no own lockfile, so per-dir blocks would error/duplicate.
-  # Grouped (patterns: ["*"]) so a refresh is ~one PR, not one per dependency.
+  #
+  # Minors/patches are grouped so a routine refresh is ~one PR. Majors are
+  # deliberately NOT grouped: an earlier `patterns: ["*"]` group welded five
+  # unrelated majors (TypeScript 7, zod 4, commander 15, vitest 4, p-limit 7)
+  # into one permanently-red PR that could not be reviewed or landed piecewise.
+  # zod in particular is part of the published API of @deepthonk/core, so its
+  # major is a breaking release, not a dependency chore. Let each major arrive
+  # on its own branch.
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 5
     groups:
-      npm-deps:
+      npm-minor-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # CI targets Node 22, so @types/node must track the runtime floor, not latest.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
