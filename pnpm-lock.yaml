@@ -13,7 +13,7 @@ importers:
     devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
-        version: 1.29.0(zod@3.25.76)
+        version: 1.29.0(zod@4.4.3)
       '@types/node':
         specifier: ^22.15.21
         version: 22.19.19
@@ -28,7 +28,7 @@ importers:
         version: 3.2.4(@types/node@22.19.19)(tsx@4.22.1)(yaml@2.9.0)
       zod-to-json-schema:
         specifier: ^3.25.2
-        version: 3.25.2(zod@3.25.76)
+        version: 3.25.2(zod@4.4.3)
 
   packages/cli:
     dependencies:
@@ -48,8 +48,8 @@ importers:
         specifier: ^2.7.1
         version: 2.9.0
       zod:
-        specifier: ^3.25.28
-        version: 3.25.76
+        specifier: ^4.4.3
+        version: 4.4.3
 
   packages/core:
     dependencies:
@@ -57,8 +57,8 @@ importers:
         specifier: ^6.2.0
         version: 6.2.0
       zod:
-        specifier: ^3.25.28
-        version: 3.25.76
+        specifier: ^4.4.3
+        version: 4.4.3
 
   packages/mcp:
     dependencies:
@@ -70,13 +70,13 @@ importers:
         version: link:../providers
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
-        version: 1.29.0(zod@3.25.76)
+        version: 1.29.0(zod@4.4.3)
       yaml:
         specifier: ^2.7.1
         version: 2.9.0
       zod:
-        specifier: ^3.25.28
-        version: 3.25.76
+        specifier: ^4.4.3
+        version: 4.4.3
 
   packages/providers:
     dependencies:
@@ -85,13 +85,13 @@ importers:
         version: link:../core
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
-        version: 1.29.0(zod@3.25.76)
+        version: 1.29.0(zod@4.4.3)
       yaml:
         specifier: ^2.7.1
         version: 2.9.0
       zod:
-        specifier: ^3.25.28
-        version: 3.25.76
+        specifier: ^4.4.3
+        version: 4.4.3
 
 packages:
 
@@ -1196,8 +1196,8 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
-  zod@3.25.76:
-    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
+  zod@4.4.3:
+    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
 
 snapshots:
 
@@ -1363,7 +1363,7 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
-  '@modelcontextprotocol/sdk@1.29.0(zod@3.25.76)':
+  '@modelcontextprotocol/sdk@1.29.0(zod@4.4.3)':
     dependencies:
       '@hono/node-server': 1.19.14(hono@4.12.28)
       ajv: 8.20.0
@@ -1380,8 +1380,8 @@ snapshots:
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
       raw-body: 3.0.2
-      zod: 3.25.76
-      zod-to-json-schema: 3.25.2(zod@3.25.76)
+      zod: 4.4.3
+      zod-to-json-schema: 3.25.2(zod@4.4.3)
     transitivePeerDependencies:
       - supports-color
 
@@ -2150,8 +2150,8 @@ snapshots:
 
   yocto-queue@1.2.2: {}
 
-  zod-to-json-schema@3.25.2(zod@3.25.76):
+  zod-to-json-schema@3.25.2(zod@4.4.3):
     dependencies:
-      zod: 3.25.76
+      zod: 4.4.3
 
-  zod@3.25.76: {}
+  zod@4.4.3: {}
