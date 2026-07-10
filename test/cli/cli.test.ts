@@ -43,6 +43,62 @@ describe("deepthonk CLI", () => {
     expect(parsed.calls).toBe(38);
   });
 
+  it("plans config retry headroom and finalizer calls for snake_case and camelCase aliases", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-plan-retries-"));
+    for (const [name, retryLine] of [["snake", "  invalid_json_retries: 2"], ["camel", "  invalidJsonRetries: 2"]] as const) {
+      const configPath = join(configDir, `${name}.yaml`);
+      await writeFile(
+        configPath,
+        [
+          "profile: quick",
+          "provider: fake",
+          "models:",
+          "  generator: fake-model",
+          "  mutator: fake-model",
+          "  judge: fake-model",
+          "  finalizer: fake-finalizer",
+          "retry:",
+          retryLine
+        ].join("\n")
+      );
+      const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "plan", "--config", configPath]);
+      expect(JSON.parse(stdout)).toMatchObject({
+        calls: 15,
+        finalizer_calls: 1,
+        invalid_json_retry_headroom_calls: 16,
+        worst_case_calls: 32
+      });
+    }
+  });
+
+  it("plans named-profile retry headroom and finalizer presence", async () => {
+    const profilesDir = await mkdtemp(join(tmpdir(), "deepthonk-plan-profile-retries-"));
+    await writeFile(
+      join(profilesDir, "finalized.yaml"),
+      [
+        "profile: quick",
+        "prompt_style: general",
+        "provider: fake",
+        "models:",
+        "  generator: fake-model",
+        "  mutator: fake-model",
+        "  judge: fake-model",
+        "  finalizer: fake-finalizer",
+        "retry:",
+        "  invalid_json_retries: 3"
+      ].join("\n")
+    );
+    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "plan", "--profile-name", "finalized"], {
+      env: { ...process.env, DEEPTHONK_PROFILES_DIR: profilesDir }
+    });
+    expect(JSON.parse(stdout)).toMatchObject({
+      calls: 15,
+      finalizer_calls: 1,
+      invalid_json_retry_headroom_calls: 24,
+      worst_case_calls: 40
+    });
+  });
+
   it("resolves run config paths from the original workspace cwd", async () => {
     const { stdout } = await execFileAsync(process.execPath, [
       "--import",
@@ -155,6 +211,55 @@ describe("deepthonk CLI", () => {
       supportsJsonMode: false,
       roleProviders: { judge: { supportsJsonMode: true, apiKeyEnv: "JUDGE_KEY" } }
     });
+  });
+
+  it("honors canonical snake_case budgets and rejects unknown or conflicting config keys", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-strict-config-"));
+    const configPath = join(configDir, "strict.yaml");
+    await writeFile(configPath, ["profile: quick", "provider: fake", "budget:", "  max_calls: 50", "retry:", "  http_retries: 0"].join("\n"));
+    const resolved = await resolveOneShotConfig({ config: configPath });
+    expect(resolved.retry.httpRetries).toBe(0);
+    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--config", configPath, "--task", "toy", "--dry-run"]);
+    expect(JSON.parse(stdout).runConfig.budget.maxCalls).toBe(50);
+
+    await writeFile(configPath, ["profile: quick", "provider: fake", "budget:", "  max_calls: 50", "  maxCalls: 60"].join("\n"));
+    await expect(resolveOneShotConfig({ config: configPath })).rejects.toMatchObject({ code: "config.alias_conflict" });
+    await writeFile(configPath, ["profile: quick", "provider: fake", "budegt:", "  max_calls: 50"].join("\n"));
+    await expect(resolveOneShotConfig({ config: configPath })).rejects.toMatchObject({ code: "config.unknown_key" });
+  });
+
+  it("isolates CLI provider and endpoint changes from config credentials and models", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-isolated-route-"));
+    const configPath = join(configDir, "route.yaml");
+    await writeFile(
+      configPath,
+      [
+        "profile: quick",
+        "provider: deepseek",
+        "base_url: https://api.deepseek.com/v1",
+        "api_key_env: DEEPSEEK_API_KEY",
+        "supports_json_mode: false",
+        "models:",
+        "  generator: deepseek-old",
+        "  mutator: deepseek-old",
+        "  judge: deepseek-old"
+      ].join("\n")
+    );
+
+    const changedProvider = await resolveOneShotConfig({ config: configPath, provider: "openrouter" });
+    expect(changedProvider.providerConfig).toMatchObject({
+      provider: "openrouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      apiKeyEnv: "OPENROUTER_API_KEY",
+      models: { generator: "openrouter/auto", mutator: "openrouter/auto", judge: "openrouter/auto" }
+    });
+    expect(changedProvider.providerConfig.supportsJsonMode).toBeUndefined();
+
+    const changedEndpoint = await resolveOneShotConfig({ config: configPath, baseUrl: "https://proxy.example.test/v1" });
+    expect(changedEndpoint.providerConfig.baseUrl).toBe("https://proxy.example.test/v1");
+    expect(changedEndpoint.providerConfig.apiKeyEnv).toBeUndefined();
+    expect(changedEndpoint.providerConfig.models.judge).toBe("deepseek-v4-pro");
+    expect(changedEndpoint.providerConfig.supportsJsonMode).toBeUndefined();
   });
 
   it("rejects invalid numeric and boolean CLI options", async () => {
@@ -401,9 +506,19 @@ describe("deepthonk CLI", () => {
     );
 
     const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", cli, "resume", runDir, "--continue", "--dry-run"], {
-      env: { ...process.env, TEST_PROVIDER_KEY: "secret-test-key" }
+      env: { ...process.env, TEST_PROVIDER_KEY: "" }
     });
     expect(JSON.parse(stdout)).toMatchObject({ status: "resumable", phase: "initial_generation", safe_to_continue: true });
+  });
+
+  it("repairs legacy-redacted budget fields through the supported CLI surface", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-cli-budget-repair-"));
+    await writeFile(join(runDir, "config.json"), JSON.stringify({ budget: { maxInputTokens: "[redacted]" } }));
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import", "tsx", cli, "repair-budget", runDir, "--set", "budget.maxInputTokens=1234"
+    ]);
+    expect(JSON.parse(stdout)).toEqual({ repaired: ["budget.maxInputTokens"] });
+    expect(JSON.parse(await readFile(join(runDir, "config.json"), "utf8"))).toMatchObject({ budget: { maxInputTokens: 1234 } });
   });
 
   it("rejects unsupported export formats", async () => {

@@ -4,6 +4,7 @@ import { ConfigError } from "./errors.js";
 import { parseJsonObject } from "./json.js";
 import { runLimitedPhase } from "./phaseRunner.js";
 import { comparePrompt, mutatePrompt } from "./prompts.js";
+import { createRng, type Rng } from "./rng.js";
 import type { BtScore, Candidate, Comparison, ModelDriver, ModelTextResult, PromptOverrides, RunConfig } from "./schemas.js";
 
 export type CandidateInput = string | { id?: string; content: string };
@@ -19,6 +20,7 @@ export interface RankCandidatesOptions {
   temperature?: number;
   lambda?: number;
   concurrency?: number;
+  seed?: number;
   promptStyle?: RunConfig["promptStyle"];
   promptOverrides?: Pick<PromptOverrides, "compare">;
 }
@@ -60,13 +62,22 @@ const compareOutputSchema = z.object({
 
 export async function rankCandidates(options: RankCandidatesOptions): Promise<RankCandidatesResult> {
   const candidates = normalizeCandidates(options.candidates);
+  assertUniqueCandidateIds(candidates);
+  if (candidates.length < 2) {
+    throw new ConfigError("Ranking requires at least two candidates.", {
+      code: "rank.too_few_candidates",
+      retryable: false,
+      fix: "Supply at least two candidates with unique IDs."
+    });
+  }
   const jobs: Array<() => Promise<Comparison>> = [];
+  const presentationBalance = new Map(candidates.map((candidate) => [candidate.id, 0]));
+  const rng = createRng(options.seed ?? 0);
 
   for (let i = 0; i < candidates.length; i += 1) {
     for (let j = i + 1; j < candidates.length; j += 1) {
+      const [candidateA, candidateB] = balancedPresentation(candidates[i], candidates[j], presentationBalance, rng);
       jobs.push(async () => {
-        const candidateA = candidates[i];
-        const candidateB = candidates[j];
         const prompt = comparePrompt(options.task, candidateA, candidateB, options.rubric, options.promptStyle, options.promptOverrides?.compare);
         const result = await options.driver.compare({
           task: options.task,
@@ -141,6 +152,41 @@ export async function mutateCandidate(options: MutateCandidateOptions): Promise<
 
 export function normalizeCandidates(candidates: CandidateInput[]): Candidate[] {
   return candidates.map((candidate, index) => normalizeCandidate(candidate, index));
+}
+
+function assertUniqueCandidateIds(candidates: Candidate[]): void {
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (!candidate.id.trim()) {
+      throw new ConfigError("Candidate IDs cannot be empty.", { code: "rank.candidate_id_invalid", retryable: false });
+    }
+    if (seen.has(candidate.id)) {
+      throw new ConfigError(`Candidate ID ${candidate.id} is duplicated; ranking would collapse distinct candidates.`, {
+        code: "rank.duplicate_candidate_id",
+        retryable: false,
+        fix: "Give every candidate a unique ID."
+      });
+    }
+    seen.add(candidate.id);
+  }
+}
+
+function balancedPresentation(
+  left: Candidate,
+  right: Candidate,
+  balance: Map<string, number>,
+  rng: Rng
+): [Candidate, Candidate] {
+  const leftBalance = balance.get(left.id) ?? 0;
+  const rightBalance = balance.get(right.id) ?? 0;
+  const normalCost = Math.abs(leftBalance + 1) + Math.abs(rightBalance - 1);
+  const swappedCost = Math.abs(leftBalance - 1) + Math.abs(rightBalance + 1);
+  const swap = swappedCost < normalCost || (swappedCost === normalCost && rng.bool());
+  const candidateA = swap ? right : left;
+  const candidateB = swap ? left : right;
+  balance.set(candidateA.id, (balance.get(candidateA.id) ?? 0) + 1);
+  balance.set(candidateB.id, (balance.get(candidateB.id) ?? 0) - 1);
+  return [candidateA, candidateB];
 }
 
 function normalizeCandidate(candidate: CandidateInput, index: number): Candidate {

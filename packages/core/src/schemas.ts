@@ -124,23 +124,47 @@ const providerReplayRoleSchema = z.object({
   supportsJsonMode: z.boolean().optional()
 });
 
+const samplingPreferencesSchema = z.object({
+  modelHints: z.array(z.string().min(1)).optional(),
+  costPriority: z.number().min(0).max(1).optional(),
+  speedPriority: z.number().min(0).max(1).optional(),
+  intelligencePriority: z.number().min(0).max(1).optional()
+});
+
 const providerReplaySchema = z.object({
   provider: z.string().min(1),
   baseUrl: z.string().optional(),
   apiKeyEnv: z.string().optional(),
   supportsJsonMode: z.boolean().optional(),
+  routeFingerprint: z.string().regex(/^sha256:[0-9a-f]{64}$/).optional(),
+  samplingPreferences: samplingPreferencesSchema.optional(),
   models: z.object({
     generator: z.string().min(1),
     mutator: z.string().min(1),
     judge: z.string().min(1),
     finalizer: z.string().optional()
   }),
-  roleProviders: z.record(providerReplayRoleSchema).optional()
+  roleProviders: z
+    .object({
+      generator: providerReplayRoleSchema.optional(),
+      mutator: providerReplayRoleSchema.optional(),
+      judge: providerReplayRoleSchema.optional(),
+      finalizer: providerReplayRoleSchema.optional()
+    })
+    .strict()
+    .optional()
 });
+
+export const runIdSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, "Run IDs may contain only letters, digits, dot, underscore, and hyphen.")
+  .refine((value) => value !== "." && value !== "..", "Run ID cannot be a path segment.");
 
 export const runConfigSchema = z.object({
   version: z.string().optional(),
-  runId: z.string().optional(),
+  runId: runIdSchema.optional(),
   task: z.string().min(1),
   rubric: z.string().optional(),
   promptStyle: z.enum(["general", "paper-programming"]).default("general"),

@@ -20,12 +20,15 @@ export interface RoleProviderConfig {
   retry?: {
     httpRetries?: number;
     requestTimeoutMs?: number;
+    responseBodyLimitBytes?: number;
+    maxRetryDelayMs?: number;
   };
   supportsJsonMode?: boolean;
 }
 
 export interface BaseProviderConfig extends SamplingDriverConfig {
   provider: "fake" | "openai-compatible" | "deepseek" | string;
+  routeFingerprint?: string;
   baseUrl?: string;
   apiKeyEnv?: string;
   apiKey?: string;
@@ -39,6 +42,8 @@ export interface BaseProviderConfig extends SamplingDriverConfig {
   retry?: {
     httpRetries?: number;
     requestTimeoutMs?: number;
+    responseBodyLimitBytes?: number;
+    maxRetryDelayMs?: number;
   };
   supportsJsonMode?: boolean;
   roleProviders?: Partial<Record<ProviderRole, RoleProviderConfig>>;

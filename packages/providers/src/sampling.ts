@@ -22,6 +22,9 @@ export interface SamplingDriverConfig {
 }
 
 const DEFAULT_SAMPLING_TIMEOUT_MS = 60_000;
+const DEFAULT_SAMPLING_RESPONSE_LIMIT_BYTES = 1024 * 1024;
+const DEFAULT_OUTPUT_TOKENS = 4096;
+const DEFAULT_JUDGE_OUTPUT_TOKENS = 1024;
 
 export type SamplingTransport = (
   params: CreateMessageRequestParamsBase,
@@ -37,23 +40,33 @@ export class SamplingDriver implements ModelDriver {
   ) {}
 
   async generate(input: GenerateInput): Promise<ModelTextResult> {
-    return this.sample(input.model, input.temperature, promptMessages(input.prompt));
+    const controls = requestControls(input);
+    return this.sample(input.model, input.temperature, promptMessages(input.prompt), controls.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, controls.signal);
   }
 
   async compare(input: CompareInput): Promise<ModelTextResult> {
-    const result = await this.sample(input.model, input.temperature, promptMessages(input.prompt));
+    const controls = requestControls(input);
+    const result = await this.sample(input.model, input.temperature, promptMessages(input.prompt), controls.maxOutputTokens ?? DEFAULT_JUDGE_OUTPUT_TOKENS, controls.signal);
     return { ...result, text: extractJsonTextOrOriginal(result.text) };
   }
 
   async mutate(input: MutateInput): Promise<ModelTextResult> {
-    return this.sample(input.model, input.temperature, promptMessages(input.prompt));
+    const controls = requestControls(input);
+    return this.sample(input.model, input.temperature, promptMessages(input.prompt), controls.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, controls.signal);
   }
 
   async finalize(input: FinalizeInput): Promise<ModelTextResult> {
-    return this.sample(input.model, 0.2, promptMessages(input.prompt));
+    const controls = requestControls(input);
+    return this.sample(input.model, 0.2, promptMessages(input.prompt), controls.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, controls.signal);
   }
 
-  private async sample(model: string, temperature: number, prompt: PromptMessages): Promise<ModelTextResult> {
+  private async sample(
+    model: string,
+    temperature: number,
+    prompt: PromptMessages,
+    maxOutputTokens: number,
+    signal?: AbortSignal
+  ): Promise<ModelTextResult> {
     const started = Date.now();
     const result = await this.callCreateMessage({
       messages: prompt.user.trim()
@@ -71,8 +84,8 @@ export class SamplingDriver implements ModelDriver {
       modelPreferences: buildModelPreferences(model, this.config),
       includeContext: "none",
       temperature,
-      maxTokens: 4096
-    });
+      maxTokens: maxOutputTokens
+    }, signal);
     if (result.stopReason === "maxTokens") {
       throw new ProviderError("MCP Sampling response was truncated by maxTokens.", {
         code: "provider.output_truncated",
@@ -81,6 +94,13 @@ export class SamplingDriver implements ModelDriver {
       });
     }
     const text = textContent(result);
+    if (Buffer.byteLength(text, "utf8") > DEFAULT_SAMPLING_RESPONSE_LIMIT_BYTES) {
+      throw new ProviderError(`MCP Sampling response exceeded the ${DEFAULT_SAMPLING_RESPONSE_LIMIT_BYTES}-byte body limit.`, {
+        code: "provider.response_too_large",
+        retryable: false,
+        fix: "Use a host model with bounded text responses or reduce the requested output size."
+      });
+    }
     return {
       text,
       model: result.model ?? model,
@@ -95,16 +115,23 @@ export class SamplingDriver implements ModelDriver {
     };
   }
 
-  private async callCreateMessage(params: CreateMessageRequestParamsBase): Promise<CreateMessageResult> {
+  private async callCreateMessage(params: CreateMessageRequestParamsBase, signal?: AbortSignal): Promise<CreateMessageResult> {
     const timeoutMs = this.config.requestTimeoutMs ?? DEFAULT_SAMPLING_TIMEOUT_MS;
     try {
-      return await callWithTimeout(this.createMessage, params, timeoutMs);
+      return await callWithTimeout(this.createMessage, params, timeoutMs, signal);
     } catch (error) {
       if (error instanceof SamplingTimeoutError) {
         throw new ProviderError(`MCP Sampling request timed out after ${error.timeoutMs}ms.`, {
           code: "provider.sampling_timeout",
           retryable: false,
           fix: "Increase retry.requestTimeoutMs, switch to a direct provider, or check the MCP host responsiveness. Use 'deepthonk resume <run-dir> --continue' to retry an interrupted run."
+        });
+      }
+      if (signal?.aborted) {
+        throw new ProviderError("MCP Sampling request was aborted.", {
+          code: "provider.aborted",
+          retryable: false,
+          fix: "Retry the run if the cancellation was unintended."
         });
       }
       throw new ProviderError(`MCP Sampling request failed: ${error instanceof Error ? error.message : String(error)}`, {
@@ -126,9 +153,13 @@ class SamplingTimeoutError extends Error {
 async function callWithTimeout(
   fn: SamplingTransport,
   params: CreateMessageRequestParamsBase,
-  timeoutMs: number
+  timeoutMs: number,
+  inputSignal?: AbortSignal
 ): Promise<CreateMessageResult> {
   const controller = new AbortController();
+  const onInputAbort = () => controller.abort(inputSignal?.reason);
+  if (inputSignal?.aborted) controller.abort(inputSignal.reason);
+  else inputSignal?.addEventListener("abort", onInputAbort, { once: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
@@ -136,10 +167,27 @@ async function callWithTimeout(
       reject(new SamplingTimeoutError(timeoutMs));
     }, timeoutMs);
   });
+  let rejectOnAbort: (() => void) | undefined;
+  const abortPromise = inputSignal
+    ? new Promise<never>((_, reject) => {
+        if (inputSignal.aborted) {
+          reject(inputSignal.reason ?? new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        rejectOnAbort = () => reject(inputSignal.reason ?? new DOMException("Aborted", "AbortError"));
+        inputSignal.addEventListener("abort", rejectOnAbort, { once: true });
+      })
+    : undefined;
   try {
-    return await Promise.race([fn(params, { signal: controller.signal, timeout: timeoutMs }), timeoutPromise]);
+    return await Promise.race([
+      fn(params, { signal: controller.signal, timeout: timeoutMs }),
+      timeoutPromise,
+      ...(abortPromise ? [abortPromise] : [])
+    ]);
   } finally {
     if (timer) clearTimeout(timer);
+    inputSignal?.removeEventListener("abort", onInputAbort);
+    if (rejectOnAbort) inputSignal?.removeEventListener("abort", rejectOnAbort);
   }
 }
 
@@ -185,4 +233,8 @@ function uniqueNonEmpty(values: Array<string | undefined>): string[] {
     unique.push(trimmed);
   }
   return unique;
+}
+
+function requestControls(input: unknown): { maxOutputTokens?: number; signal?: AbortSignal } {
+  return input as { maxOutputTokens?: number; signal?: AbortSignal };
 }

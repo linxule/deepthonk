@@ -42,4 +42,52 @@ describe("core services", () => {
 
     expect(result.mutated).toContain("FAKE_QUALITY:8");
   });
+
+  it("rejects duplicate candidate IDs before scheduling self-comparisons", async () => {
+    await expect(
+      rankCandidates({
+        task: "pick the best",
+        candidates: [
+          { id: "duplicate", content: "FAKE_QUALITY:1" },
+          { id: "duplicate", content: "FAKE_QUALITY:9" }
+        ],
+        driver: new FakeDriver(),
+        judgeModel: "fake-model"
+      })
+    ).rejects.toMatchObject({ code: "rank.duplicate_candidate_id" });
+  });
+
+  it("balances seeded A/B presentation and keeps it deterministic", async () => {
+    const options = {
+      task: "pick the best",
+      candidates: ["FAKE_QUALITY:1", "FAKE_QUALITY:2", "FAKE_QUALITY:3", "FAKE_QUALITY:4"],
+      driver: new FakeDriver(),
+      judgeModel: "fake-model",
+      seed: 77
+    };
+    const first = await rankCandidates(options);
+    const second = await rankCandidates(options);
+    const presentations = (result: typeof first) => result.comparisons.map((comparison) => [comparison.candidateAId, comparison.candidateBId]);
+    expect(presentations(first)).toEqual(presentations(second));
+    for (const candidate of first.candidates) {
+      const asA = first.comparisons.filter((comparison) => comparison.candidateAId === candidate.id).length;
+      const asB = first.comparisons.filter((comparison) => comparison.candidateBId === candidate.id).length;
+      expect(Math.abs(asA - asB)).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("does not label winner-only valid JSON as an invalid comparison", async () => {
+    const winnerOnlyDriver = {
+      async generate() { return { text: "x" }; },
+      async compare() { return { text: JSON.stringify({ winner: "A" }) }; },
+      async mutate() { return { text: "x" }; }
+    };
+    const result = await rankCandidates({
+      task: "pick the best",
+      candidates: ["first", "second"],
+      driver: winnerOnlyDriver,
+      judgeModel: "winner-only"
+    });
+    expect(result.comparisons[0]).toMatchObject({ critiqueForA: "", critiqueForB: "", selectionReason: "" });
+  });
 });

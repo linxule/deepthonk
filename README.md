@@ -70,7 +70,7 @@ deepthonk plan --config ~/.config/deepthonk/config.yaml
 deepthonk run --task task.md --config ~/.config/deepthonk/config.yaml --profile quick --dry-run
 ```
 
-Start with `--profile quick` and consider `--max-concurrency`, `--max-input-tokens`, `--max-output-tokens`, `--max-usd`, and `--request-timeout-ms` before larger paid profiles. Runtime token/USD budgets are enforced after completed provider calls and can overshoot by at most the active concurrency window. Every completed run summary includes call/token usage, and includes `usage.usd` when matching model pricing is available.
+Start with `--profile quick` and consider `--max-concurrency`, `--max-calls`, `--max-input-tokens`, `--max-output-tokens`, `--max-usd`, and `--request-timeout-ms` before larger paid profiles. `max_calls` is reserved before dispatch and counts logical model invocations, including failed calls and invalid-JSON retries; provider-internal HTTP retries are reported separately. Token/USD totals are known only after responses and can overshoot by at most the active concurrency window. Plans keep nominal `calls` separate from finalizer and retry headroom in `worst_case_calls`.
 
 ## OpenAI-Compatible Providers
 
@@ -111,7 +111,7 @@ The MCP server exposes the same engine the CLI runs. Once wired into an MCP host
 
 Provider API keys come from the host process's environment, not from DeepThonk's config alone. Each host handles env passthrough slightly differently — see the concrete patterns below.
 
-MCP Sampling is supported as `provider: "sampling"` when the connected host advertises the MCP sampling capability. Sampling is not available from standalone CLI runs; use `deepseek`, `openrouter`, or `openai-compatible` there.
+MCP Sampling is supported over stdio as `provider: "sampling"` when the connected host advertises the MCP sampling capability. The v0.1 patch line rejects Sampling over Streamable HTTP and all mixed Sampling/direct role routes; use a direct provider there. Sampling is not available from standalone CLI runs.
 
 ### Claude Code
 
@@ -177,7 +177,7 @@ For local web hosts, or when stdio isn't available:
 deepthonk serve-mcp --transport http --port 3333
 ```
 
-The server binds `127.0.0.1:3333` only (loopback) and the endpoint is `POST http://127.0.0.1:3333/mcp`. DNS rebinding protection is on (CVE-2025-66414): requests with `Host` headers outside `127.0.0.1:3333` / `localhost:3333` are rejected. The HTTP wrapper also rejects non-`application/json` POSTs, non-loopback `Origin` headers, and `Sec-Fetch-Site: cross-site` before reading the body. It has no bearer auth. Do not expose this port through a reverse proxy without re-evaluating that trust boundary.
+The server binds `127.0.0.1:3333` only and exposes stateful `POST`, `GET`, and `DELETE` at `http://127.0.0.1:3333/mcp`. Sessions use cryptographic IDs, expire after 30 idle minutes when no request is active, and are capped at 64. DNS rebinding protection is on (CVE-2025-66414): requests with `Host` headers outside `127.0.0.1:3333` / `localhost:3333` are rejected. The wrapper also rejects non-JSON POSTs, non-loopback `Origin` headers, and `Sec-Fetch-Site: cross-site` before reading the body. It has no bearer auth. Do not expose this port through a reverse proxy without re-evaluating that trust boundary.
 
 ### Tools
 
@@ -188,6 +188,8 @@ The server binds `127.0.0.1:3333` only (loopback) and the endpoint is `POST http
 | `deepthonk.status` | Poll job status from a `run_dir`. |
 | `deepthonk.result` | Return final summary + winner once a job is complete. |
 | `deepthonk.cancel` | Request cancellation by writing `cancel.json` into the run directory. |
+| `deepthonk.lock_inspect` / `deepthonk.lock_reclaim` | Inspect lock ownership and explicitly reclaim only an exact fingerprint. |
+| `deepthonk.repair_budget` | Replace legacy `[redacted]` numeric budget fields with explicit original values. |
 | `deepthonk.run` | Blocking convenience: start + await completion in one call. Prefer `start` + polling for long-running jobs. |
 | `deepthonk.rank` | Rank a user-supplied candidate set with pairwise judging + Bradley-Terry (skip generation). |
 | `deepthonk.mutate` | Mutate one supplied candidate with critique (one-shot). |
@@ -211,6 +213,7 @@ All tools accept inline provider/model fields, or `config_path` pointing at a De
 - `deepthonk://runs/{run_id}/status` — run state (JSON).
 - `deepthonk://jobs/{job_id}/{status|result|config|candidates|comparisons|scores|usage|trace|final|winner}?run_dir=...` — job-scoped lookup; the `run_dir` query param is required.
 - `deepthonk://jobs/{job_id}/population/{generation}?run_dir=...` — job-scoped population snapshots before or after completion.
+- `deepthonk://runs/{run_id}/{resource}/page/{cursor}` and job equivalents — opaque bounded pages. Whole reads are limited to 1 MiB; pages contain at most 1,000 records and 1 MiB.
 
 ### Prompts
 
@@ -218,7 +221,7 @@ Four templates mirror the core loop: `deepthonk/generate`, `deepthonk/compare`, 
 
 ### Limits
 
-`deepthonk.resume` reports trace state by default. With `continue: true`, it validates the stored config/version/provider, prunes to the last completed phase boundary, and replays from there without reusing partial in-flight outputs. The HTTP transport is loopback-only by design. MCP Sampling depends on the host's sampling implementation; model hints are preferences, token usage may be unavailable, and sampling concurrency is capped at 4.
+`deepthonk.resume` reports trace state by default. With `continue: true`, it validates phase order, artifacts, run/provider/model identity, scores, usage, and deterministic pair schedules before replaying a complete phase boundary. MCP Sampling model hints are preferences, token usage may be unavailable, and stdio Sampling concurrency is capped at 4. Streamable HTTP in v0.1 supports direct providers only.
 
 ## Customization
 
@@ -294,8 +297,8 @@ Release publishing is tag-triggered through npm Trusted Publishing. See [docs/re
 
 Known limits for this release:
 
-- Conservative resume reports trace state by default; replay requires an explicit `--continue` / MCP `continue: true` and only starts from validated phase boundaries.
-- MCP Sampling is MCP-host-only. Standalone CLI runs need a direct provider.
+- Conservative v1 resume replays an interrupted phase wholesale, preserves its usage accounting, and only reuses validated completed phase boundaries.
+- MCP Sampling is stdio-host-only in v0.1. Standalone CLI and Streamable HTTP runs need a direct provider.
 - `maxUsd` requires known model pricing; add explicit prices in YAML for custom providers and model IDs. Optional fields `longContextThresholdTokens`, `inputUsdPerMillionLong`, and `outputUsdPerMillionLong` enable tiered pricing for models with a long-context surcharge (e.g., Gemini at 200K input tokens). Cache hit/miss rates remain flat.
 
 ## Acknowledgments

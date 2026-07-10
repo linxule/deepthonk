@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import { planBudget } from "@deepthonk/core";
-import { profileFromOptions, resolvePlanProfile } from "../config.js";
+import { profileFromOptions, resolvePlanConfig } from "../config.js";
 
 export function registerPlan(program: Command): void {
   program
@@ -15,7 +15,8 @@ export function registerPlan(program: Command): void {
     .option("--m <number>")
     .action(async (options) => {
       if (options.config || options.profileName) {
-        console.log(JSON.stringify(planBudget(await resolvePlanProfile(options)), null, 2));
+        const resolved = await resolvePlanConfig(options);
+        console.log(JSON.stringify(planBudget(resolved.profile, resolved.planOptions), null, 2));
         return;
       }
       const hasOverrides = Boolean(options.n || options.k || options.t || options.m);

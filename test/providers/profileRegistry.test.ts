@@ -2,7 +2,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { loadNamedProfile } from "@deepthonk/providers";
+import { loadNamedProfile, validateNamedProfileBundle } from "@deepthonk/providers";
 
 describe("profile registry", () => {
   it.each([
@@ -27,6 +27,21 @@ describe("profile registry", () => {
 
       await expect(loadNamedProfile("bad")).rejects.toMatchObject({ code: "config.profile_raw_secret" });
     });
+  });
+
+  it.each([
+    ["unknown nested key", { algorithm: { mystery: 1 } }, "config.unknown_key"],
+    ["conflicting aliases", { retry: { http_retries: 1, httpRetries: 2 } }, "config.alias_conflict"],
+    ["wrong numeric type", { budget: { max_calls: "50" } }, "config.invalid_value"]
+  ])("rejects invalid operational config before profile save: %s", (_label, extra, code) => {
+    const bundle = {
+      profile: "quick",
+      prompt_style: "general",
+      provider: "fake",
+      models: { generator: "fake-model", mutator: "fake-model", judge: "fake-model" },
+      ...extra
+    };
+    expect(() => validateNamedProfileBundle(bundle, "bad")).toThrow(expect.objectContaining({ code }));
   });
 });
 

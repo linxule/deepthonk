@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runArtifactFiles, traceJsonlFiles } from "./artifacts.js";
 import { TraceError } from "./errors.js";
@@ -16,9 +16,9 @@ export class TraceStore {
     this.runDir = runDir;
   }
 
-  async init(config: RunConfig, runId: string): Promise<void> {
+  async init(config: RunConfig, runId: string, preflight: { allowOwnedLock?: boolean; pendingJobId?: string } = {}): Promise<void> {
     await mkdir(join(this.runDir, "artifacts"), { recursive: true });
-    await this.assertFreshTrace();
+    await this.assertFreshTrace(preflight);
     await this.writeJson(runArtifactFiles.config, redactConfig({ ...config, runId }));
     await this.event({ type: "run.started", run_id: runId, created_at: new Date().toISOString() });
   }
@@ -101,16 +101,40 @@ export class TraceStore {
     await writeFile(join(this.runDir, fileName), `${JSON.stringify(value, null, 2)}\n`, "utf8");
   }
 
-  private async assertFreshTrace(): Promise<void> {
-    const traceFiles = [...traceJsonlFiles, runArtifactFiles.summary];
-    for (const file of traceFiles) {
-      try {
-        await access(join(this.runDir, file));
-        throw new TraceError(`Run directory already contains ${file}; choose a new --out directory or remove the old trace first.`);
-      } catch (error) {
-        if (error instanceof TraceError) throw error;
+  private async assertFreshTrace(preflight: { allowOwnedLock?: boolean; pendingJobId?: string }): Promise<void> {
+    const managedFiles = new Set<string>([
+      ...Object.values(runArtifactFiles),
+      ...traceJsonlFiles,
+      ".prune-in-progress"
+    ]);
+    const entries = await readdir(this.runDir, { recursive: true }).catch(() => [] as string[]);
+    for (const file of entries) {
+      const normalized = file.replaceAll("\\", "/");
+      const base = normalized.split("/").at(-1) ?? normalized;
+      if (normalized === runArtifactFiles.lock && preflight.allowOwnedLock) continue;
+      if (normalized === runArtifactFiles.status && preflight.pendingJobId !== undefined) {
+        const status = await readPendingStatus(join(this.runDir, normalized));
+        if (status?.state === "pending" && status.job_id === preflight.pendingJobId) continue;
+      }
+      const isManaged =
+        managedFiles.has(normalized) ||
+        managedFiles.has(base) ||
+        /^population-\d+\.json$/.test(base) ||
+        normalized.startsWith("manifests/") ||
+        normalized.startsWith("checkpoints/") ||
+        normalized.startsWith("commits/");
+      if (isManaged) {
+        throw new TraceError(`Run directory already contains ${normalized}; choose a new --out directory or remove the old trace first.`);
       }
     }
+  }
+}
+
+async function readPendingStatus(path: string): Promise<{ state?: unknown; job_id?: unknown } | undefined> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as { state?: unknown; job_id?: unknown };
+  } catch {
+    return undefined;
   }
 }
 
@@ -129,5 +153,9 @@ function redactValue(value: unknown, key = ""): unknown {
 
 function isSecretValueKey(key: string): boolean {
   if (/^(apiKeyEnv|api_key_env|apiKeyFile|api_key_file|apiKeyStdin|api_key_stdin)$/i.test(key)) return false;
-  return /apiKey|api_key|token|secret|password|authorization|bearer|cookie|credential/i.test(key);
+  const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  if (["secret", "password", "authorization", "bearer", "cookie", "credential", "credentials", "privatekey"].includes(normalized)) {
+    return true;
+  }
+  return /(?:apikey|secretkey|accesstoken|refreshtoken|authtoken|idtoken|secrettoken|sessiontoken|clientsecret|privatekey)$/.test(normalized);
 }

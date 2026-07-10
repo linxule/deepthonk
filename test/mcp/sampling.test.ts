@@ -2,7 +2,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { deepthonkResume, deepthonkRun, type McpSamplingContext } from "@deepthonk/mcp";
+import { deepthonkResume, deepthonkRun, deepthonkStart, type McpSamplingContext } from "@deepthonk/mcp";
 import type { CreateMessageRequestParamsBase, CreateMessageResult } from "@modelcontextprotocol/sdk/types.js";
 
 describe("MCP Sampling provider", () => {
@@ -77,6 +77,27 @@ describe("MCP Sampling provider", () => {
       }, context)
     ).rejects.toMatchObject({ code: "provider.sampling_capability_missing" });
     expect(createMessage).not.toHaveBeenCalled();
+  });
+
+  it("honestly rejects HTTP Sampling throughout the v0.1 patch line", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-http-background-sampling-"));
+    const context: McpSamplingContext = {
+      transport: "http",
+      getClientCapabilities: () => ({ sampling: {} }),
+      createMessage: vi.fn(async () => textResult("unused"))
+    };
+    await expect(deepthonkStart({
+      task: "toy",
+      profile: "quick",
+      provider: "sampling",
+      run_dir: runDir
+    }, context)).rejects.toMatchObject({ code: "mcp.http_background_sampling_unsupported" });
+    await expect(deepthonkRun({
+      task: "toy",
+      profile: "quick",
+      provider: "sampling",
+      run_dir: `${runDir}-blocking`
+    }, context)).rejects.toMatchObject({ code: "mcp.http_sampling_requires_v0_2" });
   });
 });
 

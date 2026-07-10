@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   builtInProfiles,
+  repairLegacyBudgetConfig,
   resumeDeepThonk,
   runDeepThonk,
   type CompareInput,
@@ -15,7 +16,7 @@ import {
   type RunConfig,
   type RunResult
 } from "@deepthonk/core";
-import { FakeDriver } from "@deepthonk/providers";
+import { createDriver, FakeDriver, providerConfigFromReplay, providerReplayFromConfig } from "@deepthonk/providers";
 import { buildResumePlan, readResumeTrace } from "../../packages/core/src/resume.js";
 
 describe("resume replay", () => {
@@ -64,7 +65,10 @@ describe("resume replay", () => {
       (comparison) => comparison.generation === 1
     );
     expect(resumedComparisons).toHaveLength(4);
-    expect(result.calls).toBe(15);
+    expect(result.calls).toBeGreaterThan(15);
+    const usage = await readJsonl<{ outcome?: string }>(join(runDir, "usage.jsonl"));
+    expect(usage).toHaveLength(result.calls);
+    expect(usage).toContainEqual(expect.objectContaining({ outcome: "failed" }));
   });
 
   it("drops incomplete generation candidates from a partial mutation phase", async () => {
@@ -83,7 +87,10 @@ describe("resume replay", () => {
       (candidate) => candidate.generation === 1 && candidate.status !== "discarded"
     );
     expect(resumedGenerationOne).toHaveLength(4);
-    expect(result.calls).toBe(15);
+    expect(result.calls).toBeGreaterThan(15);
+    const usage = await readJsonl<{ outcome?: string }>(join(runDir, "usage.jsonl"));
+    expect(usage).toHaveLength(result.calls);
+    expect(usage).toContainEqual(expect.objectContaining({ outcome: "failed" }));
   });
 
   it("refuses to resume while a prune sentinel is present", async () => {
@@ -205,7 +212,155 @@ describe("resume replay", () => {
     // and timestamps are intentionally fresh; the deterministic replay contract is rank identity.
     expect(scoreOrder(resumedSummary)).toEqual(scoreOrder(fullSummary));
   });
+
+  it("rejects phase markers that are not a strict completed prefix", () => {
+    const config = quickConfig("runs/prefix-test");
+    expect(() =>
+      buildResumePlan(config, [
+        { type: "phase.completed", phase: "generation_judging", generation: 1, at: new Date().toISOString() }
+      ])
+    ).toThrowError(expect.objectContaining({ code: "resume.phase_order_invalid" }));
+  });
+
+  it("detects and explicitly repairs legacy-redacted numeric budget fields", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-budget-repair-"));
+    await writeStoredConfig(runDir, {
+      ...quickConfig(runDir),
+      budget: { maxInputTokens: "[redacted]", maxOutputTokens: "[redacted]" }
+    });
+    await expect(resumeDeepThonk(runDir, new FakeDriver(), { dryRun: true })).rejects.toMatchObject({
+      code: "resume.legacy_redacted_budget"
+    });
+
+    await expect(
+      repairLegacyBudgetConfig(runDir, { "budget.maxInputTokens": 1000, "budget.maxOutputTokens": 500 })
+    ).resolves.toEqual(["budget.maxInputTokens", "budget.maxOutputTokens"]);
+    const repaired = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as { budget: Record<string, unknown> };
+    expect(repaired.budget).toMatchObject({ maxInputTokens: 1000, maxOutputTokens: 500 });
+    const events = await readJsonl<{ type: string; fields?: string[] }>(join(runDir, "events.jsonl"));
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: "config.repaired", fields: ["budget.maxInputTokens", "budget.maxOutputTokens"] })
+    );
+  });
+
+  it("rejects a substituted pair even when comparison count and IDs remain valid", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-pair-tamper-"));
+    const config = quickConfig(runDir);
+    await expect(runDeepThonk(config, new FailAfterRoleCallDriver("mutate", 0))).rejects.toThrow(/Injected mutate failure/);
+    const population = JSON.parse(await readFile(join(runDir, "population-0.json"), "utf8")) as Array<{ id: string }>;
+    const comparisons = await readJsonl<Record<string, unknown>>(join(runDir, "comparisons.jsonl"));
+    const generationRows = comparisons.filter((row) => row.generation === 1);
+    const used = new Set(
+      generationRows.map((row) => [String(row.candidateAId), String(row.candidateBId)].sort().join("::"))
+    );
+    let replacement: [string, string] | undefined;
+    for (let left = 0; left < population.length; left += 1) {
+      for (let right = left + 1; right < population.length; right += 1) {
+        const pair: [string, string] = [population[left].id, population[right].id];
+        if (!used.has([...pair].sort().join("::"))) replacement = pair;
+      }
+    }
+    expect(replacement).toBeDefined();
+    const target = generationRows[0]!;
+    target.candidateAId = replacement![0];
+    target.candidateBId = replacement![1];
+    target.presentedAOriginalId = replacement![0];
+    target.presentedBOriginalId = replacement![1];
+    await writeFile(join(runDir, "comparisons.jsonl"), comparisons.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8");
+
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.comparison_schedule_mismatch" });
+  });
+
+  it("rejects population content that disagrees with candidates.jsonl", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-population-tamper-"));
+    await expect(runDeepThonk(quickConfig(runDir), new FailAfterRoleCallDriver("compare", 0))).rejects.toThrow(/Injected compare failure/);
+    const population = JSON.parse(await readFile(join(runDir, "population-0.json"), "utf8")) as Array<{ content: string }>;
+    population[0]!.content = "tampered content";
+    await writeFile(join(runDir, "population-0.json"), JSON.stringify(population, null, 2), "utf8");
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.population_mismatch" });
+  });
+
+  it("rejects structurally impossible append-only usage rows", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-usage-tamper-"));
+    await expect(runDeepThonk(quickConfig(runDir), new FailAfterRoleCallDriver("compare", 0))).rejects.toThrow(/Injected compare failure/);
+    await appendJsonl(join(runDir, "usage.jsonl"), {
+      schema_version: 1,
+      ts: new Date().toISOString(),
+      phase: "gen1_judge",
+      role: "judge",
+      input_tokens: -1,
+      output_tokens: 0,
+      total_tokens: 0
+    });
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.usage_invalid" });
+  });
+
+  it.each([
+    ["out-of-range confidence", (row: Record<string, unknown>) => { row.confidence = 2; }, "resume.comparison_row_invalid"],
+    ["non-string provider", (row: Record<string, unknown>) => { row.provider = 42; }, "resume.comparison_row_invalid"],
+    ["array metadata", (row: Record<string, unknown>) => { row.metadata = []; }, "resume.comparison_row_invalid"],
+    ["oversized critique", (row: Record<string, unknown>) => { row.critiqueForA = "x".repeat(16_001); }, "resume.comparison_row_invalid"],
+    ["different run ID", (row: Record<string, unknown>) => { row.runId = "different-run"; }, "resume.run_id_mismatch"]
+  ])("rejects completed comparison rows with %s", async (_label, mutate, expectedCode) => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-comparison-row-"));
+    await expect(runDeepThonk(quickConfig(runDir), new FailAfterRoleCallDriver("mutate", 0))).rejects.toThrow(/Injected mutate failure/);
+    const comparisons = await readJsonl<Record<string, unknown>>(join(runDir, "comparisons.jsonl"));
+    const target = comparisons.find((row) => row.generation === 1)!;
+    mutate(target);
+    await writeFile(join(runDir, "comparisons.jsonl"), comparisons.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8");
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: expectedCode });
+  });
+
+  it("requires failed usage outcomes to carry a bounded error code", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-usage-outcome-"));
+    await expect(runDeepThonk(quickConfig(runDir), new FailAfterRoleCallDriver("compare", 0))).rejects.toThrow(/Injected compare failure/);
+    const usage = await readJsonl<Record<string, unknown>>(join(runDir, "usage.jsonl"));
+    usage[0]!.outcome = "failed";
+    delete usage[0]!.error_code;
+    await writeFile(join(runDir, "usage.jsonl"), usage.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8");
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.usage_invalid" });
+  });
+
+  it("rejects config model tampering against providerReplay before replay", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-model-tamper-"));
+    const config = replayConfig(runDir);
+    await expect(runDeepThonk(config, new FailAfterRoleCallDriver("compare", 0))).rejects.toThrow(/Injected compare failure/);
+    const stored = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as Record<string, unknown>;
+    stored.generatorModel = "tampered-model";
+    await writeFile(join(runDir, "config.json"), JSON.stringify(stored, null, 2), "utf8");
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.provider_replay_mismatch" });
+  });
+
+  it("recomputes the stored providerReplay fingerprint before replay", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-fingerprint-tamper-"));
+    const config = replayConfig(runDir);
+    await expect(runDeepThonk(config, new FailAfterRoleCallDriver("compare", 0))).rejects.toThrow(/Injected compare failure/);
+    const stored = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as {
+      providerReplay: Record<string, unknown>;
+    };
+    stored.providerReplay.baseUrl = "https://tampered.invalid/v1";
+    await writeFile(join(runDir, "config.json"), JSON.stringify(stored, null, 2), "utf8");
+    await expect(resumeDeepThonk(runDir, new FakeDriver())).rejects.toMatchObject({ code: "resume.provider_replay_mismatch" });
+  });
+
+  it("accepts an untampered providerReplay fingerprint with the matching runtime route", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-resume-fingerprint-valid-"));
+    const config = replayConfig(runDir);
+    await expect(runDeepThonk(config, new FailAfterRoleCallDriver("compare", 0))).rejects.toThrow(/Injected compare failure/);
+    const replay = config.providerReplay!;
+    await expect(resumeDeepThonk(runDir, createDriver(providerConfigFromReplay(replay)))).resolves.toHaveProperty("winner");
+  });
 });
+
+function replayConfig(runDir: string): RunConfig {
+  const config = quickConfig(runDir);
+  config.providerReplay = providerReplayFromConfig({
+    provider: "fake",
+    supportsJsonMode: true,
+    models: { generator: "fake-model", mutator: "fake-model", judge: "fake-model" }
+  });
+  return config;
+}
 
 function quickConfig(runDir: string, seed = 42): RunConfig {
   return {

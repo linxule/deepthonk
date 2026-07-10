@@ -1,8 +1,7 @@
 import type { Command } from "commander";
-import { ConfigError, runDeepThonk, type ModelDriver } from "@deepthonk/core";
+import { ConfigError, runDeepThonk } from "@deepthonk/core";
 import { createDriver } from "@deepthonk/providers";
 import { resolveRunConfig } from "../config.js";
-import { upsertProviderReplay, type ProviderReplay } from "../providerReplay.js";
 import { redacted } from "../redaction.js";
 
 export function registerRun(program: Command): void {
@@ -23,6 +22,7 @@ export function registerRun(program: Command): void {
     .option("--finalizer-model <model>")
     .option("--supports-json-mode <true|false>", "Whether the base OpenAI-compatible provider supports response_format JSON mode")
     .option("--seed <number>")
+    .option("--run-id <id>", "Stable caller-supplied run ID (letters, digits, dot, underscore, and hyphen)")
     .option("--out <dir>")
     .option("--max-concurrency <number>")
     .option("--generate-concurrency <number>", "Maximum concurrent generation calls")
@@ -66,9 +66,7 @@ export function registerRun(program: Command): void {
         console.log(JSON.stringify(redacted(withApiKeyPresence(resolved)), null, 2));
         return;
       }
-      const driver = persistProviderReplayBeforeFirstCall(createDriver(resolved.providerConfig), resolved.runConfig.runDir, resolved.providerReplay);
-      const result = await runDeepThonk(resolved.runConfig, driver);
-      await upsertProviderReplay(resolved.runConfig.runDir, resolved.providerReplay);
+      const result = await runDeepThonk(resolved.runConfig, createDriver(resolved.providerConfig));
       console.log(
         JSON.stringify(
           {
@@ -83,35 +81,6 @@ export function registerRun(program: Command): void {
         )
       );
     });
-}
-
-function persistProviderReplayBeforeFirstCall(driver: ModelDriver, runDir: string, providerReplay: ProviderReplay): ModelDriver {
-  let persisted: Promise<void> | undefined;
-  const ensurePersisted = (): Promise<void> => {
-    persisted ??= upsertProviderReplay(runDir, providerReplay);
-    return persisted;
-  };
-  const wrapped: ModelDriver = {
-    async generate(input) {
-      await ensurePersisted();
-      return driver.generate(input);
-    },
-    async compare(input) {
-      await ensurePersisted();
-      return driver.compare(input);
-    },
-    async mutate(input) {
-      await ensurePersisted();
-      return driver.mutate(input);
-    }
-  };
-  if (driver.finalize) {
-    wrapped.finalize = async (input) => {
-      await ensurePersisted();
-      return driver.finalize!(input);
-    };
-  }
-  return wrapped;
 }
 
 function withApiKeyPresence<T extends { providerConfig: { apiKeyEnv?: string; apiKey?: string } }>(value: T): T & { providerConfig: T["providerConfig"] & { apiKeyPresent: boolean } } {

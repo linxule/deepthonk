@@ -2,6 +2,64 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
+## [0.1.5] — 2026-07-10
+
+### Added
+
+- Caller-supplied, path-safe `run_id` support plus collision-resistant generated run and job IDs.
+- Explicit lock inspection and fingerprinted reclaim through CLI/MCP, and `repair-budget` / `deepthonk.repair_budget` for legacy numeric fields redacted by v0.1.4.
+- Stateful Streamable HTTP sessions with bounded session capacity, idle eviction, FIFO background admission (2 active, 32 queued), and paged resources capped at 1 MiB / 1,000 records.
+- Repeatable performance benchmarks and scheduled regression gates for CLI startup and Bradley-Terry fitting.
+
+### Changed
+
+- External YAML is strict and canonical snake_case; existing camelCase aliases remain accepted, conflicting aliases and unknown operational keys are rejected, and arbitrary application data is allowed only under `metadata`.
+- Resume now verifies strict phase order, run IDs, provider-route fingerprints/models, exact deterministic pairs, populations, comparisons, scores, usage, and critique bounds before replay. Incomplete-phase usage remains append-only.
+- `max_calls` counts logical model invocations, including failed calls and invalid-JSON retries. Plans report nominal calls, finalizer calls, retry headroom, and worst-case calls separately.
+- Provider requests use one logical deadline across retries, response-body reads, and bounded `Retry-After` waits. Direct and Sampling responses are capped at 1 MiB; judge output defaults to 1,024 tokens and other roles to 4,096.
+- CLI commands load lazily, reducing local `--version` and `plan` startup time.
+
+### Fixed
+
+- Provider/endpoint overrides no longer inherit credentials, models, role routes, or JSON-mode assumptions from the replaced route.
+- Concurrent JSON-mode capability probes no longer stampede an endpoint that rejects `response_format`.
+- Ranking rejects duplicate candidate IDs, balances seeded A/B presentation, and no longer invents an invalid-JSON critique for valid winner-only responses.
+- Run locks, run-index writes, and legacy budget repairs are ownership-aware and cross-process safe; wrong-fingerprint reclaim is non-mutating.
+- MCP error results omit `structuredContent` so official SDK 1.29 clients do not mask tool errors with success-schema validation failures.
+
+### Security
+
+- Pinned transitive Hono to 4.12.28 and added a production-audit release gate.
+- Job resources require the exact recorded `job_id`/`run_dir` pair, and resource run IDs reject path-shaped values.
+- Background jobs use verified lock claims and wrap success, failure, index, status, and release writes.
+
+## [0.1.4] — 2026-06-24
+
+### Added
+
+- Persisted redacted provider replay routes so interrupted CLI runs can reconstruct their provider, endpoint, model, API-key environment variable name, and JSON-mode preference.
+- Job-scoped MCP resources for status, result, config, candidates, comparisons, scores, usage, trace, populations, final output, and winner artifacts.
+- Phase-specific CLI concurrency flags and strict numeric/boolean option validation.
+- A tokenless pnpm 11 release runbook covering package order, version guards, Trusted Publishing, and post-publish verification.
+
+### Changed
+
+- Hardened replay validation, pair scheduling, Bradley-Terry fitting, bounded phase execution, and direct `rank`/`mutate` config resolution.
+- OpenAI-compatible comparison calls fall back once when an endpoint explicitly rejects JSON mode and remember that capability for later calls in the process.
+
+### Security
+
+- Streamable HTTP rejects invalid content types, non-loopback origins, and cross-site browser requests before reading request bodies, in addition to loopback bind, DNS-rebinding protection, and `Host` validation.
+- Background MCP work wraps driver construction, status writes, resource recording, and lock release so filesystem failures do not escape as unhandled rejections.
+
+## [0.1.3] — 2026-06-22
+
+### Changed
+
+- Moved the four-package publication flow to npm Trusted Publishing through GitHub Actions OIDC and pnpm 11.
+- Fixed package preparation so published tarballs retain `README.md` and `LICENSE`, while `workspace:*` dependencies are rewritten by `pnpm publish` in topological order.
+- Declared previously implicit YAML and JSON-schema development dependencies and approved the esbuild lifecycle dependency in the workspace lock configuration.
+
 ## [0.1.2] — 2026-05-19
 
 ### Added

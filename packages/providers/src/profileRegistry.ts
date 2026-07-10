@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import YAML from "yaml";
 import { ConfigError } from "@deepthonk/core";
 import { defaultConfigPath } from "./env.js";
+import { normalizeExternalConfig } from "./externalConfig.js";
 
 export const NAMED_PROFILE_NAME_RE = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
 export const RAW_API_KEY_RE = /^api[_-]?key$/i;
@@ -115,8 +116,9 @@ function validateNamedProfileValue(value: unknown, name: string): NamedProfileBu
   const config = value as NamedProfileBundle;
   rejectRawApiKeyFields(config, name);
   rejectAllSecretShapedFields(config, name);
-  validateRequiredFields(config, name);
-  return config;
+  const normalized = normalizeExternalConfig(config, `named profile '${name}'`) as NamedProfileBundle;
+  validateRequiredFields(normalized, name);
+  return normalized;
 }
 
 export function rejectRawApiKeyFields(value: unknown, name = "profile"): void {

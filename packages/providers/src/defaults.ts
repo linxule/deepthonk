@@ -12,6 +12,7 @@ export interface ProviderModelOverrides {
 
 export interface ProviderConfigOptions {
   provider: string;
+  routeFingerprint?: string;
   baseUrl?: string;
   apiKeyEnv?: string;
   apiKey?: string;
@@ -19,6 +20,14 @@ export interface ProviderConfigOptions {
   retry?: ProviderConfig["retry"];
   supportsJsonMode?: boolean;
   samplingTransport?: SamplingTransport;
+  modelHints?: string[];
+  costPriority?: number;
+  speedPriority?: number;
+  intelligencePriority?: number;
+  includeRawOutputs?: boolean;
+  requestTimeoutMs?: number;
+  /** Disable implicit endpoint and credential defaults for an explicitly replaced route. */
+  inheritProviderDefaults?: boolean;
   roleProviders?: Partial<Record<ProviderRole, Partial<Omit<RoleProviderConfig, "model">> & { model?: string }>>;
 }
 
@@ -33,15 +42,23 @@ export function resolveProviderModels(provider: string, overrides: ProviderModel
 
 export function resolveProviderConfig(options: ProviderConfigOptions): ProviderConfig {
   const models = resolveProviderModels(options.provider, options.models);
+  const inheritProviderDefaults = options.inheritProviderDefaults ?? true;
   return {
     provider: options.provider,
-    baseUrl: options.baseUrl ?? defaultBaseUrl(options.provider),
-    apiKeyEnv: options.apiKeyEnv ?? defaultApiKeyEnv(options.provider),
+    routeFingerprint: options.routeFingerprint,
+    baseUrl: options.baseUrl ?? (inheritProviderDefaults ? defaultBaseUrl(options.provider) : undefined),
+    apiKeyEnv: options.apiKeyEnv ?? (inheritProviderDefaults ? defaultApiKeyEnv(options.provider) : undefined),
     apiKey: options.apiKey,
     models,
     retry: options.retry,
     supportsJsonMode: options.supportsJsonMode,
     samplingTransport: options.samplingTransport,
+    modelHints: options.modelHints,
+    costPriority: options.costPriority,
+    speedPriority: options.speedPriority,
+    intelligencePriority: options.intelligencePriority,
+    includeRawOutputs: options.includeRawOutputs,
+    requestTimeoutMs: options.requestTimeoutMs,
     roleProviders: resolveRoleProviders(options.provider, models, options.roleProviders, options.retry, options.supportsJsonMode)
   };
 }
@@ -81,15 +98,17 @@ function resolveRoleProviders(
     const input = roleProviders[role];
     if (!input) continue;
     const provider = input.provider ?? baseProvider;
-    const model = input.model ?? models[role] ?? defaultModel(provider, role);
+    const isolatedRoute =
+      input.baseUrl !== undefined || (input.provider !== undefined && input.provider !== baseProvider);
+    const model = input.model ?? (isolatedRoute ? defaultModel(provider, role) : models[role]) ?? defaultModel(provider, role);
     resolved[role] = {
       provider,
       baseUrl: input.baseUrl ?? defaultBaseUrl(provider),
-      apiKeyEnv: input.apiKeyEnv ?? defaultApiKeyEnv(provider),
+      apiKeyEnv: input.apiKeyEnv ?? (input.baseUrl === undefined ? defaultApiKeyEnv(provider) : undefined),
       apiKey: input.apiKey,
       model,
       retry: input.retry ?? baseRetry,
-      supportsJsonMode: input.supportsJsonMode ?? baseSupportsJsonMode
+      supportsJsonMode: input.supportsJsonMode ?? (isolatedRoute ? undefined : baseSupportsJsonMode)
     };
   }
   return Object.keys(resolved).length ? resolved : undefined;

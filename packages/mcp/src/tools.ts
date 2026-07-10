@@ -8,7 +8,7 @@ import { z } from "zod";
 import YAML from "yaml";
 import {
   builtInProfiles,
-  claimRunLock,
+  claimRunLockOwnership,
   ConfigError,
   DeepThonkError,
   getProfile,
@@ -16,38 +16,47 @@ import {
   detectResumeState,
   exportRun,
   isRunCancelRequested,
+  inspectRunLock,
   releaseRunLock,
+  reclaimRunLock,
+  repairLegacyBudgetConfig,
   mutateCandidate,
   rankCandidates,
   readRunStatus,
   requestRunCancel,
   resumeDeepThonk,
+  runIdSchema,
   runConfigSchema,
   runDeepThonk,
   TraceStore,
   type BuiltInProfileName,
-  type CandidateInput
+  type CandidateInput,
+  type RunLockClaim
 } from "@deepthonk/core";
 import {
   createDriver,
   defaultPricesForProviderConfig,
+  type ExternalConfigFile,
   listProfiles,
   loadDeepThonkEnv,
   loadNamedProfile,
   NAMED_PROFILE_NAME_RE,
+  normalizeExternalConfig,
   profilePath,
   profilesDir,
+  parseProviderReplay,
+  providerConfigFromReplay,
+  providerReplayFromConfig,
   rejectAllSecretShapedFields,
   rejectRawApiKeyFields,
   resolveProviderConfig,
-  resolveProviderModels,
   SECRET_KEY_RE,
   type NamedProfileBundle,
   type ProviderConfig,
   type SamplingTransport,
   validateNamedProfileBundle
 } from "@deepthonk/providers";
-import { jobArtifactResources, recordRunResource } from "./resources.js";
+import { jobArtifactResources, MAX_RESOURCE_BYTES, recordRunResource } from "./resources.js";
 
 export const toolNames = [
   "deepthonk.plan",
@@ -55,6 +64,9 @@ export const toolNames = [
   "deepthonk.status",
   "deepthonk.result",
   "deepthonk.cancel",
+  "deepthonk.lock_inspect",
+  "deepthonk.lock_reclaim",
+  "deepthonk.repair_budget",
   "deepthonk.run",
   "deepthonk.rank",
   "deepthonk.mutate",
@@ -84,6 +96,7 @@ const providerNameSchema = z
 
 export const runArgsSchema = z.object({
   task: z.string().min(1).describe("Task text to solve. MCP tools do not read task files."),
+  run_id: runIdSchema.optional().describe("Optional stable caller-supplied run ID."),
   rubric: z.string().optional().describe("Optional judging rubric text."),
   config_path: z.string().optional().describe("Optional DeepThonk YAML config path, such as ~/.config/deepthonk/config.yaml."),
   profile_name: z.string().optional().describe("Saved profile bundle name; loads ~/.config/deepthonk/profiles/<name>.yaml. Mutually exclusive with config_path."),
@@ -103,11 +116,11 @@ export const runArgsSchema = z.object({
   sampling_intelligence_priority: z.number().min(0).max(1).optional().describe("MCP Sampling model preference for intelligence, from 0 to 1."),
   seed: z.number().int().default(1).describe("Deterministic seed for pair ordering and IDs."),
   run_dir: z.string().optional().describe("Directory for trace files."),
-  max_calls: z.number().int().optional().describe("Maximum completed provider calls before the run stops at a phase boundary."),
-  max_input_tokens: z.number().int().optional().describe("Maximum recorded input tokens before the run stops at a phase boundary."),
-  max_output_tokens: z.number().int().optional().describe("Maximum recorded output tokens before the run stops at a phase boundary."),
-  max_usd: z.number().optional().describe("Maximum estimated USD spend; requires matching budget.prices in config."),
-  request_timeout_ms: z.number().int().optional().describe("Per-request provider timeout in milliseconds."),
+  max_calls: z.number().int().min(1).optional().describe("Maximum logical model invocations, including failed calls and invalid-JSON retries; internal HTTP retries are reported separately."),
+  max_input_tokens: z.number().int().min(1).optional().describe("Maximum recorded input tokens before the run stops at a phase boundary."),
+  max_output_tokens: z.number().int().min(1).optional().describe("Maximum recorded output tokens before the run stops at a phase boundary."),
+  max_usd: z.number().min(0).optional().describe("Maximum estimated USD spend; requires matching budget.prices in config."),
+  request_timeout_ms: z.number().int().min(1).optional().describe("Logical provider-call deadline in milliseconds, including body reads and retry waits."),
   n: z.number().int().min(2).optional().describe("Population size override. Defaults to the profile's n."),
   k: z.number().int().min(1).optional().describe("Comparisons per candidate per mutation-generation round."),
   t: z.number().int().min(0).optional().describe("Number of mutation generations (t=0 disables mutation rounds)."),
@@ -135,6 +148,39 @@ export const jobArgsSchema = z.object({
   run_dir: z.string().min(1).optional().describe("Run directory returned by deepthonk.start or deepthonk.run."),
   job_id: z.string().optional().describe("Job ID returned by deepthonk.start.")
 });
+
+export const lockInspectArgsSchema = z.object({
+  run_dir: z.string().min(1).describe("Run directory containing the lock to inspect.")
+});
+
+export const lockReclaimArgsSchema = lockInspectArgsSchema.extend({
+  fingerprint: z.string().regex(/^sha256:[0-9a-f]{64}$/).describe("Exact fingerprint returned by deepthonk.lock_inspect.")
+});
+
+export const lockInspectOutputSchema = z.object({
+  run_dir: z.string(),
+  state: z.enum(["missing", "valid", "malformed"]),
+  fingerprint: z.string().optional(),
+  lock: z.object({}).passthrough().optional(),
+  sameHost: z.boolean().optional(),
+  workerAlive: z.boolean().optional()
+});
+
+export const lockReclaimOutputSchema = z.object({
+  run_dir: z.string(),
+  fingerprint: z.string(),
+  reclaimed: z.boolean()
+});
+
+const repairBudgetPath = /^budget\.(?:maxCalls|maxInputTokens|maxOutputTokens)$|^budget\.prices\.\d+\.longContextThresholdTokens$/;
+export const repairBudgetArgsSchema = z.object({
+  run_dir: z.string().min(1),
+  replacements: z.record(z.number().int().positive()).refine(
+    (value) => Object.keys(value).length > 0 && Object.keys(value).every((path) => repairBudgetPath.test(path)),
+    "Replacement keys must be exact legacy-redacted budget paths."
+  )
+});
+export const repairBudgetOutputSchema = z.object({ run_dir: z.string(), repaired: z.array(z.string()) });
 
 const providerArgsSchema = z.object({
   config_path: z.string().optional().describe("Optional DeepThonk YAML config path."),
@@ -269,93 +315,184 @@ export async function deepthonkPlanAsync(argsInput: unknown): Promise<Record<str
   const config = await readMcpConfig(args.config_path, args.profile_name);
   const profileName = config.profile ?? args.profile;
   const base = builtInProfiles[profileName];
-  return planBudget({
-    ...base,
-    n: args.n ?? config.algorithm?.n ?? base.n,
-    k: args.k ?? config.algorithm?.k ?? base.k,
-    t: args.t ?? config.algorithm?.t ?? base.t,
-    m: args.m ?? config.algorithm?.m ?? base.m,
-    lambda: config.algorithm?.lambda ?? base.lambda,
-    sampleTemperature: config.algorithm?.sample_temperature ?? base.sampleTemperature,
-    mutateTemperature: config.algorithm?.mutate_temperature ?? base.mutateTemperature,
-    judgeTemperature: config.algorithm?.judge_temperature ?? base.judgeTemperature
-  }) as unknown as Record<string, unknown>;
+  return planBudget(
+    {
+      ...base,
+      n: args.n ?? config.algorithm?.n ?? base.n,
+      k: args.k ?? config.algorithm?.k ?? base.k,
+      t: args.t ?? config.algorithm?.t ?? base.t,
+      m: args.m ?? config.algorithm?.m ?? base.m,
+      lambda: config.algorithm?.lambda ?? base.lambda,
+      sampleTemperature: config.algorithm?.sample_temperature ?? base.sampleTemperature,
+      mutateTemperature: config.algorithm?.mutate_temperature ?? base.mutateTemperature,
+      judgeTemperature: config.algorithm?.judge_temperature ?? base.judgeTemperature
+    },
+    {
+      invalidJsonRetries: config.retry?.invalidJsonRetries ?? 1,
+      includeFinalizer: Boolean(config.models?.finalizer || config.providers?.finalizer?.model)
+    }
+  ) as unknown as Record<string, unknown>;
 }
 
 export interface McpSamplingContext {
   getClientCapabilities(): ClientCapabilities | undefined;
   createMessage: SamplingTransport;
+  transport?: "stdio" | "http";
 }
 
-export async function deepthonkStart(argsInput: unknown, context?: McpSamplingContext): Promise<Record<string, unknown>> {
-  const { runConfig, providerConfig } = await resolveMcpRun(argsInput, context);
-  const jobId = `job_${new Date().toISOString().replace(/[:.]/g, "-")}_${Math.random().toString(16).slice(2, 8)}`;
-  const now = new Date().toISOString();
-  const claimed = await claimRunLock(runConfig.runDir, jobId);
-  if (!claimed) {
-    const existing = await readRunStatus(runConfig.runDir);
-    if (existing?.job_id && (existing.state === "pending" || existing.state === "running")) {
-      const resources = jobArtifactResources(existing.job_id, runConfig.runDir);
-      return {
-        job_id: existing.job_id,
-        run_dir: runConfig.runDir,
-        state: existing.state,
-        status_resource: resources.status,
-        result_resource: resources.result,
-        artifact_resources: resources
-      };
+interface BackgroundJobReservation {
+  readonly id: symbol;
+}
+
+export interface BackgroundJobManagerStats {
+  active: number;
+  queued: number;
+  reserved: number;
+  maxActive: number;
+  maxQueued: number;
+}
+
+/** Process-local FIFO admission control for MCP background jobs. */
+export class BackgroundJobManager {
+  private active = 0;
+  private readonly queue: Array<() => Promise<void>> = [];
+  private readonly reservations = new Set<symbol>();
+
+  constructor(
+    private readonly maxActive = 2,
+    private readonly maxQueued = 32
+  ) {}
+
+  reserve(): BackgroundJobReservation | undefined {
+    if (this.active + this.queue.length + this.reservations.size >= this.maxActive + this.maxQueued) return undefined;
+    const id = Symbol("background-job-reservation");
+    this.reservations.add(id);
+    return { id };
+  }
+
+  release(reservation: BackgroundJobReservation): void {
+    this.reservations.delete(reservation.id);
+  }
+
+  schedule(reservation: BackgroundJobReservation, task: () => Promise<void>): void {
+    if (!this.reservations.delete(reservation.id)) throw new Error("Background job reservation is no longer valid.");
+    if (this.active < this.maxActive) {
+      this.start(task);
+      return;
     }
-    throw new ConfigError(`Run directory is already claimed: ${runConfig.runDir}`, {
-      code: "run.directory_locked",
-      retryable: false,
-      fix: "Use a fresh run_dir or inspect the existing run status."
+    this.queue.push(task);
+  }
+
+  stats(): BackgroundJobManagerStats {
+    return {
+      active: this.active,
+      queued: this.queue.length,
+      reserved: this.reservations.size,
+      maxActive: this.maxActive,
+      maxQueued: this.maxQueued
+    };
+  }
+
+  private start(task: () => Promise<void>): void {
+    this.active += 1;
+    void Promise.resolve()
+      .then(task)
+      .catch((error) => {
+        process.stderr.write(`deepthonk: background job escaped its safety wrapper: ${error instanceof Error ? error.message : String(error)}\n`);
+      })
+      .finally(() => {
+        this.active -= 1;
+        const next = this.queue.shift();
+        if (next) this.start(next);
+      });
+  }
+}
+
+const backgroundJobs = new BackgroundJobManager();
+
+export async function deepthonkStart(argsInput: unknown, context?: McpSamplingContext): Promise<Record<string, unknown>> {
+  const reservation = backgroundJobs.reserve();
+  if (!reservation) {
+    throw new ConfigError("The MCP background job queue is full (2 active, 32 queued).", {
+      code: "mcp.job_queue_full",
+      retryable: true,
+      fix: "Retry after a running background job completes, or use blocking deepthonk.run."
     });
   }
+  let scheduled = false;
   try {
-    await new TraceStore(runConfig.runDir).writeStatus({
+    const { runConfig, providerConfig } = await resolveMcpRun(argsInput, context);
+    if (context?.transport === "http" && providerConfigUsesSampling(providerConfig)) {
+      throw new ConfigError("MCP Sampling is not available for HTTP background jobs.", {
+        code: "mcp.http_background_sampling_unsupported",
+        retryable: false,
+        fix: "Use blocking deepthonk.run over the same HTTP session, use a direct provider, or use stdio for deepthonk.start with Sampling."
+      });
+    }
+    const jobId = `job_${randomUUID()}`;
+    const now = new Date().toISOString();
+    const claimed = await claimRunLockOwnership(runConfig.runDir, jobId);
+    if (!claimed) {
+      throw new ConfigError(`Run directory is already claimed: ${runConfig.runDir}`, {
+        code: "run.directory_locked",
+        retryable: false,
+        fix: "Use a fresh run_dir or inspect the existing run status. DeepThonk does not treat an occupied directory as an idempotent retry."
+      });
+    }
+    try {
+      await new TraceStore(runConfig.runDir).writeStatus({
+        job_id: jobId,
+        run_dir: runConfig.runDir,
+        state: "pending",
+        phase: "queued",
+        usage: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        started_at: now,
+        worker_pid: process.pid,
+        updated_at: now
+      });
+    } catch (error) {
+      await safeReleaseRunLock(runConfig.runDir, claimed.claimId);
+      throw error;
+    }
+    backgroundJobs.schedule(reservation, () => runBackgroundJob(runConfig, providerConfig, jobId, now, claimed));
+    scheduled = true;
+    const resources = jobArtifactResources(jobId, runConfig.runDir);
+    return {
       job_id: jobId,
       run_dir: runConfig.runDir,
       state: "pending",
-      phase: "queued",
-      usage: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-      started_at: now,
-      worker_pid: process.pid,
-      updated_at: now
-    });
-  } catch (error) {
-    await safeReleaseRunLock(runConfig.runDir);
-    throw error;
+      status_resource: resources.status,
+      result_resource: resources.result,
+      artifact_resources: resources
+    };
+  } finally {
+    if (!scheduled) backgroundJobs.release(reservation);
   }
-  void runBackgroundJob(runConfig, providerConfig, jobId, now);
-  const resources = jobArtifactResources(jobId, runConfig.runDir);
-  return {
-    job_id: jobId,
-    run_dir: runConfig.runDir,
-    state: "pending",
-    status_resource: resources.status,
-    result_resource: resources.result,
-    artifact_resources: resources
-  };
+}
+
+function providerConfigUsesSampling(config: ProviderConfig): boolean {
+  return config.provider === "sampling" || Object.values(config.roleProviders ?? {}).some((role) => role?.provider === "sampling");
 }
 
 async function runBackgroundJob(
   runConfig: Parameters<typeof runDeepThonk>[0],
   providerConfig: ProviderConfig,
   jobId: string,
-  startedAt: string
+  startedAt: string,
+  lockClaim: RunLockClaim
 ): Promise<void> {
   try {
     const driver = createDriver(providerConfig);
     const result = await runDeepThonk(runConfig, driver, {
       jobId,
-      lockClaimed: true,
+      lockClaim,
       shouldCancel: () => isRunCancelRequested(runConfig.runDir)
     });
     await safeRecordRunResource(result.runId, result.runDir);
   } catch (error) {
     await safePersistFailureStatus(runConfig.runDir, jobId, startedAt, error);
   } finally {
-    await safeReleaseRunLock(runConfig.runDir);
+    await safeReleaseRunLock(runConfig.runDir, lockClaim.claimId);
   }
 }
 
@@ -393,9 +530,9 @@ async function safePersistFailureStatus(runDir: string, jobId: string, startedAt
   }
 }
 
-async function safeReleaseRunLock(runDir: string): Promise<void> {
+async function safeReleaseRunLock(runDir: string, claimId: string): Promise<void> {
   try {
-    await releaseRunLock(runDir);
+    await releaseRunLock(runDir, claimId);
   } catch (error) {
     process.stderr.write(`deepthonk: failed to release run lock: ${(error as Error).message}\n`);
   }
@@ -408,6 +545,25 @@ export async function deepthonkStatus(argsInput: unknown): Promise<Record<string
   if (args.job_id && status?.job_id && args.job_id !== status.job_id) throw jobMismatch(args.job_id, status.job_id);
   if (status) return { ...status };
   return { ...(await detectResumeState(runDir)), run_dir: runDir };
+}
+
+export async function deepthonkLockInspect(argsInput: unknown): Promise<Record<string, unknown>> {
+  const args = lockInspectArgsSchema.parse(argsInput);
+  return { run_dir: args.run_dir, ...(await inspectRunLock(args.run_dir)) };
+}
+
+export async function deepthonkLockReclaim(argsInput: unknown): Promise<Record<string, unknown>> {
+  const args = lockReclaimArgsSchema.parse(argsInput);
+  return {
+    run_dir: args.run_dir,
+    fingerprint: args.fingerprint,
+    reclaimed: await reclaimRunLock(args.run_dir, args.fingerprint)
+  };
+}
+
+export async function deepthonkRepairBudget(argsInput: unknown): Promise<Record<string, unknown>> {
+  const args = repairBudgetArgsSchema.parse(argsInput);
+  return { run_dir: args.run_dir, repaired: await repairLegacyBudgetConfig(args.run_dir, args.replacements) };
 }
 
 export async function deepthonkResult(argsInput: unknown): Promise<Record<string, unknown>> {
@@ -426,11 +582,20 @@ export async function deepthonkResult(argsInput: unknown): Promise<Record<string
   const summary = await exportRun(runDir, "json");
   const runId = typeof summary.run_id === "string" ? summary.run_id : status?.run_id;
   if (runId) await recordRunResource(runId, runDir);
-  return {
+  const fullResult = {
     complete: true,
     run_id: runId,
     run_dir: runDir,
     summary,
+    summary_resource: runId ? `deepthonk://runs/${runId}/summary` : undefined,
+    trace_resource: runId ? `deepthonk://runs/${runId}/trace` : undefined
+  };
+  if (Buffer.byteLength(JSON.stringify(fullResult), "utf8") <= MAX_RESOURCE_BYTES) return fullResult;
+  return {
+    complete: true,
+    run_id: runId,
+    run_dir: runDir,
+    summary_omitted: true,
     summary_resource: runId ? `deepthonk://runs/${runId}/summary` : undefined,
     trace_resource: runId ? `deepthonk://runs/${runId}/trace` : undefined
   };
@@ -451,6 +616,7 @@ export async function deepthonkCancel(argsInput: unknown): Promise<Record<string
 
 export async function deepthonkRun(argsInput: unknown, context?: McpSamplingContext): Promise<Record<string, unknown>> {
   const { runConfig, providerConfig } = await resolveMcpRun(argsInput, context);
+  rejectHttpBlockingSamplingForPatch(providerConfig, context);
   const result = await runDeepThonk(runConfig, createDriver(providerConfig), {
     shouldCancel: () => isRunCancelRequested(runConfig.runDir)
   });
@@ -473,9 +639,10 @@ async function resolveMcpRun(argsInput: unknown, context?: McpSamplingContext): 
   const baseProfile = getProfile(profileName);
   const profile = mergeProfileOverrides(baseProfile, config.algorithm, args);
   const providerConfig = resolveMcpProviderConfig(args, raw, config, context?.createMessage);
+  assertSupportedSamplingRoutes(providerConfig);
   assertSamplingCapability(providerConfig, context);
   const models = providerConfig.models;
-  const runDir = args.run_dir ?? `runs/mcp-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const runDir = args.run_dir ?? (args.run_id ? `runs/${args.run_id}` : `runs/mcp-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`);
   const promptOverrides = mergePromptOverrides(config.prompts, args.prompts);
   const concurrency = capSamplingConcurrency(providerConfig.provider, profile, {
     generate: args.concurrency?.generate ?? config.concurrency?.generate ?? profile.n,
@@ -484,16 +651,17 @@ async function resolveMcpRun(argsInput: unknown, context?: McpSamplingContext): 
   });
   return {
     runConfig: {
+      runId: args.run_id,
       task: args.task,
       rubric: args.rubric,
       promptStyle: args.prompt_style ?? config.prompt_style ?? (profileName === "paper" ? "paper-programming" : "general"),
       promptOverrides,
       profile,
       runDir,
-	      seed: args.seed,
-	      provider: providerConfig.provider,
-	      providerReplay: providerReplayFromConfig(providerConfig),
-	      generatorModel: models.generator,
+      seed: args.seed,
+      provider: providerConfig.provider,
+      providerReplay: providerReplayFromConfig(providerConfig),
+      generatorModel: models.generator,
       mutatorModel: models.mutator,
       judgeModel: models.judge,
       finalizerModel: models.finalizer,
@@ -523,7 +691,9 @@ export async function deepthonkRank(argsInput: unknown, context?: McpSamplingCon
   const raw = objectInput(argsInput);
   const oneShot = await resolveMcpOneShot(args, raw, context?.createMessage);
   const providerConfig = oneShot.providerConfig;
+  assertSupportedSamplingRoutes(providerConfig);
   assertSamplingCapability(providerConfig, context);
+  rejectHttpBlockingSamplingForPatch(providerConfig, context);
   const models = providerConfig.models;
   const driver = createDriver(providerConfig);
   const candidates: CandidateInput[] = args.candidates;
@@ -548,6 +718,7 @@ export async function deepthonkMutate(argsInput: unknown, context?: McpSamplingC
   const raw = objectInput(argsInput);
   const oneShot = await resolveMcpOneShot(args, raw, context?.createMessage);
   const providerConfig = oneShot.providerConfig;
+  assertSupportedSamplingRoutes(providerConfig);
   assertSamplingCapability(providerConfig, context);
   const models = providerConfig.models;
   return {
@@ -570,8 +741,8 @@ export async function deepthonkResume(argsInput: unknown, context?: McpSamplingC
   if (args.continue === true) {
     const raw = JSON.parse(await readFile(join(args.run_dir, "config.json"), "utf8")) as unknown;
     const config = runConfigSchema.parse(raw);
-    const providerConfig = config.providerReplay
-      ? providerConfigFromReplay(config.providerReplay, config.retry, config.providerReplay.provider === "sampling" ? context?.createMessage : undefined)
+    const replayedProvider = config.providerReplay
+      ? providerConfigFromReplay(parseProviderReplay(config.providerReplay)!, config.retry)
       : resolveProviderConfig({
           provider: config.provider,
           models: {
@@ -583,7 +754,12 @@ export async function deepthonkResume(argsInput: unknown, context?: McpSamplingC
           retry: config.retry,
           samplingTransport: config.provider === "sampling" ? context?.createMessage : undefined
         });
+    const providerConfig = replayedProvider.provider === "sampling"
+      ? { ...replayedProvider, samplingTransport: context?.createMessage }
+      : replayedProvider;
+    assertSupportedSamplingRoutes(providerConfig);
     assertSamplingCapability(providerConfig, context);
+    rejectHttpBlockingSamplingForPatch(providerConfig, context);
     const result = await resumeDeepThonk(args.run_dir, createDriver(providerConfig), { provider: providerConfig.provider });
     if ("winner" in result) {
       return {
@@ -650,23 +826,22 @@ function resolveMcpProviderConfig(
   samplingTransport?: SamplingTransport
 ): ProviderConfig {
   const provider = String(raw.provider ?? config.provider ?? args.provider);
+  const providerChanged = raw.provider !== undefined && raw.provider !== config.provider;
+  const baseUrlChanged = raw.base_url !== undefined && raw.base_url !== config.base_url;
+  const isolateFileRoute = providerChanged || baseUrlChanged;
   const resolved = resolveProviderConfig({
     provider,
-    baseUrl: args.base_url ?? config.base_url,
-    apiKeyEnv: args.api_key_env ?? config.api_key_env,
-    supportsJsonMode: args.supports_json_mode ?? config.supports_json_mode,
+    baseUrl: args.base_url ?? (isolateFileRoute ? undefined : config.base_url),
+    apiKeyEnv: args.api_key_env ?? (isolateFileRoute ? undefined : config.api_key_env),
+    supportsJsonMode: args.supports_json_mode ?? (isolateFileRoute ? undefined : config.supports_json_mode),
     models: {
-      generator: args.generator_model ?? config.models?.generator,
-      mutator: args.mutator_model ?? config.models?.mutator,
-      judge: args.judge_model ?? config.models?.judge,
-      finalizer: args.finalizer_model ?? config.models?.finalizer
+      generator: args.generator_model ?? (isolateFileRoute ? undefined : config.models?.generator),
+      mutator: args.mutator_model ?? (isolateFileRoute ? undefined : config.models?.mutator),
+      judge: args.judge_model ?? (isolateFileRoute ? undefined : config.models?.judge),
+      finalizer: args.finalizer_model ?? (isolateFileRoute ? undefined : config.models?.finalizer)
     },
-    roleProviders: normalizeRoleProviders(config.providers, resolveProviderModels(provider, {
-      generator: args.generator_model ?? config.models?.generator,
-      mutator: args.mutator_model ?? config.models?.mutator,
-      judge: args.judge_model ?? config.models?.judge,
-      finalizer: args.finalizer_model ?? config.models?.finalizer
-    }), args.supports_json_mode ?? config.supports_json_mode),
+    roleProviders: isolateFileRoute ? undefined : normalizeRoleProviders(config.providers),
+    inheritProviderDefaults: !baseUrlChanged,
     retry: { httpRetries: 2, requestTimeoutMs: args.request_timeout_ms ?? config.retry?.requestTimeoutMs }
   });
   if (provider !== "sampling") return resolved;
@@ -694,7 +869,7 @@ type ProviderResolutionArgs = z.infer<typeof providerArgsSchema> &
   >;
 
 function assertSamplingCapability(providerConfig: ProviderConfig, context?: McpSamplingContext): void {
-  if (providerConfig.provider !== "sampling") return;
+  if (!providerConfigUsesSampling(providerConfig)) return;
   const capabilities = context?.getClientCapabilities();
   if (!capabilities?.sampling) {
     throw new ConfigError("Connected MCP client does not advertise sampling capability. This client cannot serve as a sampling provider.", {
@@ -703,6 +878,34 @@ function assertSamplingCapability(providerConfig: ProviderConfig, context?: McpS
       fix: "Use an MCP client that supports sampling, or choose a direct provider such as deepseek, openrouter, or openai-compatible."
     });
   }
+}
+
+function rejectHttpBlockingSamplingForPatch(providerConfig: ProviderConfig, context?: McpSamplingContext): void {
+  if (context?.transport !== "http" || !providerConfigUsesSampling(providerConfig)) return;
+  throw new ConfigError("Blocking MCP Sampling over Streamable HTTP is not enabled in the v0.1 patch line.", {
+    code: "mcp.http_sampling_requires_v0_2",
+    retryable: false,
+    fix: "Use stdio Sampling, use a direct provider over HTTP, or upgrade to DeepThonk v0.2.0."
+  });
+}
+
+function assertSupportedSamplingRoutes(providerConfig: ProviderConfig): void {
+  const roleRoutes = Object.entries(providerConfig.roleProviders ?? {});
+  if (roleRoutes.length === 0) return;
+  const samplingRoles = roleRoutes.filter(([, route]) => route?.provider === "sampling").map(([role]) => role);
+  const directRoles = roleRoutes.filter(([, route]) => route?.provider !== "sampling").map(([role]) => role);
+  if (samplingRoles.length === 0 && providerConfig.provider !== "sampling") return;
+  const mixed = providerConfig.provider !== "sampling" || directRoles.length > 0;
+  throw new ConfigError(
+    mixed
+      ? `Mixed MCP Sampling/direct role routes are unsupported (Sampling roles: ${samplingRoles.join(", ") || "base"}).`
+      : "Role-specific MCP Sampling routes are unsupported; use Sampling as the single base provider.",
+    {
+      code: mixed ? "provider.mixed_sampling_routes_unsupported" : "provider.sampling_role_routes_unsupported",
+      retryable: false,
+      fix: "Use provider: sampling without providers role overrides, or use direct providers for every route."
+    }
+  );
 }
 
 function capSamplingConcurrency(
@@ -723,56 +926,6 @@ function capOneShotConcurrency(provider: string, concurrency: number): number {
   return provider === "sampling" ? Math.min(concurrency, 4) : concurrency;
 }
 
-function providerReplayFromConfig(config: ProviderConfig): NonNullable<Parameters<typeof runDeepThonk>[0]["providerReplay"]> {
-  const replay: NonNullable<Parameters<typeof runDeepThonk>[0]["providerReplay"]> = {
-    provider: config.provider,
-    baseUrl: config.baseUrl,
-    apiKeyEnv: config.apiKeyEnv,
-    supportsJsonMode: config.supportsJsonMode,
-    models: {
-      generator: config.models.generator,
-      mutator: config.models.mutator,
-      judge: config.models.judge,
-      finalizer: config.models.finalizer
-    }
-  };
-  const roleProviders = replayRoleProviders(config);
-  if (roleProviders) replay.roleProviders = roleProviders;
-  return replay;
-}
-
-function replayRoleProviders(config: ProviderConfig): NonNullable<Parameters<typeof runDeepThonk>[0]["providerReplay"]>["roleProviders"] {
-  if (!config.roleProviders) return undefined;
-  const entries = Object.entries(config.roleProviders).map(([role, roleConfig]) => [
-    role,
-    {
-      provider: roleConfig.provider,
-      baseUrl: roleConfig.baseUrl,
-      apiKeyEnv: roleConfig.apiKeyEnv,
-      model: roleConfig.model,
-      supportsJsonMode: roleConfig.supportsJsonMode
-    }
-  ]);
-  return entries.length ? Object.fromEntries(entries) : undefined;
-}
-
-function providerConfigFromReplay(
-  replay: NonNullable<Parameters<typeof runDeepThonk>[0]["providerReplay"]>,
-  retry: Parameters<typeof runDeepThonk>[0]["retry"],
-  samplingTransport?: SamplingTransport
-): ProviderConfig {
-  return resolveProviderConfig({
-    provider: replay.provider,
-    baseUrl: replay.baseUrl,
-    apiKeyEnv: replay.apiKeyEnv,
-    supportsJsonMode: replay.supportsJsonMode,
-    models: replay.models,
-    roleProviders: replay.roleProviders,
-    retry,
-    samplingTransport
-  });
-}
-
 export function toolResult(value: unknown): { structuredContent: Record<string, unknown>; content: Array<{ type: "text"; text: string }> } {
   const structuredContent = typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : { value };
   return { structuredContent, content: [{ type: "text", text: summarizeToolResult(structuredContent) }] };
@@ -780,29 +933,13 @@ export function toolResult(value: unknown): { structuredContent: Record<string, 
 
 export function toolError(error: unknown, runDir?: string): {
   isError: true;
-  structuredContent: Record<string, unknown>;
   content: Array<{ type: "text"; text: string }>;
 } {
   const structuredContent = serializeToolError(error, runDir);
-  return { isError: true, structuredContent, content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }] };
+  return { isError: true, content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }] };
 }
 
-interface RawMcpConfig {
-  profile?: BuiltInProfileName;
-  provider?: string;
-  base_url?: string;
-  api_key_env?: string;
-  supports_json_mode?: boolean;
-  models?: { generator?: string; mutator?: string; judge?: string; finalizer?: string };
-  providers?: Record<string, { provider?: string; base_url?: string; api_key_env?: string; model?: string; supports_json_mode?: boolean }>;
-  concurrency?: Partial<Parameters<typeof runDeepThonk>[0]["concurrency"]>;
-  retry?: Partial<Parameters<typeof runDeepThonk>[0]["retry"]>;
-  budget?: Parameters<typeof runDeepThonk>[0]["budget"];
-  output?: Partial<Parameters<typeof runDeepThonk>[0]["output"]>;
-  prompt_style?: Parameters<typeof runDeepThonk>[0]["promptStyle"];
-  algorithm?: McpAlgorithmOverrides;
-  prompts?: McpPromptOverrides;
-}
+type RawMcpConfig = ExternalConfigFile;
 
 interface McpPromptOverrides {
   generate?: { system?: string; user?: string };
@@ -863,10 +1000,10 @@ async function readMcpConfig(path?: string, profileName?: string): Promise<RawMc
         fix: "Choose one: profile_name to load a saved bundle, or config_path to point at a config YAML."
       });
     }
-    return (await loadNamedProfile(profileName)) as RawMcpConfig;
+    return normalizeExternalConfig(await loadNamedProfile(profileName), `named profile '${profileName}'`);
   }
   if (!path) return {};
-  return YAML.parse(await readFile(resolveMcpPath(path), "utf8")) as RawMcpConfig;
+  return normalizeExternalConfig(YAML.parse(await readFile(resolveMcpPath(path), "utf8")), path);
 }
 
 async function resolveJobRunDir(args: z.infer<typeof jobArgsSchema>): Promise<string> {
@@ -893,23 +1030,19 @@ function resolveMcpPath(path: string): string {
 }
 
 function normalizeRoleProviders(
-  providers: RawMcpConfig["providers"],
-  models: ProviderConfig["models"],
-  baseSupportsJsonMode?: boolean
+  providers: RawMcpConfig["providers"]
 ): Parameters<typeof resolveProviderConfig>[0]["roleProviders"] {
   if (!providers) return undefined;
   const normalized: Parameters<typeof resolveProviderConfig>[0]["roleProviders"] = {};
   for (const role of ["generator", "mutator", "judge", "finalizer"] as const) {
     const provider = providers[role];
     if (!provider) continue;
-    const model = provider.model ?? models[role];
-    if (!model) continue;
     normalized[role] = {
       provider: provider.provider,
       baseUrl: provider.base_url,
       apiKeyEnv: provider.api_key_env,
-      model,
-      supportsJsonMode: provider.supports_json_mode ?? baseSupportsJsonMode
+      model: provider.model,
+      supportsJsonMode: provider.supports_json_mode
     };
   }
   return Object.keys(normalized).length ? normalized : undefined;

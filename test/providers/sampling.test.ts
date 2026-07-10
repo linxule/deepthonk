@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { getEventListeners } from "node:events";
 import { ConfigError, ProviderError } from "@deepthonk/core";
 import { SamplingDriver, buildModelPreferences, createDriver } from "@deepthonk/providers";
 import type { CreateMessageRequestParamsBase, CreateMessageResult } from "@modelcontextprotocol/sdk/types.js";
@@ -36,6 +37,7 @@ describe("SamplingDriver", () => {
 
     expect(createMessage).toHaveBeenCalledTimes(4);
     expect(createMessage.mock.calls.map(([params]) => params.temperature)).toEqual([0.7, 0.1, 0.9, 0.2]);
+    expect(createMessage.mock.calls.map(([params]) => params.maxTokens)).toEqual([4096, 1024, 4096, 4096]);
     expect(createMessage.mock.calls.map(([params]) => params.systemPrompt)).toEqual(["system-g", "system-c", "system-m", "system-f"]);
     expect(createMessage.mock.calls.map(([params]) => textMessage(params))).toEqual(["user-g", "user-c", "user-m", "user-f"]);
     expect(createMessage.mock.calls[0]?.[0].modelPreferences?.hints).toEqual([{ name: "generate-model" }]);
@@ -111,14 +113,16 @@ describe("SamplingDriver", () => {
     expect(Date.now() - start).toBeLessThan(500);
   });
 
-  it("rejects oversized host responses via the JSON extraction cap", async () => {
-    const enormous = "a".repeat(150_000) + '{"winner":"A","feedback_a":"x","feedback_b":"y"}';
+  it("rejects oversized host responses before returning model text", async () => {
+    const enormous = "a".repeat(1024 * 1024 + 1) + '{"winner":"A","feedback_a":"x","feedback_b":"y"}';
     const driver = new SamplingDriver(async () => textResult(enormous));
-    await expect(
-      driver.compare({ task: "t", model: "m", temperature: 0, prompt: { system: "", user: "u" }, candidateA: { id: "a", content: "" }, candidateB: { id: "b", content: "" } })
-    ).resolves.toMatchObject({ provider: "sampling" });
-    // The compare path uses extractJsonTextOrOriginal which catches errors and returns the original text.
-    // Verify the extractor itself rejects oversized text by importing it directly.
+    let error: unknown;
+    try {
+      await driver.compare({ task: "t", model: "m", temperature: 0, prompt: { system: "", user: "u" }, candidateA: { id: "a", content: "" }, candidateB: { id: "b", content: "" } });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ code: "provider.response_too_large" });
     const { extractJsonObjectText } = await import("@deepthonk/providers");
     expect(() => extractJsonObjectText(enormous)).toThrow(/exceeds .* JSON extraction cap/);
   });
@@ -136,6 +140,21 @@ describe("SamplingDriver", () => {
         models: { generator: "sampling", mutator: "sampling", judge: "sampling" }
       })
     ).toThrow(ConfigError);
+  });
+
+  it("removes run abort listeners after successful sampling calls", async () => {
+    const controller = new AbortController();
+    const driver = new SamplingDriver(async () => textResult("ok"));
+    for (let index = 0; index < 20; index += 1) {
+      await driver.generate({
+        task: "t",
+        model: "m",
+        temperature: 0,
+        prompt: { system: "s", user: "u" },
+        signal: controller.signal
+      });
+    }
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
   });
 });
 

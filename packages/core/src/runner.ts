@@ -1,20 +1,24 @@
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { fitBradleyTerry } from "./bradleyTerry.js";
 import { BudgetTracker } from "./budgetTracker.js";
+import type { CallReservation } from "./budgetTracker.js";
 import { planBudget, validateProfile } from "./budget.js";
 import { BudgetExceededError, CancelledError, ConfigError, DeepThonkError } from "./errors.js";
 import { runArtifactFiles } from "./artifacts.js";
 import { parseJsonObject } from "./json.js";
 import {
-  claimRunLock,
+  claimRunLockOwnership,
   emptyUsage,
   releaseRunLock,
+  verifyRunLockClaim,
   type BudgetUsage,
   type CallRole,
   type RunLifecycleState,
   type RunStatus,
+  type RunLockClaim,
   type UsageDelta,
   type UsageRecord
 } from "./lifecycle.js";
@@ -24,6 +28,7 @@ import { comparePrompt, finalizePrompt, generatePrompt, mutatePrompt } from "./p
 import { createRng, type Rng } from "./rng.js";
 import {
   assertNoPruneInProgress,
+  assertNoLegacyRedactedBudget,
   buildPopulationMap,
   buildResumePlan,
   groupComparisons,
@@ -66,7 +71,7 @@ const compareOutputSchema = z.object({
 
 export interface RunControl {
   jobId?: string;
-  lockClaimed?: boolean;
+  lockClaim?: RunLockClaim;
   shouldCancel?: () => boolean | Promise<boolean>;
 }
 
@@ -100,7 +105,7 @@ export interface ResumePlan {
 }
 
 interface RunGuards {
-  beforeCall(phase: string): Promise<void>;
+  beforeCall(phase: string): Promise<CallReservation>;
   afterCall(phase: string): Promise<void>;
 }
 
@@ -125,22 +130,39 @@ export async function runDeepThonk(
   validateProfile(config.profile);
   enforceBudget(config);
 
-  const runId = resumeState?.runId ?? `run_${new Date().toISOString().replace(/[:.]/g, "-")}_${Math.abs(config.seed)}`;
+  const runId =
+    resumeState?.runId ??
+    config.runId ??
+    `run_${new Date().toISOString().replace(/[:.]/g, "-")}_${randomUUID()}`;
   const trace = new TraceStore(config.runDir);
   const rng = createRng(config.seed);
   const tracker = resumeState?.tracker ?? new BudgetTracker(config);
   const startedAt = resumeState?.startedAt ?? new Date().toISOString();
   let ownsLock = false;
-  if (!resumeState && !control.lockClaimed) {
-    const claimed = await claimRunLock(config.runDir, control.jobId ?? runId);
-    if (!claimed) {
-      throw new ConfigError(`Run directory is already claimed: ${config.runDir}`, {
-        code: "run.directory_locked",
-        retryable: false,
-        fix: "Wait for the active run to finish, or choose a fresh run directory."
-      });
+  let ownedLockClaimId: string | undefined;
+  let verifiedPreclaim = false;
+  if (!resumeState) {
+    if (control.lockClaim) {
+      verifiedPreclaim = await verifyRunLockClaim(config.runDir, control.lockClaim, control.jobId);
+      if (!verifiedPreclaim) {
+        throw new ConfigError("The supplied run lock claim does not own the current run.lock.", {
+          code: "run.lock_not_owned",
+          retryable: false,
+          fix: "Claim the run directory with claimRunLockOwnership and pass that exact claim to the worker."
+        });
+      }
+    } else {
+      const claimed = await claimRunLockOwnership(config.runDir, control.jobId ?? runId);
+      if (!claimed) {
+        throw new ConfigError(`Run directory is already claimed: ${config.runDir}`, {
+          code: "run.directory_locked",
+          retryable: false,
+          fix: "Wait for the active run to finish, or choose a fresh run directory."
+        });
+      }
+      ownsLock = true;
+      ownedLockClaimId = claimed.claimId;
     }
-    ownsLock = true;
   }
   let stopped = false;
   let caughtError: unknown;
@@ -185,10 +207,11 @@ export async function runDeepThonk(
     }
   };
   const guards: RunGuards = {
-    async beforeCall(phase: string): Promise<void> {
+    async beforeCall(phase: string): Promise<CallReservation> {
       if (stopped) throw new BudgetExceededError(`Run already stopped before ${phase}.`, { code: "budget.stopped" });
       await assertNotCancelled(phase);
       await assertBudget(phase);
+      return tracker.reserveCall(phase);
     },
     async afterCall(phase: string): Promise<void> {
       await assertNotCancelled(phase);
@@ -198,7 +221,11 @@ export async function runDeepThonk(
 
   try {
     if (!resumeState) {
-      await trace.init({ ...config, version: await currentPackageVersion() }, runId);
+      await trace.init(
+        { ...config, version: await currentPackageVersion() },
+        runId,
+        { allowOwnedLock: ownsLock || verifiedPreclaim, pendingJobId: verifiedPreclaim ? control.jobId : undefined }
+      );
     } else {
       await trace.event({
         type: "run.resumed",
@@ -374,7 +401,7 @@ export async function runDeepThonk(
   } finally {
     if (ownsLock) {
       try {
-        await releaseRunLock(config.runDir);
+        await releaseRunLock(config.runDir, ownedLockClaimId);
       } catch (error) {
         if (caughtError !== undefined) {
           process.stderr.write(`deepthonk: failed to release run lock: ${(error as Error).message}\n`);
@@ -401,6 +428,7 @@ export async function resumeDeepThonk(
   }
 
   const rawConfig = await readRequiredConfig(runDir);
+  assertNoLegacyRedactedBudget(rawConfig);
   const currentVersion = await currentPackageVersion();
   if (!sameMajorMinor(typeof rawConfig.version === "string" ? rawConfig.version : undefined, currentVersion)) {
     resumeConfigError(
@@ -418,7 +446,7 @@ export async function resumeDeepThonk(
   assertResumeProviderMatches(rawConfig, config, driver, options);
   assertNoPruneInProgress(runDir);
   const lockRunId = resolveResumeRunId(config, undefined, []);
-  const claimed = await claimRunLock(runDir, lockRunId);
+  const claimed = await claimRunLockOwnership(runDir, lockRunId);
   if (!claimed) {
     throw new ConfigError(`Run directory is already claimed: ${runDir}`, {
       code: "run.directory_locked",
@@ -449,12 +477,13 @@ export async function resumeDeepThonk(
     }
 
     const planStatus = toResumePlanStatus(runDir, runId, plan);
-    if (options.dryRun) return planStatus;
-
     const pruned = pruneTraceToPlan(trace, plan);
+    assertResumeRunIdsAgree(runId, config, status, pruned);
     const populationByGeneration = buildPopulationMap(config, pruned.populations, pruned.candidates, plan);
     const comparisonsByGeneration = groupComparisons(pruned.comparisons);
-    const scoresByGeneration = reconstructScores(config, populationByGeneration, comparisonsByGeneration, pruned.scores, plan);
+    const scoresByGeneration = reconstructScores(config, populationByGeneration, comparisonsByGeneration, pruned.scores, plan, runId);
+    if (options.dryRun) return planStatus;
+
     const tracker = replayBudgetUsage(config, pruned.usage);
     const startedAt = status?.started_at ?? new Date().toISOString();
     await new TraceStore(runDir).writeStatus({
@@ -480,7 +509,32 @@ export async function resumeDeepThonk(
       nextPhase: plan.nextPhase
     });
   } finally {
-    await releaseRunLock(runDir);
+    await releaseRunLock(runDir, claimed?.claimId);
+  }
+}
+
+function assertResumeRunIdsAgree(
+  resolvedRunId: string,
+  config: RunConfig,
+  status: RunStatus | undefined,
+  trace: Awaited<ReturnType<typeof readResumeTrace>>
+): void {
+  const observed = new Set<string>();
+  if (config.runId) observed.add(config.runId);
+  if (status?.run_id) observed.add(status.run_id);
+  for (const event of trace.events) {
+    if (typeof event.run_id === "string") observed.add(event.run_id);
+  }
+  for (const comparison of trace.comparisons) {
+    if (comparison.runId) observed.add(comparison.runId);
+  }
+  observed.add(resolvedRunId);
+  if (observed.size > 1) {
+    resumeConfigError(
+      `Resume artifacts disagree on run ID: ${[...observed].sort().join(", ")}.`,
+      "resume.run_id_mismatch",
+      "Restore artifacts from one run; do not combine trace files from different run directories."
+    );
   }
 }
 
@@ -580,9 +634,22 @@ function assertResumeProviderMatches(
   driver: ModelDriver,
   options: ResumeDeepThonkOptions
 ): void {
+  assertProviderReplayInternalConsistency(config);
   const runtimeProvider = options.provider ?? providerLabel(driver) ?? config.provider;
   if (runtimeProvider !== config.provider) {
     providerMismatch(`Cannot resume provider ${config.provider} with runtime provider ${runtimeProvider}.`);
+  }
+  const expectedFingerprint = config.providerReplay?.routeFingerprint;
+  if (expectedFingerprint !== undefined && providerRouteFingerprint(driver) !== expectedFingerprint) {
+    providerMismatch("Cannot resume because the provider route fingerprint changed.");
+  }
+  if (
+    config.providerReplay?.baseUrl !== undefined &&
+    normalizeBaseUrl(providerBaseUrl(driver)) !== normalizeBaseUrl(config.providerReplay.baseUrl)
+  ) {
+    providerMismatch(
+      `Cannot resume base URL ${config.providerReplay.baseUrl} with runtime base URL ${providerBaseUrl(driver) ?? "missing"}.`
+    );
   }
 
   const expectedRoutes = expectedProviderRoutes(rawConfig, config);
@@ -606,9 +673,113 @@ function assertResumeProviderMatches(
   }
 }
 
+function assertProviderReplayInternalConsistency(config: RunConfig): void {
+  const replay = config.providerReplay;
+  if (!replay) return;
+  const expectedModels = {
+    generator: config.generatorModel,
+    mutator: config.mutatorModel,
+    judge: config.judgeModel,
+    finalizer: config.finalizerModel
+  };
+  if (
+    replay.provider !== config.provider ||
+    replay.models.generator !== expectedModels.generator ||
+    replay.models.mutator !== expectedModels.mutator ||
+    replay.models.judge !== expectedModels.judge ||
+    replay.models.finalizer !== expectedModels.finalizer
+  ) {
+    resumeConfigError(
+      "Stored run provider/model fields disagree with providerReplay.",
+      "resume.provider_replay_mismatch",
+      "Restore config.json from the original run; do not edit provider or model fields independently."
+    );
+  }
+  if (replay.routeFingerprint !== undefined && replay.routeFingerprint !== coreProviderReplayFingerprint(replay)) {
+    resumeConfigError(
+      "Stored providerReplay fingerprint does not match its route fields.",
+      "resume.provider_replay_mismatch",
+      "Restore the original providerReplay block instead of editing route fields."
+    );
+  }
+}
+
+function coreProviderReplayFingerprint(replay: NonNullable<RunConfig["providerReplay"]>): string {
+  const roles = Object.fromEntries(
+    providerRoles.flatMap((role) => {
+      const route = replay.roleProviders?.[role];
+      return route
+        ? [[role, routeFingerprintValue(route.provider, route.baseUrl, route.apiKeyEnv, route.model, route.supportsJsonMode)] as const]
+        : [];
+    })
+  );
+  const value = {
+    base: routeFingerprintValue(replay.provider, replay.baseUrl, replay.apiKeyEnv, replay.models, replay.supportsJsonMode),
+    roles,
+    samplingPreferences: replay.samplingPreferences ?? null
+  };
+  return `sha256:${createHash("sha256").update(stableJson(value)).digest("hex")}`;
+}
+
+function routeFingerprintValue(
+  provider: string,
+  baseUrl: string | undefined,
+  apiKeyEnv: string | undefined,
+  model: string | NonNullable<RunConfig["providerReplay"]>["models"],
+  supportsJsonMode: boolean | undefined
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries({
+      provider,
+      baseUrl: normalizeFingerprintUrl(baseUrl),
+      apiKeyEnv,
+      model,
+      supportsJsonMode
+    }).filter(([, value]) => value !== undefined)
+  );
+}
+
+function normalizeFingerprintUrl(baseUrl: string | undefined): string | undefined {
+  if (!baseUrl) return undefined;
+  try {
+    const parsed = new URL(baseUrl);
+    parsed.hash = "";
+    parsed.hostname = parsed.hostname.toLowerCase();
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return baseUrl.replace(/\/+$/, "");
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, inner]) => `${JSON.stringify(key)}:${stableJson(inner)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 const providerRoles = ["generator", "mutator", "judge", "finalizer"] as const satisfies readonly ProviderRole[];
 
 function expectedProviderRoutes(rawConfig: Record<string, unknown>, config: RunConfig): Partial<Record<ProviderRole, ProviderRouteFingerprint>> {
+  const replayRoutes = config.providerReplay?.roleProviders;
+  if (replayRoutes) {
+    const routes: Partial<Record<ProviderRole, ProviderRouteFingerprint>> = {};
+    for (const role of providerRoles) {
+      const route = replayRoutes[role];
+      if (!route) continue;
+      routes[role] = {
+        provider: route.provider,
+        baseUrl: route.baseUrl,
+        model: route.model
+      };
+    }
+    return routes;
+  }
   const providers = rawConfig.providers;
   if (!isRecord(providers)) return {};
   const routes: Partial<Record<ProviderRole, ProviderRouteFingerprint>> = {};
@@ -639,6 +810,14 @@ function runtimeProviderRoutes(driver: ModelDriver): Partial<Record<ProviderRole
     };
   }
   return routes;
+}
+
+function providerRouteFingerprint(driver: ModelDriver): string | undefined {
+  const value = driver as { routeFingerprint?: unknown; config?: { routeFingerprint?: unknown }; baseDriver?: ModelDriver };
+  if (typeof value.routeFingerprint === "string") return value.routeFingerprint;
+  if (typeof value.config?.routeFingerprint === "string") return value.config.routeFingerprint;
+  if (value.baseDriver) return providerRouteFingerprint(value.baseDriver);
+  return undefined;
 }
 
 function providerBaseUrl(driver: ModelDriver): string | undefined {
@@ -702,8 +881,8 @@ function isLiveWorker(pid: number | undefined): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
@@ -780,16 +959,31 @@ async function generateInitialPopulation(
   }));
   const candidates = await runLimitedPhase(
     jobs.map((job) => async () => {
-        await guards.beforeCall("initial population call");
-        const result = await driver.generate({
-          task: config.task,
-          rubric: config.rubric,
-          model: config.generatorModel,
-          temperature: config.profile.sampleTemperature,
-          candidateIndex: job.index,
-          prompt: job.prompt
-        });
-        const delta = tracker.record(result, { provider: config.provider, model: config.generatorModel });
+        const reservation = await guards.beforeCall("initial population call");
+        let result: ModelTextResult;
+        try {
+          result = await driver.generate({
+            task: config.task,
+            rubric: config.rubric,
+            model: config.generatorModel,
+            temperature: config.profile.sampleTemperature,
+            candidateIndex: job.index,
+            prompt: job.prompt
+          });
+        } catch (error) {
+          await recordFailedInvocation({
+            tracker,
+            reservation,
+            trace,
+            phase: "gen0_initial",
+            role: "generator",
+            provider: config.provider,
+            model: config.generatorModel,
+            error
+          });
+          throw error;
+        }
+        const delta = tracker.record(result, { provider: config.provider, model: config.generatorModel }, reservation);
         await trace.writeUsage(buildUsageRecord({
           phase: "gen0_initial",
           role: "generator",
@@ -862,17 +1056,32 @@ async function judgePairs(args: {
         let totalTokens = 0;
 
         for (let attempt = 0; attempt <= args.config.retry.invalidJsonRetries; attempt += 1) {
-          await args.guards.beforeCall(`${args.generation} comparison call`);
-          const result = await args.driver.compare({
-            task: args.config.task,
-            rubric: args.config.rubric,
-            model: args.config.judgeModel,
-            temperature: args.config.profile.judgeTemperature,
-            candidateA: job.presentedA,
-            candidateB: job.presentedB,
-            prompt: job.prompt
-          });
-          const delta = args.tracker.record(result, { provider: args.config.provider, model: args.config.judgeModel });
+          const reservation = await args.guards.beforeCall(`${args.generation} comparison call`);
+          let result: ModelTextResult;
+          try {
+            result = await args.driver.compare({
+              task: args.config.task,
+              rubric: args.config.rubric,
+              model: args.config.judgeModel,
+              temperature: args.config.profile.judgeTemperature,
+              candidateA: job.presentedA,
+              candidateB: job.presentedB,
+              prompt: job.prompt
+            });
+          } catch (error) {
+            await recordFailedInvocation({
+              tracker: args.tracker,
+              reservation,
+              trace: args.trace,
+              phase: args.generation === "final" ? "final_judge" : `gen${args.generation}_judge`,
+              role: "judge",
+              provider: args.config.provider,
+              model: args.config.judgeModel,
+              error
+            });
+            throw error;
+          }
+          const delta = args.tracker.record(result, { provider: args.config.provider, model: args.config.judgeModel }, reservation);
           await args.trace.writeUsage(buildUsageRecord({
             phase: args.generation === "final" ? "final_judge" : `gen${args.generation}_judge`,
             role: "judge",
@@ -920,11 +1129,11 @@ async function judgePairs(args: {
           candidateBId: job.presentedB.id,
           presentedAOriginalId: job.presentedA.id,
           presentedBOriginalId: job.presentedB.id,
-          winner: parsed?.winner ?? "tie",
-          confidence: parsed?.confidence,
-          critiqueForA: parsed?.feedback_a ?? parsed?.critique_for_A ?? "Invalid comparison JSON; recorded as tie.",
-          critiqueForB: parsed?.feedback_b ?? parsed?.critique_for_B ?? "Invalid comparison JSON; recorded as tie.",
-          selectionReason: parsed?.selection_reason ?? "invalid_json_tie",
+          winner: parsed.winner,
+          confidence: parsed.confidence,
+          critiqueForA: parsed.feedback_a ?? parsed.critique_for_A ?? "",
+          critiqueForB: parsed.feedback_b ?? parsed.critique_for_B ?? "",
+          selectionReason: parsed.selection_reason ?? "",
           rawOutput,
           model: resultModel,
           provider: resultProvider,
@@ -971,17 +1180,32 @@ async function mutateSurvivors(args: {
     args.survivors.map((candidate, index) => async () => {
         const critique = args.critiquesByCandidate.get(candidate.id) ?? "";
         const prompt = mutatePrompt(args.config.task, candidate, critique, args.config.rubric, args.config.promptStyle, args.config.promptOverrides?.mutate);
-        await args.guards.beforeCall(`generation ${args.generation} mutation call`);
-        const result = await args.driver.mutate({
-          task: args.config.task,
-          rubric: args.config.rubric,
-          model: args.config.mutatorModel,
-          temperature: args.config.profile.mutateTemperature,
-          candidate,
-          critique,
-          prompt
-        });
-        const delta = args.tracker.record(result, { provider: args.config.provider, model: args.config.mutatorModel });
+        const reservation = await args.guards.beforeCall(`generation ${args.generation} mutation call`);
+        let result: ModelTextResult;
+        try {
+          result = await args.driver.mutate({
+            task: args.config.task,
+            rubric: args.config.rubric,
+            model: args.config.mutatorModel,
+            temperature: args.config.profile.mutateTemperature,
+            candidate,
+            critique,
+            prompt
+          });
+        } catch (error) {
+          await recordFailedInvocation({
+            tracker: args.tracker,
+            reservation,
+            trace: args.trace,
+            phase: `gen${args.generation}_mutate`,
+            role: "mutator",
+            provider: args.config.provider,
+            model: args.config.mutatorModel,
+            error
+          });
+          throw error;
+        }
+        const delta = args.tracker.record(result, { provider: args.config.provider, model: args.config.mutatorModel }, reservation);
         await args.trace.writeUsage(buildUsageRecord({
           phase: `gen${args.generation}_mutate`,
           role: "mutator",
@@ -1018,15 +1242,30 @@ async function maybeFinalize(
   guards: RunGuards
 ): Promise<string> {
   if (!config.finalizerModel || !driver.finalize) return winner.content;
-  await guards.beforeCall("finalization call");
-  const result = await driver.finalize({
-    task: config.task,
-    rubric: config.rubric,
-    model: config.finalizerModel,
-    candidate: winner,
-    prompt: finalizePrompt(config.task, winner, config.rubric, config.promptStyle, config.promptOverrides?.finalize)
-  });
-  const delta = tracker.record(result, { provider: config.provider, model: config.finalizerModel });
+  const reservation = await guards.beforeCall("finalization call");
+  let result: ModelTextResult;
+  try {
+    result = await driver.finalize({
+      task: config.task,
+      rubric: config.rubric,
+      model: config.finalizerModel,
+      candidate: winner,
+      prompt: finalizePrompt(config.task, winner, config.rubric, config.promptStyle, config.promptOverrides?.finalize)
+    });
+  } catch (error) {
+    await recordFailedInvocation({
+      tracker,
+      reservation,
+      trace,
+      phase: "finalize",
+      role: "finalizer",
+      provider: config.provider,
+      model: config.finalizerModel,
+      error
+    });
+    throw error;
+  }
+  const delta = tracker.record(result, { provider: config.provider, model: config.finalizerModel }, reservation);
   await trace.writeUsage(buildUsageRecord({
     phase: "finalize",
     role: "finalizer",
@@ -1117,6 +1356,8 @@ function buildUsageRecord(args: {
   delta: UsageDelta;
   provider?: string;
   model?: string;
+  outcome?: "success" | "failed";
+  errorCode?: string;
 }): UsageRecord {
   return {
     schema_version: 1,
@@ -1134,19 +1375,45 @@ function buildUsageRecord(args: {
     output_usd: args.delta.outputUsd,
     total_usd: args.delta.usd,
     latency_ms: args.result.latencyMs,
-    retry_count: args.result.retryCount
+    retry_count: args.result.retryCount,
+    outcome: args.outcome,
+    error_code: args.errorCode
   };
 }
 
+async function recordFailedInvocation(args: {
+  tracker: BudgetTracker;
+  reservation: CallReservation;
+  trace: TraceStore;
+  phase: string;
+  role: CallRole;
+  provider?: string;
+  model: string;
+  error: unknown;
+}): Promise<void> {
+  const delta = args.tracker.failCall(args.reservation);
+  await bestEffortTraceWrite("failed call usage", () =>
+    args.trace.writeUsage(
+      buildUsageRecord({
+        phase: args.phase,
+        role: args.role,
+        result: { text: "" },
+        delta,
+        provider: args.provider,
+        model: args.model,
+        outcome: "failed",
+        errorCode: args.error instanceof DeepThonkError ? args.error.code : args.error instanceof Error ? args.error.name : "unknown_error"
+      })
+    )
+  );
+}
+
 function enforceBudget(config: RunConfig): void {
-  const plan = planBudget(config.profile);
-  // Each comparison call may fire up to invalidJsonRetries extra requests before the loop gives up.
-  // Include that worst-case headroom so a user who sets --max-calls = plan.calls isn't tripped by
-  // a single retry mid-run.
-  const judgeCalls = plan.per_generation_judge_calls * config.profile.t + plan.final_judge_calls;
-  const retryHeadroom = judgeCalls * config.retry.invalidJsonRetries;
-  const finalizerCalls = config.finalizerModel ? 1 : 0;
-  const plannedCalls = plan.calls + finalizerCalls + retryHeadroom;
+  const plan = planBudget(config.profile, {
+    invalidJsonRetries: config.retry.invalidJsonRetries,
+    includeFinalizer: Boolean(config.finalizerModel)
+  });
+  const plannedCalls = plan.calls + plan.finalizer_calls;
   if (config.budget?.maxCalls !== undefined && plannedCalls > config.budget.maxCalls) {
     throw new BudgetExceededError(`Planned call count ${plannedCalls} exceeds maxCalls ${config.budget.maxCalls}.`, {
       code: "budget.planned_calls_exceeded",

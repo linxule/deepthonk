@@ -6,8 +6,55 @@ import type { CompareInput, FinalizeInput, GenerateInput, ModelDriver, MutateInp
 
 export function createDriver(config: ProviderConfig): ModelDriver {
   const baseDriver = createSingleDriver({ ...config, roleProviders: undefined });
-  if (config.roleProviders) return new RoleRoutingDriver(baseDriver, config.roleProviders);
-  return baseDriver;
+  const driver = config.roleProviders ? new RoleRoutingDriver(baseDriver, config.roleProviders) : baseDriver;
+  if (config.routeFingerprint) {
+    Object.defineProperty(driver, "routeFingerprint", { value: config.routeFingerprint, enumerable: false });
+  }
+  return driver;
+}
+
+/** Route-only driver for validation and dry-run planning; every model method refuses execution. */
+export function createDriverIdentity(config: ProviderConfig): ModelDriver {
+  const unavailable = async (): Promise<never> => {
+    throw new ConfigError("A route-identity driver cannot make model calls.", {
+      code: "provider.identity_driver_call",
+      retryable: false,
+      fix: "Construct a real provider driver before executing the run."
+    });
+  };
+  const identity = {
+    provider: config.provider,
+    baseUrl: config.baseUrl,
+    routeFingerprint: config.routeFingerprint,
+    generate: unavailable,
+    compare: unavailable,
+    mutate: unavailable,
+    finalize: unavailable
+  } as ModelDriver & {
+    provider: string;
+    baseUrl?: string;
+    routeFingerprint?: string;
+    routes?: Partial<Record<ProviderRole, { driver: ModelDriver; model: string }>>;
+  };
+  if (config.roleProviders) {
+    identity.routes = Object.fromEntries(
+      Object.entries(config.roleProviders).map(([role, route]) => [
+        role,
+        {
+          driver: {
+            provider: route.provider,
+            baseUrl: route.baseUrl,
+            generate: unavailable,
+            compare: unavailable,
+            mutate: unavailable,
+            finalize: unavailable
+          } as ModelDriver,
+          model: route.model
+        }
+      ])
+    );
+  }
+  return identity;
 }
 
 function createSingleDriver(config: ProviderConfig): ModelDriver {

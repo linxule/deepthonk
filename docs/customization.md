@@ -27,6 +27,8 @@ MCP inline arguments override YAML where both are present.
 Prompt overrides merge by phase and field.
 For example, `prompts.compare.system` can replace only the compare system template while leaving the built-in compare user template intact.
 
+External YAML is canonical snake_case. Existing camelCase aliases remain accepted, but supplying both aliases with different values is an error. Unknown operational keys are rejected at every declared level; put arbitrary application annotations below `metadata`.
+
 ## Algorithm-shape overrides
 
 `n` is the population size.
@@ -88,12 +90,15 @@ Per-role provider routes can set `supports_json_mode` under `providers.generator
 If a provider returns a `400` or `422` response that rejects `response_format` or JSON mode, DeepThonk retries that call without JSON mode and remembers the provider does not support JSON mode for later comparison calls in the same process.
 
 CLI runs store a redacted `providerReplay` block in `config.json` so `deepthonk resume --continue` can reconstruct provider connection settings.
-The block contains provider label, base URL, API-key environment variable name, JSON-mode support, models, and role-provider routes.
+The block contains provider label, base URL, API-key environment variable name, JSON-mode support, models, role-provider routes, Sampling preferences, and a stable route fingerprint checked during resume.
 It never stores raw API-key values.
+Changing `--provider` or `--base-url` starts a new route source: DeepThonk does not inherit the replaced route's key environment, models, JSON-mode setting, or role overrides.
+
+If a v0.1.4 trace reports `resume.legacy_redacted_budget`, restore the exact original numbers with repeated CLI flags such as `deepthonk repair-budget <runDir> --set budget.maxOutputTokens=4096`, or MCP `deepthonk.repair_budget`. The repair refuses missing or unrelated fields and records a `config.repaired` event.
 
 ## MCP Sampling provider
 
-Use `provider: "sampling"` only inside an MCP host that can answer MCP Sampling `createMessage` requests. It lets DeepThonk use the host's model picker instead of a configured API key.
+Use `provider: "sampling"` only through stdio in the v0.1 patch line and only inside an MCP host that can answer Sampling `createMessage` requests. Streamable HTTP and mixed Sampling/direct role routes require direct providers in v0.1.
 Standalone CLI runs cannot use sampling; use `deepseek`, `openrouter`, or `openai-compatible` from the CLI.
 
 Sampling model fields are hints, not enforcement. `generator_model`, `mutator_model`, `judge_model`, and `finalizer_model` become per-role model hints, and MCP `sampling_model_hints` adds extra host-facing hints. A sampling-capable client may ignore any hint and choose another model.
@@ -102,7 +107,7 @@ Before a sampling run starts, the MCP server checks `server.getClientCapabilitie
 
 Sampling adds a host round trip for every model call, so latency depends on both DeepThonk's phase concurrency and the host's sampling queue. DeepThonk caps sampling concurrency at `min(n, 4)` even when higher per-phase concurrency is configured.
 
-MCP Sampling responses do not provide standardized token usage. DeepThonk records `inputTokens` and `outputTokens` as unavailable for sampling calls. `maxCalls` still works; token and USD caps can warn or become unenforceable unless the host/provider supplies usage through a direct provider mode.
+MCP Sampling responses do not provide standardized token usage. `maxCalls` still works, but DeepThonk rejects token/USD caps for Sampling rather than pretending they are enforceable.
 
 ## Prompt template variables
 
@@ -287,7 +292,7 @@ prompts:
       language. Do not include hidden chain-of-thought. Return the clause only.
 
 budget:
-  max_calls: 50
+  max_calls: 60
 ```
 
 Run it:

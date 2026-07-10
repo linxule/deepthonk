@@ -2,3 +2,5 @@ packages:
   - "packages/*"
 allowBuilds:
   esbuild: true
+overrides:
+  hono: 4.12.28

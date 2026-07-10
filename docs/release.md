@@ -38,7 +38,7 @@ Reference: https://docs.npmjs.com/trusted-publishers/
    npm view deepthonk version
    ```
 
-2. Choose the next unused version. All four published packages must use the same version. If npm currently shows `0.1.3`, use `0.1.4` for the next patch release.
+2. Choose the next unused version. All four published packages must use the same version; never reuse a partially published version.
 
 3. Update exactly these manifests:
 
@@ -58,6 +58,8 @@ Reference: https://docs.npmjs.com/trusted-publishers/
    pnpm run build
    pnpm run typecheck
    pnpm test
+   pnpm audit --prod --audit-level high
+   pnpm run bench:ci
    pnpm --silent --filter deepthonk deepthonk plan --profile paper
    rm -rf runs/test-quick
    pnpm --silent --filter deepthonk deepthonk run --provider fake --profile quick --task examples/tasks/toy-math.txt --out runs/test-quick
@@ -79,7 +81,7 @@ Reference: https://docs.npmjs.com/trusted-publishers/
    git push origin vX.Y.Z
    ```
 
-7. Watch the `Publish` GitHub Actions run. The workflow verifies build/typecheck/tests, checks that every package version matches the tag, then publishes in dependency order:
+7. Watch the `Publish` GitHub Actions run. The workflow verifies build/typecheck/tests, production audit, and performance budgets; checks that every package version matches the tag; publishes in dependency order; then creates the GitHub release:
 
    ```text
    @deepthonk/core -> @deepthonk/providers -> @deepthonk/mcp -> deepthonk

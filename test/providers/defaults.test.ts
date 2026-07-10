@@ -57,6 +57,42 @@ describe("provider defaults", () => {
     expect(config.roleProviders?.judge?.supportsJsonMode).toBe(true);
   });
 
+  it("isolates explicit endpoint routes from provider credential defaults", () => {
+    const config = resolveProviderConfig({
+      provider: "deepseek",
+      baseUrl: "https://proxy.example.test/v1",
+      inheritProviderDefaults: false
+    });
+
+    expect(config.baseUrl).toBe("https://proxy.example.test/v1");
+    expect(config.apiKeyEnv).toBeUndefined();
+  });
+
+  it("does not inherit base models, credentials, or JSON settings across role routes", () => {
+    const config = resolveProviderConfig({
+      provider: "openrouter",
+      supportsJsonMode: false,
+      models: { judge: "openrouter/old-judge" },
+      roleProviders: {
+        judge: { provider: "deepseek" },
+        mutator: { baseUrl: "https://custom.example.test/v1" }
+      }
+    });
+
+    expect(config.roleProviders?.judge).toMatchObject({
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      apiKeyEnv: "DEEPSEEK_API_KEY"
+    });
+    expect(config.roleProviders?.judge?.supportsJsonMode).toBeUndefined();
+    expect(config.roleProviders?.mutator).toMatchObject({
+      baseUrl: "https://custom.example.test/v1",
+      model: "openrouter/auto"
+    });
+    expect(config.roleProviders?.mutator?.apiKeyEnv).toBeUndefined();
+    expect(config.roleProviders?.mutator?.supportsJsonMode).toBeUndefined();
+  });
+
   it("ships official DeepSeek V4 pricing defaults", () => {
     expect(defaultProviderPricing).toContainEqual(
       expect.objectContaining({

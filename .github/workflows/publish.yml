@@ -25,7 +25,7 @@ on:
 
 permissions:
   id-token: write
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -55,6 +55,12 @@ jobs:
 
       - run: pnpm test
 
+      - name: Reject high-severity production dependency advisories
+        run: pnpm audit --prod --audit-level high
+
+      - name: Performance regression gate
+        run: node --expose-gc scripts/bench.mjs --ci
+
       - name: Guard — tag must match every package version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
@@ -82,3 +88,8 @@ jobs:
 
       - name: Publish deepthonk (cli)
         run: pnpm --filter deepthonk publish --no-git-checks
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "DeepThonk $GITHUB_REF_NAME"

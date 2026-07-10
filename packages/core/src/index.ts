@@ -10,6 +10,7 @@ export * from "./pairScheduler.js";
 export * from "./phaseRunner.js";
 export * from "./prompts.js";
 export * from "./rng.js";
+export { assertNoLegacyRedactedBudget, repairLegacyBudgetConfig } from "./resume.js";
 export * from "./runner.js";
 export * from "./schemas.js";
 export * from "./services.js";

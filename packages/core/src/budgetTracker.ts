@@ -4,10 +4,12 @@ import { emptyUsage } from "./lifecycle.js";
 import type { ModelTextResult, RunConfig } from "./schemas.js";
 
 type Price = NonNullable<NonNullable<RunConfig["budget"]>["prices"]>[number];
+export type CallReservation = symbol;
 
 export class BudgetTracker {
   readonly usage: BudgetUsage = emptyUsage();
   private readonly prices: Price[];
+  private readonly callReservations = new Set<CallReservation>();
 
   constructor(private readonly config: RunConfig) {
     this.prices = config.budget?.prices ?? [];
@@ -33,8 +35,48 @@ export class BudgetTracker {
     }
   }
 
-  record(result: ModelTextResult, fallback: { provider?: string; model: string; calls?: number } = { model: "unknown" }): UsageDelta {
+  reserveCall(phase: string): CallReservation {
+    const maxCalls = this.config.budget?.maxCalls;
+    if (maxCalls !== undefined && this.usage.calls + this.callReservations.size >= maxCalls) {
+      throw new BudgetExceededError(
+        `Cannot dispatch ${phase}: calls ${this.usage.calls} plus ${this.callReservations.size} active reservations reached maxCalls ${maxCalls}.`,
+        {
+          code: "budget.calls_exhausted",
+          fix: "Raise maxCalls or use a smaller profile."
+        }
+      );
+    }
+    const reservation = Symbol(phase);
+    this.callReservations.add(reservation);
+    return reservation;
+  }
+
+  releaseCall(reservation: CallReservation): void {
+    this.callReservations.delete(reservation);
+  }
+
+  failCall(reservation: CallReservation): UsageDelta {
+    if (!this.callReservations.delete(reservation)) {
+      throw new ConfigError("Model call reservation was already settled.", { code: "budget.reservation_invalid" });
+    }
+    this.usage.calls += 1;
+    return { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  }
+
+  record(
+    result: ModelTextResult,
+    fallback: { provider?: string; model: string; calls?: number } = { model: "unknown" },
+    reservation?: CallReservation
+  ): UsageDelta {
     const calls = fallback.calls ?? 1;
+    if (reservation !== undefined) {
+      if (!this.callReservations.delete(reservation)) {
+        throw new ConfigError("Model call reservation was already settled.", { code: "budget.reservation_invalid" });
+      }
+      if (calls !== 1) {
+        throw new ConfigError("A reserved model call must settle exactly one logical invocation.", { code: "budget.reservation_invalid" });
+      }
+    }
     this.usage.calls += calls;
     const inputCacheHitTokens = result.usage?.inputCacheHitTokens ?? 0;
     const inputCacheMissTokens = result.usage?.inputCacheMissTokens ?? 0;

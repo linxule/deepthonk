@@ -29,9 +29,9 @@ The tools are implemented over the shared core and provider interfaces. Use `sta
 
 `resume` is conservative by default: it reports completed, running, cancel-requested, cancelled, failed, budget-stopped, missing, resumable, or interrupted trace state and marks unsafe traces with `safe_to_continue: false`. With `continue: true`, it validates the stored config/version/provider, prunes to the last completed phase boundary, and replays from there. It never reuses partial in-flight model outputs.
 
-MCP Sampling is available as `provider: "sampling"` for `deepthonk.run` and `deepthonk.start` when the connected client advertises the MCP sampling capability. If the client does not advertise sampling, the tool fails before claiming a run directory with `provider.sampling_capability_missing`. Standalone CLI runs cannot use sampling; choose a direct provider there.
+MCP Sampling is available over stdio as `provider: "sampling"` for `deepthonk.run` and `deepthonk.start` when the connected client advertises the sampling capability. If it does not, the tool fails before claiming a run directory with `provider.sampling_capability_missing`. The v0.1 patch line rejects Sampling over Streamable HTTP and rejects mixed Sampling/direct role routes; choose a direct provider there.
 
-Tool handlers return `structuredContent` with a matching broad output schema, plus a text rendering for clients that display only content blocks. Tool failures are structured as `isError: true` with stable `code`, `message`, `retryable`, `fix`, and optional `run_dir` fields.
+Successful tool handlers return `structuredContent` with a matching broad output schema plus a text rendering. Failures return `isError: true` and JSON text with stable `code`, `message`, `retryable`, `fix`, and optional `run_dir` fields, but intentionally omit `structuredContent`: official SDK 1.29 clients otherwise validate an error against the success schema and mask the real failure.
 
 ## Host Configuration
 
@@ -109,9 +109,10 @@ The blocking run response includes `summary_resource` and `trace_resource`; read
 - `deepthonk://jobs/{job_id}/result?run_dir=...`
 - `deepthonk://jobs/{job_id}/{config|candidates|comparisons|scores|usage|trace|final|winner}?run_dir=...`
 - `deepthonk://jobs/{job_id}/population/{generation}?run_dir=...`
+- `deepthonk://runs/{run_id}/{resource}/page/{cursor}` and job equivalents for opaque bounded paging
 
 Resources are keyed by the recorded `run_id`. For MCP runs that write to custom absolute directories, the server records a local run index so the advertised resource URI can still resolve.
-Job-scoped resources resolve directly from the required `run_dir` query parameter, so agents can inspect files as soon as they are written and before `summary.json` exists.
+Job-scoped resources require the exact `job_id` and `run_dir` pair returned by `deepthonk.start`, so agents can inspect files as soon as they are written without turning the query parameter into an arbitrary filesystem read. Whole reads are capped at 1 MiB; record pages are capped at 1,000 rows and 1 MiB, while singleton JSON/text artifacts use bounded base64 byte pages.
 
 ## Prompts
 
@@ -128,10 +129,10 @@ Job-scoped resources resolve directly from the required `run_dir` query paramete
 deepthonk serve-mcp --transport http --port 3333
 ```
 
-The endpoint is `http://127.0.0.1:3333/mcp`.
+The endpoint is `http://127.0.0.1:3333/mcp`. It maintains one MCP server/transport per cryptographic session across `POST`, `GET`, and `DELETE`; sessions are capped at 64 and expire after 30 idle minutes when no request is in flight.
 
 ## Security defaults
 
 The HTTP transport binds to `127.0.0.1` only and runs with the MCP SDK's DNS rebinding protection enabled, with `Host` validated against `127.0.0.1:<port>` and `localhost:<port>`. Before reading request bodies, it also rejects non-`application/json` POSTs, non-loopback `Origin` headers, and `Sec-Fetch-Site: cross-site`. Loopback bind alone does not protect against browser-pivoted attackers (see CVE-2025-66414 / GHSA-w48q-cv73-mx4w), so do not remove the rebinding guard when adding new transport features. The HTTP transport has no bearer auth — treat it as trusted-local-host-only and prefer `stdio` for MCP host integration.
 
-API keys are read from `process.env` and never logged or written into trace files. The background `deepthonk.start` runner wraps driver construction, status writes, resource recording, and lock release so transient I/O errors cannot surface as unhandled rejections in the server process.
+API keys are read from `process.env` and never logged or written into trace files. Background admission is FIFO with 2 active and 32 queued jobs; overflow is retryable. The runner wraps driver construction, status writes, resource/index recording, and verified lock release so transient I/O errors cannot surface as unhandled rejections.

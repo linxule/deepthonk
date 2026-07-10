@@ -1,8 +1,19 @@
-import { mkdtemp, readFile, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { builtInProfiles, claimRunLock, readRunStatus, releaseRunLock, runDeepThonk, TraceStore, type RunConfig } from "@deepthonk/core";
+import {
+  builtInProfiles,
+  claimRunLock,
+  claimRunLockOwnership,
+  inspectRunLock,
+  reclaimRunLock,
+  readRunStatus,
+  releaseRunLock,
+  runDeepThonk,
+  TraceStore,
+  type RunConfig
+} from "@deepthonk/core";
 import { FakeDriver, type GenerateInput, type ModelTextResult } from "@deepthonk/providers";
 
 describe("runDeepThonk", () => {
@@ -279,6 +290,107 @@ describe("runDeepThonk", () => {
     expect(traceConfig).toContain("[redacted]");
   });
 
+  it("preserves numeric token budgets while redacting actual token secrets", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-token-redact-"));
+    const config = {
+      ...baseConfig(runDir),
+      budget: {
+        maxInputTokens: 123,
+        maxOutputTokens: 456,
+        prices: [
+          {
+            provider: "fake",
+            model: "fake-model",
+            inputUsdPerMillion: 1,
+            outputUsdPerMillion: 1,
+            longContextThresholdTokens: 789,
+            inputUsdPerMillionLong: 2,
+            outputUsdPerMillionLong: 2
+          }
+        ]
+      },
+      secretToken: "do-not-write"
+    } as RunConfig & { secretToken: string };
+    await new TraceStore(runDir).init(config, "token-redaction-test");
+    const stored = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as typeof config;
+    expect(stored.budget.maxInputTokens).toBe(123);
+    expect(stored.budget.maxOutputTokens).toBe(456);
+    expect(stored.budget.prices[0]?.longContextThresholdTokens).toBe(789);
+    expect(stored.secretToken).toBe("[redacted]");
+  });
+
+  it("honors a caller runId and rejects path-like IDs", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-run-id-"));
+    const result = await runDeepThonk({ ...baseConfig(runDir), runId: "caller.run_42" }, new FakeDriver());
+    expect(result.runId).toBe("caller.run_42");
+    const stored = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as { runId: string };
+    expect(stored.runId).toBe("caller.run_42");
+
+    const invalidDir = await mkdtemp(join(tmpdir(), "deepthonk-run-id-invalid-"));
+    await expect(runDeepThonk({ ...baseConfig(invalidDir), runId: "../escape" }, new FakeDriver())).rejects.toThrow(/Run IDs/);
+  });
+
+  it("accepts maxCalls equal to the minimum logical plan and reserves calls atomically", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-max-calls-"));
+    const result = await runDeepThonk({ ...baseConfig(runDir), budget: { maxCalls: 15 } }, new FakeDriver());
+    expect(result.calls).toBe(15);
+  });
+
+  it("automatically reclaims only a same-host dead-pid lock", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-stale-lock-"));
+    await writeFile(
+      join(runDir, "run.lock"),
+      `${JSON.stringify({
+        schema_version: 1,
+        claim_id: "stale-claim",
+        job_id: "stale-job",
+        hostname: hostname(),
+        worker_pid: 2_147_483_647,
+        claimed_at: new Date().toISOString()
+      })}\n`,
+      "utf8"
+    );
+    expect(await claimRunLock(runDir, "new-job")).toBe(true);
+    const inspection = await inspectRunLock(runDir);
+    expect(inspection).toMatchObject({ state: "valid", lock: { job_id: "new-job", worker_pid: process.pid } });
+    await releaseRunLock(runDir);
+  });
+
+  it("allows only a matching preflight pending status for a preclaimed job", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-preflight-"));
+    const claimed = await claimRunLockOwnership(runDir, "job-1");
+    expect(claimed).toBeDefined();
+    await writeFile(join(runDir, "status.json"), JSON.stringify({ state: "pending", job_id: "job-1" }), "utf8");
+    await expect(runDeepThonk(baseConfig(runDir), new FakeDriver(), { jobId: "job-1", lockClaim: claimed! })).resolves.toHaveProperty("winner");
+    await releaseRunLock(runDir, claimed!.claimId);
+
+    const mismatchDir = await mkdtemp(join(tmpdir(), "deepthonk-preflight-mismatch-"));
+    await writeFile(join(mismatchDir, "status.json"), JSON.stringify({ state: "pending", job_id: "other-job" }), "utf8");
+    await expect(new TraceStore(mismatchDir).init(baseConfig(mismatchDir), "preflight-run", { pendingJobId: "job-1" })).rejects.toThrow(
+      /already contains status.json/
+    );
+  });
+
+  it("rejects forged preclaim authority and restores locks after a fingerprint mismatch", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-forged-lock-"));
+    const claim = await claimRunLockOwnership(runDir, "real-job");
+    expect(claim).toBeDefined();
+    const [reclaimed, competingClaim] = await Promise.all([
+      reclaimRunLock(runDir, "sha256:" + "0".repeat(64)),
+      claimRunLockOwnership(runDir, "competing-job")
+    ]);
+    expect(reclaimed).toBe(false);
+    expect(competingClaim).toBeUndefined();
+    await expect(stat(join(runDir, "run.lock"))).resolves.toBeDefined();
+    await expect(
+      runDeepThonk(baseConfig(runDir), new FakeDriver(), {
+        jobId: "real-job",
+        lockClaim: { ...claim!, claimId: "forged-claim" }
+      })
+    ).rejects.toMatchObject({ code: "run.lock_not_owned" });
+    await releaseRunLock(runDir, claim!.claimId);
+  });
+
   it("keeps providerReplay env var pointers while redacting secret values", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-replay-redact-"));
     const config = {
@@ -346,6 +458,22 @@ describe("runDeepThonk", () => {
     expect(discarded.map((candidate) => candidate.metadata?.discardReason).sort()).toEqual(["bottom_quartile", "rounding_trim"]);
   });
 });
+
+function baseConfig(runDir: string): RunConfig {
+  return {
+    task: "solve toy",
+    profile: builtInProfiles.quick,
+    runDir,
+    seed: 1,
+    provider: "fake",
+    generatorModel: "fake-model",
+    mutatorModel: "fake-model",
+    judgeModel: "fake-model",
+    concurrency: { generate: 4, judge: 4, mutate: 3 },
+    retry: { httpRetries: 0, invalidJsonRetries: 1 },
+    output: { includeRawModelOutputs: false, includePrompts: false }
+  };
+}
 
 class DelayedFakeDriver extends FakeDriver {
   override async generate(input: GenerateInput): Promise<ModelTextResult> {

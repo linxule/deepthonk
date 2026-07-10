@@ -8,10 +8,13 @@ import {
   defaultEnvPath,
   defaultPricesForProviderConfig,
   loadDeepThonkEnv,
+  normalizeExternalConfig,
   resolveProviderConfig,
   resolveProviderModels,
+  type ExternalAlgorithmOverrides,
+  type ExternalConfigFile,
+  type ExternalPromptOverrides,
   type ProviderConfig,
-  type ProviderRole
 } from "@deepthonk/providers";
 import { booleanOption, numberOption, stringOption } from "./options.js";
 import { loadNamedProfile } from "./profileRegistry.js";
@@ -37,55 +40,29 @@ export interface ResolvedOneShotConfig extends ResolvedProviderConfig {
   concurrency: RunConfig["concurrency"];
 }
 
+export interface ResolvedPlanConfig {
+  profile: Profile | BuiltInProfileName;
+  planOptions: {
+    invalidJsonRetries: number;
+    includeFinalizer: boolean;
+  };
+}
+
+interface ProviderSelection {
+  provider: string;
+  models: ProviderConfig["models"];
+  baseUrl?: string;
+  apiKeyEnv?: string;
+  supportsJsonMode?: boolean;
+  roleProviders?: Parameters<typeof resolveProviderConfig>[0]["roleProviders"];
+  inheritProviderDefaults: boolean;
+}
+
 export { defaultConfigPath, defaultEnvPath, loadDeepThonkEnv };
 
-export interface RawConfigFile {
-  profile?: BuiltInProfileName;
-  provider?: string;
-  base_url?: string;
-  api_key_env?: string;
-  supports_json_mode?: boolean;
-  models?: {
-    generator?: string;
-    mutator?: string;
-    judge?: string;
-    finalizer?: string;
-  };
-  providers?: Partial<Record<ProviderRole, RawRoleProviderConfig>>;
-  concurrency?: Partial<RunConfig["concurrency"]>;
-  retry?: Partial<RunConfig["retry"]>;
-  budget?: RunConfig["budget"];
-  output?: Partial<RunConfig["output"]>;
-  prompt_style?: RunConfig["promptStyle"];
-  algorithm?: AlgorithmOverrides;
-  prompts?: PromptOverridesFile;
-}
-
-export interface AlgorithmOverrides {
-  n?: number;
-  k?: number;
-  t?: number;
-  m?: number;
-  lambda?: number;
-  sample_temperature?: number;
-  mutate_temperature?: number;
-  judge_temperature?: number;
-}
-
-interface PromptOverridesFile {
-  generate?: { system?: string; user?: string };
-  compare?: { system?: string; user?: string };
-  mutate?: { system?: string; user?: string };
-  finalize?: { system?: string; user?: string };
-}
-
-interface RawRoleProviderConfig {
-  provider?: string;
-  base_url?: string;
-  api_key_env?: string;
-  model?: string;
-  supports_json_mode?: boolean;
-}
+export type RawConfigFile = ExternalConfigFile;
+export type AlgorithmOverrides = ExternalAlgorithmOverrides;
+type PromptOverridesFile = ExternalPromptOverrides;
 
 export async function resolveRunConfig(options: Record<string, unknown>): Promise<ResolvedCliConfig> {
   await loadDeepThonkEnv();
@@ -94,23 +71,18 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
   const profile = mergeAlgorithmOverrides(getProfile(profileName), fileConfig.algorithm, options);
   const task = await readPathOrInline(String(options.task ?? ""));
   const rubric = options.rubric ? await readPathOrInline(String(options.rubric)) : undefined;
-  const provider = String(options.provider ?? fileConfig.provider ?? "fake");
-  const models = resolveProviderModels(provider, {
-    generator: stringOption(options.generatorModel) ?? fileConfig.models?.generator,
-    mutator: stringOption(options.mutatorModel) ?? fileConfig.models?.mutator,
-    judge: stringOption(options.judgeModel) ?? fileConfig.models?.judge,
-    finalizer: stringOption(options.finalizerModel) ?? fileConfig.models?.finalizer
-  });
+  const selection = resolveProviderSelection(options, fileConfig);
+  const { provider, models } = selection;
   const maxConcurrency = numberOption(options.maxConcurrency, "--max-concurrency", { integer: true, min: 1 });
   const retry = resolveRetry(options, fileConfig);
-  const supportsJsonMode = booleanOption(options.supportsJsonMode, "--supports-json-mode") ?? fileConfig.supports_json_mode;
   const providerConfig: ProviderConfig = resolveProviderConfig({
     provider,
-    baseUrl: stringOption(options.baseUrl) ?? fileConfig.base_url,
-    apiKeyEnv: stringOption(options.apiKeyEnv) ?? fileConfig.api_key_env,
-    supportsJsonMode,
+    baseUrl: selection.baseUrl,
+    apiKeyEnv: selection.apiKeyEnv,
+    supportsJsonMode: selection.supportsJsonMode,
     models,
-    roleProviders: normalizeRoleProviders(fileConfig.providers, models, supportsJsonMode),
+    roleProviders: selection.roleProviders,
+    inheritProviderDefaults: selection.inheritProviderDefaults,
     retry
   });
   const budget = mergeBudget(fileConfig.budget, {
@@ -122,6 +94,7 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
   const promptOverrides = await loadPromptOverrides(options, fileConfig);
   const providerReplay = providerReplayFromConfig(providerConfig);
   const runConfig: RunConfig = {
+    runId: stringOption(options.runId) ?? fileConfig.runId,
     task,
     rubric,
     promptStyle:
@@ -150,7 +123,10 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
     runConfig,
     providerConfig,
     providerReplay,
-    plan: planBudget(profile)
+    plan: planBudget(profile, {
+      invalidJsonRetries: retry.invalidJsonRetries,
+      includeFinalizer: Boolean(models.finalizer)
+    })
   };
 }
 
@@ -159,22 +135,17 @@ export async function resolveOneShotConfig(options: Record<string, unknown>): Pr
   const fileConfig = await resolveBaseConfig(options);
   const profileName = builtInProfileName(options.profile ?? fileConfig.profile ?? "quick");
   const profile = mergeAlgorithmOverrides(getProfile(profileName), fileConfig.algorithm, options);
-  const provider = String(options.provider ?? fileConfig.provider ?? "fake");
-  const models = resolveProviderModels(provider, {
-    generator: stringOption(options.generatorModel) ?? fileConfig.models?.generator,
-    mutator: stringOption(options.mutatorModel) ?? fileConfig.models?.mutator,
-    judge: stringOption(options.judgeModel) ?? fileConfig.models?.judge,
-    finalizer: stringOption(options.finalizerModel) ?? fileConfig.models?.finalizer
-  });
+  const selection = resolveProviderSelection(options, fileConfig);
+  const { provider, models } = selection;
   const retry = resolveRetry(options, fileConfig);
-  const supportsJsonMode = booleanOption(options.supportsJsonMode, "--supports-json-mode") ?? fileConfig.supports_json_mode;
   const providerConfig = resolveProviderConfig({
     provider,
-    baseUrl: stringOption(options.baseUrl) ?? fileConfig.base_url,
-    apiKeyEnv: stringOption(options.apiKeyEnv) ?? fileConfig.api_key_env,
-    supportsJsonMode,
+    baseUrl: selection.baseUrl,
+    apiKeyEnv: selection.apiKeyEnv,
+    supportsJsonMode: selection.supportsJsonMode,
     models,
-    roleProviders: normalizeRoleProviders(fileConfig.providers, models, supportsJsonMode),
+    roleProviders: selection.roleProviders,
+    inheritProviderDefaults: selection.inheritProviderDefaults,
     retry
   });
   return {
@@ -204,6 +175,33 @@ function resolveRetry(options: Record<string, unknown>, fileConfig: RawConfigFil
     httpRetries: fileConfig.retry?.httpRetries ?? 2,
     invalidJsonRetries: fileConfig.retry?.invalidJsonRetries ?? 1,
     requestTimeoutMs: numberOption(options.requestTimeoutMs, "--request-timeout-ms", { integer: true, min: 1 }) ?? fileConfig.retry?.requestTimeoutMs
+  };
+}
+
+function resolveProviderSelection(options: Record<string, unknown>, fileConfig: RawConfigFile): ProviderSelection {
+  const providerFlag = stringOption(options.provider);
+  const baseUrlFlag = stringOption(options.baseUrl);
+  const provider = String(providerFlag ?? fileConfig.provider ?? "fake");
+  const providerChanged = providerFlag !== undefined && providerFlag !== fileConfig.provider;
+  const baseUrlChanged = baseUrlFlag !== undefined && baseUrlFlag !== fileConfig.base_url;
+  const isolateFileRoute = providerChanged || baseUrlChanged;
+  const models = resolveProviderModels(provider, {
+    generator: stringOption(options.generatorModel) ?? (isolateFileRoute ? undefined : fileConfig.models?.generator),
+    mutator: stringOption(options.mutatorModel) ?? (isolateFileRoute ? undefined : fileConfig.models?.mutator),
+    judge: stringOption(options.judgeModel) ?? (isolateFileRoute ? undefined : fileConfig.models?.judge),
+    finalizer: stringOption(options.finalizerModel) ?? (isolateFileRoute ? undefined : fileConfig.models?.finalizer)
+  });
+  const supportsJsonMode =
+    booleanOption(options.supportsJsonMode, "--supports-json-mode") ??
+    (isolateFileRoute ? undefined : fileConfig.supports_json_mode);
+  return {
+    provider,
+    models,
+    baseUrl: baseUrlFlag ?? (isolateFileRoute ? undefined : fileConfig.base_url),
+    apiKeyEnv: stringOption(options.apiKeyEnv) ?? (isolateFileRoute ? undefined : fileConfig.api_key_env),
+    supportsJsonMode,
+    roleProviders: isolateFileRoute ? undefined : normalizeRoleProviders(fileConfig.providers),
+    inheritProviderDefaults: !baseUrlChanged
   };
 }
 
@@ -265,13 +263,22 @@ export function mergeAlgorithmOverrides(
 }
 
 export async function resolvePlanProfile(options: Record<string, unknown>): Promise<Profile | BuiltInProfileName> {
+  return (await resolvePlanConfig(options)).profile;
+}
+
+export async function resolvePlanConfig(options: Record<string, unknown>): Promise<ResolvedPlanConfig> {
   const fileConfig = await resolveBaseConfig(options);
   const profileName = builtInProfileName(options.profile ?? fileConfig.profile ?? "quick");
   const hasOverrides =
     fileConfig.algorithm !== undefined ||
     ["n", "k", "t", "m", "lambda", "sampleTemperature", "mutateTemperature", "judgeTemperature"].some((key) => options[key] !== undefined);
-  if (!hasOverrides) return profileName;
-  return mergeAlgorithmOverrides(getProfile(profileName), fileConfig.algorithm, options);
+  return {
+    profile: hasOverrides ? mergeAlgorithmOverrides(getProfile(profileName), fileConfig.algorithm, options) : profileName,
+    planOptions: {
+      invalidJsonRetries: fileConfig.retry?.invalidJsonRetries ?? 1,
+      includeFinalizer: Boolean(fileConfig.models?.finalizer)
+    }
+  };
 }
 
 export async function readPathOrInline(value: string): Promise<string> {
@@ -297,7 +304,18 @@ function candidatePaths(value: string): string[] {
 }
 
 async function readConfig(path: string): Promise<RawConfigFile> {
-  return YAML.parse(await readFile(resolveCliPath(path), "utf8")) as RawConfigFile;
+  const resolved = resolveCliPath(path);
+  let parsed: unknown;
+  try {
+    parsed = YAML.parse(await readFile(resolved, "utf8"));
+  } catch (error) {
+    throw new ConfigError(`Config '${path}' is not valid YAML: ${(error as Error).message}`, {
+      code: "config.invalid_yaml",
+      retryable: false,
+      fix: `Fix YAML syntax in ${resolved}.`
+    });
+  }
+  return normalizeExternalConfig(parsed, path);
 }
 
 function resolveConfigPath(options: Record<string, unknown>): string | undefined {
@@ -314,7 +332,7 @@ async function resolveBaseConfig(options: Record<string, unknown>): Promise<RawC
         fix: "Choose one: --profile-name <name> to load a saved bundle, or --config <path> to point at a config YAML."
       });
     }
-    return (await loadNamedProfile(profileName)) as unknown as RawConfigFile;
+    return normalizeExternalConfig(await loadNamedProfile(profileName), `named profile '${profileName}'`);
   }
   const configPath = resolveConfigPath(options);
   return configPath ? await readConfig(configPath) : {};
@@ -401,23 +419,19 @@ function looksPathLike(value: string): boolean {
 }
 
 function normalizeRoleProviders(
-  providers: RawConfigFile["providers"],
-  models: ProviderConfig["models"],
-  baseSupportsJsonMode?: boolean
+  providers: RawConfigFile["providers"]
 ): Parameters<typeof resolveProviderConfig>[0]["roleProviders"] {
   if (!providers) return undefined;
   const normalized: Parameters<typeof resolveProviderConfig>[0]["roleProviders"] = {};
   for (const role of ["generator", "mutator", "judge", "finalizer"] as const) {
     const provider = providers[role];
     if (!provider) continue;
-    const model = provider.model ?? models[role];
-    if (!model) continue;
     normalized[role] = {
       provider: provider.provider,
       baseUrl: provider.base_url,
       apiKeyEnv: provider.api_key_env,
-      model,
-      supportsJsonMode: provider.supports_json_mode ?? baseSupportsJsonMode
+      model: provider.model,
+      supportsJsonMode: provider.supports_json_mode
     };
   }
   return Object.keys(normalized).length ? normalized : undefined;

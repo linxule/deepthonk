@@ -2,7 +2,7 @@ import type { Command } from "commander";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { detectResumeState, resumeDeepThonk, runConfigSchema } from "@deepthonk/core";
-import { createDriver, resolveProviderConfig } from "@deepthonk/providers";
+import { createDriver, createDriverIdentity, resolveProviderConfig } from "@deepthonk/providers";
 import { resolveCliPath } from "../config.js";
 import { parseProviderReplay, providerConfigFromReplay } from "../providerReplay.js";
 
@@ -17,7 +17,7 @@ export function registerResume(program: Command): void {
     .action(async (runDir: string, options: { continue?: boolean; dryRun?: boolean; provider?: string }) => {
       runDir = resolveCliPath(runDir);
       if (options.continue) {
-        const { driver, provider } = await resumeDriverFromRunConfig(runDir, options.provider);
+        const { driver, provider } = await resumeDriverFromRunConfig(runDir, options.provider, Boolean(options.dryRun));
         const result = await resumeDeepThonk(runDir, driver, { dryRun: Boolean(options.dryRun), provider });
         console.log(JSON.stringify(result, null, 2));
         return;
@@ -28,7 +28,11 @@ export function registerResume(program: Command): void {
     });
 }
 
-async function resumeDriverFromRunConfig(runDir: string, providerOverride?: string): Promise<{ driver: ReturnType<typeof createDriver>; provider: string }> {
+async function resumeDriverFromRunConfig(
+  runDir: string,
+  providerOverride?: string,
+  identityOnly = false
+): Promise<{ driver: ReturnType<typeof createDriver>; provider: string }> {
   const raw = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as unknown;
   const config = runConfigSchema.parse(raw);
   const replay = parseProviderReplay(isRecord(raw) ? raw.providerReplay : undefined);
@@ -45,7 +49,7 @@ async function resumeDriverFromRunConfig(runDir: string, providerOverride?: stri
         },
         retry: config.retry
       });
-  return { driver: createDriver(providerConfig), provider };
+  return { driver: identityOnly ? createDriverIdentity(providerConfig) : createDriver(providerConfig), provider };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

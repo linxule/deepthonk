@@ -1,10 +1,13 @@
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { describe, expect, it } from "vitest";
 import {
   deepthonkCancel,
+  deepthonkLockInspect,
+  deepthonkLockReclaim,
+  deepthonkRepairBudget,
   deepthonkPlan,
   deepthonkPlanAsync,
   deepthonkResult,
@@ -19,6 +22,8 @@ import {
   isAllowedMcpHttpHost,
   isAllowedSecFetchSite,
   isApplicationJsonContentType,
+  BackgroundJobManager,
+  createMcpHttpServer,
   listRunResources,
   promptNames,
   readJobResource,
@@ -27,6 +32,7 @@ import {
   mutateArgsSchema,
   rankArgsSchema,
   runArgsSchema,
+  toolError,
   toolNames
 } from "@deepthonk/mcp";
 
@@ -37,6 +43,9 @@ describe("MCP helpers", () => {
     expect(toolNames).toContain("deepthonk.status");
     expect(toolNames).toContain("deepthonk.result");
     expect(toolNames).toContain("deepthonk.cancel");
+    expect(toolNames).toContain("deepthonk.lock_inspect");
+    expect(toolNames).toContain("deepthonk.lock_reclaim");
+    expect(toolNames).toContain("deepthonk.repair_budget");
     expect(toolNames).toContain("deepthonk.profile_list");
     expect(toolNames).toContain("deepthonk.profile_show");
     expect(toolNames).toContain("deepthonk.profile_save");
@@ -44,9 +53,155 @@ describe("MCP helpers", () => {
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/summary");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/usage");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/population/{generation}");
+    expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/{resource}/page/{cursor}");
     expect(resourceTemplates).toContain("deepthonk://jobs/{job_id}/config");
     expect(resourceTemplates).toContain("deepthonk://jobs/{job_id}/population/{generation}");
     expect(promptNames).toContain("deepthonk/compare");
+  });
+
+  it("returns MCP tool errors as JSON text without structuredContent", () => {
+    const result = toolError(new Error("boom"));
+    expect(result).not.toHaveProperty("structuredContent");
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ code: "unexpected_error", message: "boom" });
+  });
+
+  it("runs background jobs FIFO with two active slots and bounded reservations", async () => {
+    const manager = new BackgroundJobManager(2, 2);
+    const reservations = Array.from({ length: 4 }, () => manager.reserve());
+    expect(reservations.every(Boolean)).toBe(true);
+    expect(manager.reserve()).toBeUndefined();
+
+    const started: number[] = [];
+    const releases: Array<() => void> = [];
+    const task = (id: number) => () => new Promise<void>((resolve) => {
+      started.push(id);
+      releases[id] = resolve;
+    });
+    reservations.forEach((reservation, id) => manager.schedule(reservation!, task(id)));
+    await Promise.resolve();
+    expect(started).toEqual([0, 1]);
+    releases[0]!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual([0, 1, 2]);
+    releases[1]!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual([0, 1, 2, 3]);
+    releases[2]!();
+    releases[3]!();
+  });
+
+  it("inspects and reclaims locks only with the exact fingerprint", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-lock-"));
+    await writeFile(join(runDir, "run.lock"), "malformed lock\n");
+    const inspected = await deepthonkLockInspect({ run_dir: runDir });
+    expect(inspected).toMatchObject({ state: "malformed", run_dir: runDir });
+    expect(await deepthonkLockReclaim({ run_dir: runDir, fingerprint: `sha256:${"0".repeat(64)}` })).toMatchObject({ reclaimed: false });
+    expect(await deepthonkLockReclaim({ run_dir: runDir, fingerprint: inspected.fingerprint })).toMatchObject({ reclaimed: true });
+    await expect(readFile(join(runDir, "run.lock"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("repairs legacy-redacted budgets through the MCP surface", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-budget-repair-"));
+    await writeFile(join(runDir, "config.json"), JSON.stringify({ budget: { maxOutputTokens: "[redacted]" } }));
+    await expect(deepthonkRepairBudget({
+      run_dir: runDir,
+      replacements: { "budget.maxOutputTokens": 4096 }
+    })).resolves.toEqual({ run_dir: runDir, repaired: ["budget.maxOutputTokens"] });
+  });
+
+  it("pages resources over 1 MiB with opaque bounded cursors", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-pages-"));
+    const runId = "large-run";
+    const runDir = join(root, runId);
+    await mkdir(runDir, { recursive: true });
+    await writeFile(join(runDir, "summary.json"), `${JSON.stringify({ run_id: runId })}\n`);
+    const rows = Array.from({ length: 1_200 }, (_, index) => JSON.stringify({ index, text: "x".repeat(900) })).join("\n") + "\n";
+    await writeFile(join(runDir, "candidates.jsonl"), rows);
+
+    let firstPageUri = "";
+    await expect(readRunResource(`deepthonk://runs/${runId}/candidates`, root)).rejects.toSatisfy((error: unknown) => {
+      const fix = (error as { fix?: string }).fix ?? "";
+      firstPageUri = fix.match(/deepthonk:\/\/\S+/)?.[0] ?? "";
+      return (error as { code?: string }).code === "mcp.resource_too_large" && firstPageUri.length > 0;
+    });
+    expect(firstPageUri).not.toContain("/page/0");
+    const pageText = await readRunResource(firstPageUri, root);
+    const page = JSON.parse(pageText) as { records: unknown[]; next_cursor?: string };
+    expect(page.records.length).toBeLessThanOrEqual(1_000);
+    expect(Buffer.byteLength(pageText, "utf8")).toBeLessThanOrEqual(1_000_000);
+    expect(page.next_cursor).toBeTruthy();
+
+    await writeFile(join(runDir, "summary.json"), JSON.stringify({ run_id: runId, blob: "x".repeat(1_100_000) }));
+    let summaryPageUri = "";
+    await expect(readRunResource(`deepthonk://runs/${runId}/summary`, root)).rejects.toSatisfy((error: unknown) => {
+      summaryPageUri = ((error as { fix?: string }).fix ?? "").match(/deepthonk:\/\/\S+/)?.[0] ?? "";
+      return (error as { code?: string }).code === "mcp.resource_too_large";
+    });
+    const summaryPageText = await readRunResource(summaryPageUri, root);
+    const summaryPage = JSON.parse(summaryPageText) as { encoding: string; data: string; next_cursor?: string };
+    expect(summaryPage.encoding).toBe("base64");
+    expect(Buffer.from(summaryPage.data, "base64").toString("utf8")).toContain(`{"run_id":"${runId}"`);
+    expect(Buffer.byteLength(summaryPageText, "utf8")).toBeLessThanOrEqual(1_000_000);
+    expect(summaryPage.next_cursor).toBeTruthy();
+  });
+
+  it("refuses job resources without the exact recorded job ID and run directory pair", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-unowned-job-"));
+    await writeFile(join(runDir, "config.json"), '{"not":"a job"}\n');
+    const uri = `deepthonk://jobs/forged/config?run_dir=${encodeURIComponent(runDir)}`;
+    await expect(readJobResource(uri)).rejects.toMatchObject({ code: "mcp.job_mismatch" });
+  });
+
+  it.each(["..", ".", "%2e%2e", "bad%2Fid", "bad\\id"])("rejects path-shaped run IDs in resources: %s", async (runId) => {
+    await expect(readRunResource(`deepthonk://runs/${runId}/summary`)).rejects.toMatchObject({ code: "mcp.invalid_run_id" });
+  });
+
+  it("keeps Streamable HTTP state across requests and closes it with DELETE", async () => {
+    const httpServer = createMcpHttpServer({ port: 0, sessionIdleMs: 60_000, maxSessions: 2 });
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = httpServer.address();
+      if (!address || typeof address === "string") throw new Error("Expected TCP address");
+      const url = `http://127.0.0.1:${address.port}/mcp`;
+      const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+      const initialized = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1" } }
+        })
+      });
+      expect(initialized.status).toBe(200);
+      const sessionId = initialized.headers.get("mcp-session-id");
+      expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
+      const sessionHeaders = { ...headers, "mcp-session-id": sessionId! };
+      await fetch(url, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })
+      });
+      const listed = await fetch(url, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })
+      });
+      expect(listed.status).toBe(200);
+      expect(await listed.text()).toContain("deepthonk.run");
+      expect((await fetch(url, { method: "DELETE", headers: sessionHeaders })).status).toBe(200);
+      expect((await fetch(url, {
+        method: "POST",
+        headers: sessionHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} })
+      })).status).toBe(404);
+    } finally {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
   });
 
   it("starts, polls, and reads result for a fake background job", async () => {
@@ -141,6 +296,21 @@ describe("MCP helpers", () => {
     );
     const listedResources = await listRunResources(join(runDir, ".."));
     expect(new Set(listedResources.map((resource) => resource.uri)).size).toBe(listedResources.length);
+  });
+
+  it("honors a validated caller-supplied run_id", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-run-id-"));
+    const runId = `caller.run_${Date.now()}`;
+    const result = await deepthonkRun({
+      task: "toy",
+      profile: "quick",
+      provider: "fake",
+      run_id: runId,
+      run_dir: runDir
+    });
+    expect(result.run_id).toBe(runId);
+    expect(JSON.parse(await readFile(join(runDir, "config.json"), "utf8"))).toMatchObject({ runId });
+    expect(() => runArgsSchema.parse({ task: "toy", provider: "fake", run_id: "../escape" })).toThrow();
   });
 
   it("loads a named profile via profile_name", async () => {
@@ -369,6 +539,75 @@ describe("MCP helpers", () => {
     });
 
     expect(result.winner_id).toBeTruthy();
+  });
+
+  it("isolates a replaced role route from base model, credential, and JSON-mode settings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-role-isolation-"));
+    const configPath = join(root, "config.yaml");
+    const runDir = join(root, "run");
+    await writeFile(configPath, [
+      "profile: quick",
+      "provider: fake",
+      "api_key_env: STALE_BASE_KEY",
+      "supports_json_mode: false",
+      "models:",
+      "  generator: stale-generator",
+      "  mutator: stale-mutator",
+      "  judge: stale-judge",
+      "providers:",
+      "  judge:",
+      "    provider: fake",
+      "    base_url: https://judge.example.test/v1"
+    ].join("\n"));
+
+    await deepthonkRun({ task: "toy", config_path: configPath, run_dir: runDir });
+    const stored = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as {
+      providerReplay?: { roleProviders?: { judge?: { model?: string; apiKeyEnv?: string; supportsJsonMode?: boolean } } };
+    };
+    expect(stored.providerReplay?.roleProviders?.judge).toMatchObject({ model: "fake-model" });
+    expect(stored.providerReplay?.roleProviders?.judge).not.toHaveProperty("apiKeyEnv");
+    expect(stored.providerReplay?.roleProviders?.judge).not.toHaveProperty("supportsJsonMode");
+  });
+
+  it("rejects mixed Sampling/direct role routes with a stable error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-mixed-sampling-"));
+    const configPath = join(root, "config.yaml");
+    await writeFile(configPath, [
+      "profile: quick",
+      "provider: fake",
+      "providers:",
+      "  judge:",
+      "    provider: sampling"
+    ].join("\n"));
+    await expect(deepthonkRun({ task: "toy", config_path: configPath, run_dir: join(root, "run") }, {
+      getClientCapabilities: () => ({ sampling: {} }),
+      createMessage: async () => ({ model: "unused", role: "assistant", content: { type: "text", text: "unused" } })
+    })).rejects.toMatchObject({ code: "provider.mixed_sampling_routes_unsupported", retryable: false });
+  });
+
+  it("omits oversized summaries from job result tool and resource outputs", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-large-result-"));
+    const jobId = `job-large-${Date.now()}`;
+    const runId = `large-result-${Date.now()}`;
+    await writeFile(join(runDir, "summary.json"), JSON.stringify({ run_id: runId, payload: "x".repeat(1_100_000) }));
+    await writeFile(join(runDir, "status.json"), JSON.stringify({
+      job_id: jobId,
+      run_id: runId,
+      run_dir: runDir,
+      state: "completed",
+      phase: "summary",
+      usage: { calls: 1, inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      updated_at: new Date().toISOString()
+    }));
+
+    const toolOutput = await deepthonkResult({ run_dir: runDir, job_id: jobId });
+    expect(toolOutput).toMatchObject({ complete: true, summary_omitted: true });
+    expect(toolOutput).not.toHaveProperty("summary");
+    expect(Buffer.byteLength(JSON.stringify(toolOutput), "utf8")).toBeLessThanOrEqual(1_000_000);
+
+    const resourceText = await readJobResource(`deepthonk://jobs/${jobId}/result?run_dir=${encodeURIComponent(runDir)}`);
+    expect(JSON.parse(resourceText)).toMatchObject({ complete: true, summary_omitted: true });
+    expect(Buffer.byteLength(resourceText, "utf8")).toBeLessThanOrEqual(1_000_000);
   });
 
   it("honors MCP config output and concurrency fields", async () => {

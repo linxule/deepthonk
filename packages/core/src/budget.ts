@@ -9,6 +9,9 @@ export interface BudgetPlan {
   per_generation_judge_calls: number;
   per_generation_mutate_calls: number;
   final_judge_calls: number;
+  finalizer_calls: number;
+  invalid_json_retry_headroom_calls: number;
+  worst_case_calls: number;
   sequential_rounds: number;
   warnings: string[];
 }
@@ -27,7 +30,10 @@ export function validateProfile(profile: Profile): void {
   if ((profile.n * profile.m) % 2 !== 0) throw new ConfigError(`Profile invalid: n*m must be even, got ${profile.n * profile.m}.`);
 }
 
-export function planBudget(profileInput: BuiltInProfileName | Profile): BudgetPlan {
+export function planBudget(
+  profileInput: BuiltInProfileName | Profile,
+  options: { invalidJsonRetries?: number; includeFinalizer?: boolean } = {}
+): BudgetPlan {
   const profile = getProfile(profileInput);
   validateProfile(profile);
   const profileName = typeof profileInput === "string" ? profileInput : "custom";
@@ -36,6 +42,8 @@ export function planBudget(profileInput: BuiltInProfileName | Profile): BudgetPl
   const perGenerationJudge = (profile.n * profile.k) / 2;
   const finalJudge = (profile.n * profile.m) / 2;
   const calls = profile.n + profile.t * (perGenerationJudge + mutateCount) + finalJudge;
+  const finalizerCalls = options.includeFinalizer ? 1 : 0;
+  const invalidJsonRetryHeadroom = (profile.t * perGenerationJudge + finalJudge) * (options.invalidJsonRetries ?? 0);
   return {
     profile: profileName,
     calls,
@@ -43,6 +51,9 @@ export function planBudget(profileInput: BuiltInProfileName | Profile): BudgetPl
     per_generation_judge_calls: perGenerationJudge,
     per_generation_mutate_calls: mutateCount,
     final_judge_calls: finalJudge,
+    finalizer_calls: finalizerCalls,
+    invalid_json_retry_headroom_calls: invalidJsonRetryHeadroom,
+    worst_case_calls: calls + finalizerCalls + invalidJsonRetryHeadroom,
     sequential_rounds: 1 + profile.t * 2 + 1,
     warnings: calls >= 100 ? ["High call count; confirm provider cost limits before running."] : []
   };
