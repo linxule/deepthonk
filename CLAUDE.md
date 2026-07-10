@@ -8,7 +8,7 @@ DeepThonk implements OpenDeepThink as a provider-neutral TypeScript CLI + MCP se
 
 ## Toolchain
 
-Uses `pnpm` workspaces (not bun) — pinned to `pnpm@11.8.0` via the root `packageManager` field (pnpm 11 requires **Node ≥ 22.13** and is needed for OIDC trusted publishing). Node ESM (`"type": "module"`). TypeScript with project references; tests use Vitest with path aliases that resolve `@deepthonk/*` to `packages/*/src` so tests run against source, not built `dist/`. `pnpm-workspace.yaml` sets `allowBuilds: { esbuild: true }` (pnpm 11 errors on unapproved build scripts).
+Uses `pnpm` workspaces (not bun) — pinned to `pnpm@11.8.0` via the root `packageManager` field (pnpm 11 requires **Node ≥ 22.13** and is needed for OIDC trusted publishing). Node ESM (`"type": "module"`). TypeScript 7 with project references; tests use Vitest 4 with path aliases that resolve `@deepthonk/*` to `packages/*/src` so tests run against source, not built `dist/`. `pnpm-workspace.yaml` sets `allowBuilds: { esbuild: true }` (pnpm 11 errors on unapproved build scripts). CI runs Node 22 and 24; `@types/node` stays on `^22` to match the floor.
 
 ## Commands
 
@@ -44,7 +44,7 @@ The CLI also exposes `dt` as a short alias once installed. Built bin is `package
 
 Four workspace packages, all `@deepthonk/*`:
 
-- **`packages/core`** — algorithm engine. `runner.ts` orchestrates the OpenDeepThink loop; `bradleyTerry.ts` fits scores; `pairScheduler.ts` builds k-regular comparison graphs; `critique.ts` aggregates judge feedback per candidate; `budget.ts` + `budgetTracker.ts` plan/enforce call/token/USD caps; `traceStore.ts` writes the run directory layout (`config.json`, `events.jsonl`, `candidates.jsonl`, `comparisons.jsonl`, `scores.jsonl`, `status.json`, `summary.json`, `artifacts/`); `prompts.ts` defines `general` and `paper-programming` prompt styles; `schemas.ts` is the Zod source of truth for `RunConfig`, `Candidate`, `Comparison`, `Profile`, and the `ModelDriver` interface.
+- **`packages/core`** — algorithm engine. `runner.ts` orchestrates the OpenDeepThink loop; `bradleyTerry.ts` fits scores; `pairScheduler.ts` builds k-regular comparison graphs; `critique.ts` aggregates judge feedback per candidate; `budget.ts` + `budgetTracker.ts` plan/enforce call/token/USD caps; `traceStore.ts` writes the run directory layout (`config.json`, `events.jsonl`, `candidates.jsonl`, `comparisons.jsonl`, `scores.jsonl`, `status.json`, `summary.json`, `artifacts/`); `prompts.ts` defines `general` and `paper-programming` prompt styles; `schemas.ts` is the Zod 4 source of truth for `RunConfig`, `Candidate`, `Comparison`, `Profile`, and the `ModelDriver` interface — and it is re-exported from `index.ts`, so it is public API (see *Zod 4* below).
 - **`packages/providers`** — `ModelDriver` implementations. `fake.ts` (deterministic, no network), `openaiCompatible.ts` (covers DeepSeek, OpenRouter, custom OpenAI-compatible endpoints — driver falls back from JSON-mode to text + robust JSON extraction). `registry.ts` exposes `createDriver(ProviderConfig)` and a `RoleRoutingDriver` so per-role models (generator / mutator / judge / finalizer) can target different providers. `pricing.ts` + `defaults.ts` hold default USD pricing keyed by `(provider, model)`.
 - **`packages/mcp`** — MCP server over the same core. `server.ts` registers tools (`deepthonk.plan|start|status|result|cancel|run|rank|mutate|resume|export`), resources (`deepthonk://runs/...` and `deepthonk://jobs/...`), and prompt templates. Stdio is default; Streamable HTTP available on `127.0.0.1:{port}/mcp`. Uses the stable `@modelcontextprotocol/sdk` (not the alpha split packages). MCP Sampling is available as a provider when running as an MCP server with a sampling-capable client. CLI standalone runs cannot use sampling — they need a direct provider.
 - **`packages/cli`** — `commander`-based CLI. Each subcommand lives in `src/commands/*.ts` (`plan`, `run`, `inspect`, `resume`, `export`, `rank`, `mutate`, `setup`, `serveMcp`). `config.ts` loads/merges YAML from `~/.config/deepthonk/config.yaml` and exposes resolution helpers. CLI errors funnel through `--json-errors` for machine-readable stderr.
@@ -63,6 +63,33 @@ The CLI and MCP server are wrappers — keep algorithm logic in core. Do not dup
 - Streamable HTTP MCP transport (`packages/mcp/src/server.ts`) must keep `enableDnsRebindingProtection: true` and `allowedHosts` set to `127.0.0.1:<port>`/`localhost:<port>` (CVE-2025-66414 / GHSA-w48q-cv73-mx4w). Loopback bind alone is not enough — a browser DNS-rebinding attack bypasses it.
 - Background `deepthonk.start` handlers in `packages/mcp/src/tools.ts` must wrap *both* the `.then` and `.catch` bodies in their own try/catch so a filesystem error (disk full, run dir gone) cannot escape as an unhandled rejection and tear down the server. The CLI also installs a process-level `unhandledRejection` guard in `packages/cli/src/index.ts`.
 - Dry-run redaction (`packages/cli/src/commands/run.ts`) uses an anchored secret-key regex so env-var metadata fields (`apiKeyEnv`, `apiKeyFile`, `apiKeyStdin`) remain visible while actual secret-shaped keys are masked.
+
+## Zod 4 (since v0.3.0)
+
+`zod` is **part of `@deepthonk/core`'s published API** — `index.ts` does `export * from "./schemas.js"`, and zod is a runtime `dependencies` entry in all four published packages. A zod major bump changes the emitted `.d.ts` and the runtime `ZodError` class for anyone composing these schemas, so it is a **breaking release**, never a patch.
+
+Traps that bit this repo during the v3 → v4 migration:
+
+- **Enum-keyed records became exhaustive.** `z.record(z.enum([...]), v)` was *partial* in zod 3 and requires **every** key in zod 4. Use `z.partialRecord(z.enum([...]), v)` for optional-key maps like the `providers:` block in `packages/providers/src/externalConfig.ts`. This type-checks either way — the compiler will not save you; only tests will.
+- `z.record(v)` no longer takes one argument. Always `z.record(z.string(), v)`.
+- `z.ZodIssueCode.custom` is gone. Pass the string literal `code: "custom"` to `ctx.addIssue`.
+- Default error text changed (`Too big: expected number to be <=1024`, not `Number must be less than or equal to 1024`) and `ZodError.message` serializes issues as JSON. It reaches MCP error strings via `formatZodIssues`. **Never assert on zod's exact wording in tests** — assert the bound and the semantics, or zod 5 breaks them again.
+- Use zod 4's built-in `z.toJSONSchema`. `zod-to-json-schema` is removed; it does not support v4 schemas.
+- `.strict()`, `.passthrough()`, `.datetime()`, `.url()`, and `superRefine` still work in 4.x but are deprecated and will be removed in zod 5.
+
+## Dependency conventions
+
+- **Anything `test/` imports must be declared in the root `package.json`.** `test/` lives at the workspace root, so a package that only reaches it transitively resolves fine locally and then fails CI with `ERR_MODULE_NOT_FOUND` under `pnpm install --frozen-lockfile`. This has happened three times (`yaml`, `@modelcontextprotocol/sdk`, `zod`). A clean-tree check catches it: `rm -rf node_modules packages/*/node_modules && pnpm install --frozen-lockfile && pnpm test`.
+- `@deepthonk/core` depends only on `zod`. **Do not add `p-limit`** — it was removed in v0.3.0 because nothing imported it; `phaseRunner.ts` has its own worker pool.
+- `@types/node` tracks the runtime floor (`^22`), not the newest release. `dependabot.yml` ignores its majors.
+- `dependabot.yml` groups only minor/patch npm updates. Majors open individually and must be evaluated one at a time — a single grouped PR of five majors is unreviewable and permanently red.
+- `packages/cli` declares `"engines": { "node": ">=22.13" }` because Commander 15 requires Node ≥ 22.12.
+
+## Test conventions
+
+- Never pass `os.tmpdir()` (or `join(runDir, "..")` where `runDir` came from `mkdtemp(tmpdir())`) as a runs-root. `listRunRecords` `readdir`s the runs-root, so it will enumerate every sibling temp dir any other test or prior run left behind, and `listRunResources` truncates at `MAX_LISTED_RESOURCES = 100`. Nest the run inside its own `mkdtemp` runs-root.
+- A green suite on a clean `TMPDIR` proves little; CI always has one. Re-run against a dirty tmpdir before trusting an isolation fix.
+- `pnpm test` appends to the repo's `runs/index.jsonl` because `recordRunResource` defaults `runsRoot` to `"runs"` relative to cwd. That is intended product behavior (it is how `deepthonk://runs` discovers runs stored elsewhere), not a bug to "fix" casually — changing it alters a published MCP surface.
 
 ## Acceptance check before claiming a change is done
 

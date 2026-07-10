@@ -20,7 +20,9 @@ Core requirements:
 - MCP is a protocol wrapper over core execution, not a separate execution engine.
 - The Streamable HTTP transport must keep DNS rebinding protection on and validate `Host` against the loopback bind (CVE-2025-66414 class). Do not remove that guard when extending the transport.
 - Background MCP jobs (`deepthonk.start`) must wrap both their success and failure handlers so a filesystem error cannot escape as an unhandled rejection.
-- Use `pnpm`, TypeScript, Vitest, Zod, Commander, `p-limit`, YAML, and the stable official MCP TypeScript SDK package `@modelcontextprotocol/sdk`.
+- Use `pnpm`, TypeScript, Vitest, Zod 4, Commander, YAML, and the stable official MCP TypeScript SDK package `@modelcontextprotocol/sdk`. Do **not** add `p-limit`: it was removed in v0.3.0 because nothing imported it — `phaseRunner.ts` implements its own worker pool.
+- `zod` is part of `@deepthonk/core`'s **published** API (`index.ts` re-exports `schemas.ts`). A Zod major bump is a breaking release, not a dependency chore.
+- Anything `test/` imports must be declared in the **root** `package.json`. `test/` sits at the workspace root, so a package reaching it only transitively resolves locally and then fails CI with `ERR_MODULE_NOT_FOUND`. This has bitten `yaml`, `@modelcontextprotocol/sdk`, and `zod`.
 
 Acceptance checks:
 

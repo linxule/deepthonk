@@ -56,6 +56,8 @@ Reference: https://docs.npmjs.com/trusted-publishers/
 
 2. Choose the next unused version. All four published packages must use the same version; never reuse a partially published version.
 
+   Decide whether the release is **breaking**. `@deepthonk/core` re-exports `schemas.ts` from `index.ts`, so its Zod schemas are public API and `zod` is a runtime dependency of all four packages. A Zod **major** bump therefore changes the emitted `.d.ts` and the runtime `ZodError` class for any consumer composing those schemas — that is a breaking release (under 0.x, a minor: `0.2.x` → `0.3.0`), not a patch. The same reasoning applies to any dependency whose types leak into the published surface. `v0.3.0` was exactly this case.
+
 3. Update exactly these manifests:
 
    ```text

@@ -4,11 +4,23 @@ Thanks for considering a contribution to DeepThonk.
 
 ## Development
 
+Requires Node ≥ 22.13 (pnpm 11's floor; the published CLI declares the same in `engines`).
+
 ```bash
 pnpm install
 pnpm run build
 pnpm test
 pnpm run lint        # typecheck across all workspace packages
+```
+
+### If you add or remove a dependency
+
+`test/` lives at the workspace root, so anything it imports must be declared in the **root** `package.json`. A package that only reaches it transitively resolves fine against a warm `node_modules` and then fails CI with `ERR_MODULE_NOT_FOUND`. Reproduce CI's resolution before pushing:
+
+```bash
+rm -rf node_modules packages/*/node_modules
+pnpm install --frozen-lockfile
+pnpm test
 ```
 
 ## Acceptance smoke before opening a PR

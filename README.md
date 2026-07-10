@@ -12,6 +12,8 @@ Use it for hard, verifiable reasoning, coding, planning, and synthesis where bre
 
 ## Quickstart
 
+Requires **Node ≥ 22.13**.
+
 Run without installing:
 
 ```bash
