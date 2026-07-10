@@ -32,16 +32,16 @@ jobs:
     name: build + verify + pnpm publish (OIDC)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # pnpm version is read from package.json "packageManager" (pnpm@11.8.0).
       # pnpm 11+ is required for native OIDC trusted publishing. Do NOT also set
       # a `version:` here — action-setup errors on a mismatch with packageManager.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           run_install: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
