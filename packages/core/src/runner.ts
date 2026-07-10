@@ -2,9 +2,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { fitBradleyTerry } from "./bradleyTerry.js";
+import { canonicalizeComparisons, fitBradleyTerry } from "./bradleyTerry.js";
 import { BudgetTracker } from "./budgetTracker.js";
 import type { CallReservation } from "./budgetTracker.js";
+import {
+  readValidatedPhaseReceiptUsage,
+  runCheckpointedPhase,
+  traceSchemaVersion,
+  validatePhaseCommit,
+  validatePhaseCommitIfPresent,
+  writePhaseCommit
+} from "./checkpointStore.js";
 import { planBudget, validateProfile } from "./budget.js";
 import { BudgetExceededError, CancelledError, ConfigError, DeepThonkError } from "./errors.js";
 import { runArtifactFiles } from "./artifacts.js";
@@ -29,6 +37,7 @@ import { createRng, type Rng } from "./rng.js";
 import {
   assertNoPruneInProgress,
   assertNoLegacyRedactedBudget,
+  applyUsageRecords,
   buildPopulationMap,
   buildResumePlan,
   groupComparisons,
@@ -40,10 +49,13 @@ import {
   resolveResumeRunId,
   resumeConfigError,
   toResumePlanStatus,
+  validateUsageRecords,
+  validatedReceiptUsageIds,
   type PhaseCursor
 } from "./resume.js";
 import {
   runConfigSchema,
+  resolveRunConfigDefaults,
   builtInProfiles,
   type BuiltInProfileName,
   type BtScore,
@@ -73,6 +85,7 @@ export interface RunControl {
   jobId?: string;
   lockClaim?: RunLockClaim;
   shouldCancel?: () => boolean | Promise<boolean>;
+  signal?: AbortSignal;
 }
 
 export interface ResumeDeepThonkOptions {
@@ -126,7 +139,7 @@ export async function runDeepThonk(
   control: RunControl = {},
   resumeState?: ResumeState
 ): Promise<RunResult> {
-  const config = runConfigSchema.parse(configInput);
+  const config = resolveRunConfigDefaults(runConfigSchema.parse(configInput));
   validateProfile(config.profile);
   enforceBudget(config);
 
@@ -185,7 +198,7 @@ export async function runDeepThonk(
     });
   };
   const assertNotCancelled = async (phase: string): Promise<void> => {
-    if (await control.shouldCancel?.()) {
+    if (control.signal?.aborted || (await control.shouldCancel?.())) {
       throw new CancelledError(`Run cancelled before ${phase}.`, {
         code: "run.cancelled",
         retryable: false,
@@ -241,9 +254,13 @@ export async function runDeepThonk(
       population = resumePopulation(resumeState, 0);
     } else {
       await assertNotCancelled("initial population");
-      population = await generateInitialPopulation(config, driver, trace, rng, runId, tracker, guards);
+      population = await generateInitialPopulation(config, driver, trace, rng, runId, tracker, guards, control.signal);
       await trace.writePopulation(0, population);
       await assertBudget("initial population");
+      await writePhaseCommit(config.runDir, "initial_generation", {
+        population,
+        usage: await phaseUsageRows(trace, "initial_generation")
+      });
       await markPhaseCompleted(trace, "initial_generation");
       await writeStatus("running", "population_completed", { generation: 0 });
     }
@@ -278,12 +295,18 @@ export async function runDeepThonk(
           pairs,
           population,
           tracker,
-          guards
+          guards,
+          signal: control.signal
         });
 
         scores = fitBradleyTerry(population, comparisons, config.profile.lambda, gen);
         await trace.writeScores(gen, scores);
         await assertBudget(`generation ${gen} comparisons`);
+        await writePhaseCommit(config.runDir, `generation_judging:${gen}`, {
+          comparisons,
+          scores,
+          usage: await phaseUsageRows(trace, `generation_judging:${gen}`)
+        });
         await markPhaseCompleted(trace, "generation_judging", gen);
       }
 
@@ -292,7 +315,9 @@ export async function runDeepThonk(
       const discarded = bottomQuartile(ranked);
       const survivors = ranked.filter((candidate) => !discarded.has(candidate.id));
       const mutationParents = survivors.slice(0, config.profile.n - elites.length);
-      const critiquesByCandidate = aggregateCritiques(population, comparisons);
+      const critiquesByCandidate = aggregateCritiques(population, comparisons, {
+        aggregateChars: config.critiqueLimits.aggregateChars
+      });
 
       await assertNotCancelled(`generation ${gen} mutation`);
       await writeStatus("running", "generation_mutation", { generation: gen });
@@ -305,7 +330,8 @@ export async function runDeepThonk(
         survivors: mutationParents,
         critiquesByCandidate,
         tracker,
-        guards
+        guards,
+        signal: control.signal
       });
 
       const eliteCopies = copyElites(elites, gen);
@@ -316,6 +342,10 @@ export async function runDeepThonk(
       population = keepPopulationSize([...eliteCopies, ...mutants], config.profile.n);
       await trace.writePopulation(gen, population);
       await assertBudget(`generation ${gen} mutation`);
+      await writePhaseCommit(config.runDir, `generation_mutation:${gen}`, {
+        population,
+        usage: await phaseUsageRows(trace, `generation_mutation:${gen}`)
+      });
       await markPhaseCompleted(trace, "generation_mutation", gen);
       await writeStatus("running", "generation_completed", { generation: gen });
     }
@@ -328,12 +358,16 @@ export async function runDeepThonk(
     } else {
       await assertNotCancelled("final ranking");
       await writeStatus("running", "final_ranking", { generation: "final" });
-      const finalRng = phaseRng(config.seed, "final_judging");
-      const finalPairs = makeKRegularPairs(
-        population.map((candidate) => candidate.id),
-        config.profile.m,
-        finalRng
-      );
+      const finalRng = config.rank
+        ? createRng(config.rank.seed ?? hashSeed(`${config.seed}:final_judging:`))
+        : phaseRng(config.seed, "final_judging");
+      const finalPairs = config.rank
+        ? configuredFinalPairs(population.map((candidate) => candidate.id), config.rank, finalRng)
+        : makeKRegularPairs(
+            population.map((candidate) => candidate.id),
+            config.profile.m,
+            finalRng
+          );
       finalComparisons = await judgePairs({
         config,
         driver,
@@ -344,11 +378,17 @@ export async function runDeepThonk(
         pairs: finalPairs,
         population,
         tracker,
-        guards
+        guards,
+        signal: control.signal
       });
       finalScores = fitBradleyTerry(population, finalComparisons, config.profile.lambda, "final");
       await trace.writeScores("final", finalScores);
       await assertBudget("final ranking");
+      await writePhaseCommit(config.runDir, "final_judging", {
+        comparisons: finalComparisons,
+        scores: finalScores,
+        usage: await phaseUsageRows(trace, "final_judging")
+      });
       await markPhaseCompleted(trace, "final_judging");
     }
     const winner = rankPopulation(population, finalScores)[0];
@@ -356,7 +396,7 @@ export async function runDeepThonk(
 
     await assertNotCancelled("finalization");
     await writeStatus("running", "finalizing", { generation: "final" });
-    const finalAnswer = await maybeFinalize(winner, config, driver, trace, tracker, guards);
+    const finalAnswer = await maybeFinalize(winner, config, driver, trace, tracker, guards, control.signal);
     await assertBudget("finalization");
     const completedAt = new Date().toISOString();
     const summary = {
@@ -375,6 +415,12 @@ export async function runDeepThonk(
       completed_at: completedAt
     };
     await trace.writeSummary(summary, finalAnswer, winner.content);
+    await writePhaseCommit(config.runDir, "finalizing", {
+      summary,
+      finalAnswer,
+      winner: winner.content,
+      usage: await phaseUsageRows(trace, "finalizing")
+    });
     await markPhaseCompleted(trace, "finalizing");
     await trace.event({ type: "run.completed", winner_id: winner.id, completed_at: completedAt });
     if (resumeState) await trace.event({ type: "run.resumed_completed", winner_id: winner.id, completed_at: completedAt });
@@ -399,9 +445,16 @@ export async function runDeepThonk(
     await bestEffortTraceWrite("run failure status", () => writeStatus(state, state, { error: serialized }));
     throw error;
   } finally {
-    if (ownsLock) {
+    let closeError: unknown;
+    try {
+      await trace.close();
+    } catch (error) {
+      if (caughtError !== undefined) process.stderr.write(`deepthonk: failed to close trace handles: ${(error as Error).message}\n`);
+      else closeError = error;
+    }
+    if (ownsLock || verifiedPreclaim) {
       try {
-        await releaseRunLock(config.runDir, ownedLockClaimId);
+        await releaseRunLock(config.runDir, ownsLock ? ownedLockClaimId : control.lockClaim?.claimId);
       } catch (error) {
         if (caughtError !== undefined) {
           process.stderr.write(`deepthonk: failed to release run lock: ${(error as Error).message}\n`);
@@ -410,6 +463,7 @@ export async function runDeepThonk(
         }
       }
     }
+    if (closeError !== undefined) throw closeError;
   }
 }
 
@@ -418,15 +472,6 @@ export async function resumeDeepThonk(
   driver: ModelDriver,
   options: ResumeDeepThonkOptions = {}
 ): Promise<RunResult | ResumePlan> {
-  const existingSummary = await readOptionalJson<Record<string, unknown>>(runDir, runArtifactFiles.summary);
-  if (existingSummary) {
-    resumeConfigError(
-      "Run already has summary.json; nothing to resume.",
-      "resume.already_complete",
-      "Use deepthonk inspect/result to read the completed run."
-    );
-  }
-
   const rawConfig = await readRequiredConfig(runDir);
   assertNoLegacyRedactedBudget(rawConfig);
   const currentVersion = await currentPackageVersion();
@@ -439,7 +484,7 @@ export async function resumeDeepThonk(
   }
   assertStoredOutputConfigComplete(rawConfig);
   const parsedConfig = runConfigSchema.parse(rawConfig);
-  const config: RunConfig = { ...parsedConfig, runDir };
+  const config = resolveRunConfigDefaults({ ...parsedConfig, runDir });
   validateProfile(config.profile);
   enforceBudget(config);
 
@@ -456,6 +501,7 @@ export async function resumeDeepThonk(
   }
 
   try {
+    const existingSummary = await readOptionalFinalSummary(runDir, rawConfig.traceSchemaVersion === traceSchemaVersion);
     const status = await readOptionalJson<RunStatus>(runDir, runArtifactFiles.status);
     if ((status?.state === "running" || status?.state === "pending") && isLiveWorker(status.worker_pid)) {
       resumeConfigError(
@@ -468,20 +514,66 @@ export async function resumeDeepThonk(
     const trace = await readResumeTrace(runDir);
     const runId = resolveResumeRunId(config, status, trace.events);
     const plan = buildResumePlan(config, trace.events);
-    if (plan.nextPhase.phase === "summary") {
+    if (existingSummary && rawConfig.traceSchemaVersion !== traceSchemaVersion) {
       resumeConfigError(
-        "Trace says finalizing completed, but summary.json is missing.",
-        "resume.inconsistent_trace",
-        "Inspect the run directory and restore summary.json, or start a fresh run."
+        "Run already has summary.json; nothing to resume.",
+        "resume.already_complete",
+        "Use deepthonk inspect/result to read the completed run."
+      );
+    }
+    if (
+      existingSummary &&
+      rawConfig.traceSchemaVersion === traceSchemaVersion &&
+      plan.nextPhase.phase !== "finalizing" &&
+      plan.nextPhase.phase !== "summary"
+    ) {
+      resumeConfigError(
+        `summary.json exists before the finalizing phase boundary (${plan.nextPhase.phase}).`,
+        "resume.trace_v2_integrity",
+        "Restore the matching finalization artifacts or start a fresh run."
       );
     }
 
     const planStatus = toResumePlanStatus(runDir, runId, plan);
-    const pruned = pruneTraceToPlan(trace, plan);
+    let receiptUsageIds: Set<string> | undefined;
+    if (rawConfig.traceSchemaVersion === traceSchemaVersion) {
+      const receiptUsage = await readValidatedPhaseReceiptUsage(runDir, phaseCursorKey(plan.nextPhase));
+      receiptUsageIds = validatedReceiptUsageIds(receiptUsage);
+    }
+    const pruned = pruneTraceToPlan(trace, plan, { dropUsageIds: receiptUsageIds });
     assertResumeRunIdsAgree(runId, config, status, pruned);
     const populationByGeneration = buildPopulationMap(config, pruned.populations, pruned.candidates, plan);
     const comparisonsByGeneration = groupComparisons(pruned.comparisons);
     const scoresByGeneration = reconstructScores(config, populationByGeneration, comparisonsByGeneration, pruned.scores, plan, runId);
+    validateUsageRecords(pruned.usage);
+    if (rawConfig.traceSchemaVersion === traceSchemaVersion) {
+      await validateTraceV2CompletedPhases(
+        runDir,
+        config,
+        plan.completed,
+        populationByGeneration,
+        comparisonsByGeneration,
+        scoresByGeneration,
+        pruned.usage
+      );
+      if (plan.nextPhase.phase === "finalizing" && !plan.completed.has("finalizing")) {
+        await validatePhaseCommitIfPresent(runDir, "finalizing", await finalizingArtifacts(runDir, trace.usage));
+      }
+    }
+    if (plan.nextPhase.phase === "summary") {
+      if (existingSummary) {
+        resumeConfigError(
+          "Run already has a validated summary.json and finalizing commit; nothing to resume.",
+          "resume.already_complete",
+          "Use deepthonk inspect/result to read the completed run."
+        );
+      }
+      resumeConfigError(
+        "Trace says finalizing completed, but summary.json is missing or invalid.",
+        rawConfig.traceSchemaVersion === traceSchemaVersion ? "resume.trace_v2_integrity" : "resume.inconsistent_trace",
+        "Inspect the run directory and restore the matching finalization artifacts, or start a fresh run."
+      );
+    }
     if (options.dryRun) return planStatus;
 
     const tracker = replayBudgetUsage(config, pruned.usage);
@@ -573,7 +665,7 @@ function resumeComparisons(resumeState: ResumeState | undefined, generation: num
       fix: "Inspect the run directory for missing comparison trace rows."
     });
   }
-  return comparisons;
+  return canonicalizeComparisons(comparisons);
 }
 
 function resumeScores(
@@ -602,6 +694,16 @@ function hashSeed(value: string): number {
 function resumePhaseKey(phase: PhaseName, generation?: number): string {
   if ((phase === "generation_judging" || phase === "generation_mutation") && generation !== undefined) return `${phase}:${generation}`;
   return phase;
+}
+
+function phaseCursorKey(cursor: PhaseCursor): string {
+  if (
+    (cursor.phase === "generation_judging" || cursor.phase === "generation_mutation") &&
+    typeof cursor.generation === "number"
+  ) {
+    return `${cursor.phase}:${cursor.generation}`;
+  }
+  return cursor.phase;
 }
 
 function providerLabel(driver: ModelDriver): string | undefined {
@@ -867,9 +969,34 @@ async function readRequiredConfig(runDir: string): Promise<Record<string, unknow
   return config;
 }
 
+async function readOptionalFinalSummary(
+  runDir: string,
+  traceV2: boolean
+): Promise<Record<string, unknown> | undefined> {
+  try {
+    return await readOptionalJson<Record<string, unknown>>(runDir, runArtifactFiles.summary);
+  } catch (error) {
+    if (!traceV2) throw error;
+    throw new ConfigError(`Could not parse summary.json: ${(error as Error).message}`, {
+      code: "resume.trace_v2_integrity",
+      retryable: false,
+      fix: "Restore summary.json from the same completed run, or resume from the pre-finalization artifacts."
+    });
+  }
+}
+
 async function readOptionalJson<T>(runDir: string, fileName: string): Promise<T | undefined> {
   try {
     return JSON.parse(await readFile(join(runDir, fileName), "utf8")) as T;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function readOptionalText(runDir: string, fileName: string): Promise<string | undefined> {
+  try {
+    return await readFile(join(runDir, fileName), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
@@ -911,9 +1038,86 @@ export function copyElites(elites: Candidate[], generation: number): Candidate[]
     status: "elite",
     metadata: {
       ...candidate.metadata,
-      createdAt: new Date().toISOString()
+      createdAt: candidate.metadata.createdAt
     }
   }));
+}
+
+async function validateTraceV2CompletedPhases(
+  runDir: string,
+  config: RunConfig,
+  completed: Set<string>,
+  populations: Map<number, Candidate[]>,
+  comparisons: Map<number | "final", Comparison[]>,
+  scores: Map<number | "final", BtScore[]>,
+  usage: UsageRecord[]
+): Promise<void> {
+  if (completed.has("initial_generation")) {
+    await validatePhaseCommit(runDir, "initial_generation", {
+      population: populations.get(0),
+      usage: usage.filter((record) => usagePhaseKey(record.phase) === "initial_generation")
+    });
+  }
+  for (let generation = 1; generation <= config.profile.t; generation += 1) {
+    if (completed.has(`generation_judging:${generation}`)) {
+      const phaseKey = `generation_judging:${generation}`;
+      await validatePhaseCommit(runDir, phaseKey, {
+        comparisons: comparisons.get(generation),
+        scores: scores.get(generation),
+        usage: usage.filter((record) => usagePhaseKey(record.phase) === phaseKey)
+      });
+    }
+    if (completed.has(`generation_mutation:${generation}`)) {
+      const phaseKey = `generation_mutation:${generation}`;
+      await validatePhaseCommit(runDir, phaseKey, {
+        population: populations.get(generation),
+        usage: usage.filter((record) => usagePhaseKey(record.phase) === phaseKey)
+      });
+    }
+  }
+  if (completed.has("final_judging")) {
+    await validatePhaseCommit(runDir, "final_judging", {
+      comparisons: comparisons.get("final"),
+      scores: scores.get("final"),
+      usage: usage.filter((record) => usagePhaseKey(record.phase) === "final_judging")
+    });
+  }
+  if (completed.has("finalizing")) {
+    await validatePhaseCommit(runDir, "finalizing", await finalizingArtifacts(runDir, usage));
+  }
+}
+
+async function finalizingArtifacts(runDir: string, usage: UsageRecord[]): Promise<Record<string, unknown>> {
+  try {
+    return {
+      summary: await readOptionalJson<Record<string, unknown>>(runDir, runArtifactFiles.summary),
+      finalAnswer: await readOptionalText(runDir, runArtifactFiles.final),
+      winner: await readOptionalText(runDir, runArtifactFiles.winner),
+      usage: usage.filter((record) => usagePhaseKey(record.phase) === "finalizing")
+    };
+  } catch (error) {
+    throw new ConfigError(`Could not read finalization artifacts: ${(error as Error).message}`, {
+      code: "resume.trace_v2_integrity",
+      retryable: false,
+      fix: "Restore summary.json, final.txt, and winner.txt from the same completed run."
+    });
+  }
+}
+
+async function phaseUsageRows(trace: TraceStore, phaseKey: string): Promise<UsageRecord[]> {
+  const usage = await trace.readJsonl<UsageRecord>(runArtifactFiles.usage).catch(() => []);
+  return usage.filter((record) => usagePhaseKey(record.phase) === phaseKey);
+}
+
+function usagePhaseKey(phase: string): string | undefined {
+  if (phase === "gen0_initial") return "initial_generation";
+  if (phase === "final_judge") return "final_judging";
+  if (phase === "finalize") return "finalizing";
+  const judge = /^gen(\d+)_judge$/.exec(phase);
+  if (judge) return `generation_judging:${judge[1]}`;
+  const mutation = /^gen(\d+)_mutate$/.exec(phase);
+  if (mutation) return `generation_mutation:${mutation[1]}`;
+  return undefined;
 }
 
 export function keepPopulationSize(population: Candidate[], n: number): Candidate[] {
@@ -950,15 +1154,33 @@ async function generateInitialPopulation(
   rng: Rng,
   runId: string,
   tracker: BudgetTracker,
-  guards: RunGuards
+  guards: RunGuards,
+  signal?: AbortSignal
 ): Promise<Candidate[]> {
   const jobs = Array.from({ length: config.profile.n }, (_, index) => ({
     index,
     id: `g0_c${index}_${rng.id("c")}`,
     prompt: generatePrompt(config.task, config.rubric, config.promptStyle, config.promptOverrides?.generate)
   }));
-  const candidates = await runLimitedPhase(
-    jobs.map((job) => async () => {
+  const promptRef = config.output.includePrompts && jobs[0] ? await trace.writePrompt(jobs[0].prompt) : undefined;
+  const candidates = await runCheckpointedPhase({
+    runDir: config.runDir,
+    phaseKey: "initial_generation",
+    jobs: jobs.map((job) => {
+      const receiptUsage: UsageRecord[] = [];
+      return {
+      id: job.id,
+      input: {
+        task: config.task,
+        rubric: config.rubric,
+        model: config.generatorModel,
+        temperature: config.profile.sampleTemperature,
+        candidateIndex: job.index,
+        prompt: job.prompt,
+        maxOutputTokens: config.modelOutputTokens?.generation ?? 4_096
+      },
+      receiptUsage: () => receiptUsage,
+      run: async (phaseSignal: AbortSignal) => {
         const reservation = await guards.beforeCall("initial population call");
         let result: ModelTextResult;
         try {
@@ -968,7 +1190,9 @@ async function generateInitialPopulation(
             model: config.generatorModel,
             temperature: config.profile.sampleTemperature,
             candidateIndex: job.index,
-            prompt: job.prompt
+            prompt: job.prompt,
+            signal: phaseSignal,
+            maxOutputTokens: config.modelOutputTokens?.generation ?? 4_096
           });
         } catch (error) {
           await recordFailedInvocation({
@@ -984,14 +1208,16 @@ async function generateInitialPopulation(
           throw error;
         }
         const delta = tracker.record(result, { provider: config.provider, model: config.generatorModel }, reservation);
-        await trace.writeUsage(buildUsageRecord({
+        const usageRecord = buildUsageRecord({
           phase: "gen0_initial",
           role: "generator",
           result,
           delta,
           provider: result.provider ?? config.provider,
           model: result.model ?? config.generatorModel
-        }));
+        });
+        receiptUsage.push(usageRecord);
+        await trace.writeUsage(usageRecord);
         await guards.afterCall("initial population call");
         const candidate: Candidate = {
           id: job.id,
@@ -999,14 +1225,21 @@ async function generateInitialPopulation(
           kind: "initial",
           content: result.text,
           status: "generated",
-          metadata: resultMetadata(result, config, job.prompt)
+          metadata: resultMetadata(result, config, promptRef)
         };
-        await trace.writeCandidate(candidate);
-        await trace.event({ type: "candidate.generated", run_id: runId, candidate_id: candidate.id });
         return candidate;
-      }),
-    config.concurrency.generate
-  );
+      }
+    };
+    }),
+    concurrency: config.concurrency.generate,
+    signal,
+    validateOutput: isCandidateCheckpoint,
+    onResult: async (candidate, context) => {
+      if (context.reused) await restoreCheckpointUsage(context.receiptUsage, tracker, trace);
+      await trace.writeCandidate(candidate);
+      await trace.event({ type: "candidate.generated", run_id: runId, candidate_id: candidate.id });
+    }
+  });
   return candidates;
 }
 
@@ -1021,6 +1254,7 @@ async function judgePairs(args: {
   population: Candidate[];
   tracker: BudgetTracker;
   guards: RunGuards;
+  signal?: AbortSignal;
 }): Promise<Comparison[]> {
   const byId = new Map(args.population.map((candidate) => [candidate.id, candidate]));
   const jobs = args.pairs.map((pair, pairIndex) => {
@@ -1037,11 +1271,32 @@ async function judgePairs(args: {
       presentedA,
       presentedB,
       id: `${args.generation}_cmp_${pairIndex}_${args.rng.id("cmp")}`,
-      prompt: comparePrompt(args.config.task, presentedA, presentedB, args.config.rubric, args.config.promptStyle, args.config.promptOverrides?.compare)
+      prompt: comparePrompt(args.config.task, presentedA, presentedB, args.config.rubric, args.config.promptStyle, args.config.promptOverrides?.compare),
+      promptRef: undefined as Awaited<ReturnType<TraceStore["writePrompt"]>> | undefined
     };
   });
-  const comparisons = await runLimitedPhase(
-    jobs.map((job) => async () => {
+  const phaseKey = args.generation === "final" ? "final_judging" : `generation_judging:${args.generation}`;
+  const comparisons = await runCheckpointedPhase({
+    runDir: args.config.runDir,
+    phaseKey,
+    jobs: jobs.map((job) => {
+      const receiptUsage: UsageRecord[] = [];
+      return {
+      id: job.id,
+      input: {
+        task: args.config.task,
+        rubric: args.config.rubric,
+        model: args.config.judgeModel,
+        temperature: args.config.profile.judgeTemperature,
+        candidateA: job.presentedA,
+        candidateB: job.presentedB,
+        prompt: job.prompt,
+        invalidJsonRetries: args.config.retry.invalidJsonRetries,
+        maxOutputTokens: args.config.modelOutputTokens?.judge ?? 1_024
+      },
+      receiptUsage: () => receiptUsage,
+      run: async (phaseSignal: AbortSignal) => {
+        if (args.config.output.includePrompts && !job.promptRef) job.promptRef = await args.trace.writePrompt(job.prompt);
         let parsed: z.infer<typeof compareOutputSchema> | undefined;
         let rawOutput: unknown;
         let invalidJson = false;
@@ -1066,7 +1321,9 @@ async function judgePairs(args: {
               temperature: args.config.profile.judgeTemperature,
               candidateA: job.presentedA,
               candidateB: job.presentedB,
-              prompt: job.prompt
+              prompt: job.prompt,
+              signal: phaseSignal,
+              maxOutputTokens: args.config.modelOutputTokens?.judge ?? 1_024
             });
           } catch (error) {
             await recordFailedInvocation({
@@ -1082,14 +1339,16 @@ async function judgePairs(args: {
             throw error;
           }
           const delta = args.tracker.record(result, { provider: args.config.provider, model: args.config.judgeModel }, reservation);
-          await args.trace.writeUsage(buildUsageRecord({
+          const usageRecord = buildUsageRecord({
             phase: args.generation === "final" ? "final_judge" : `gen${args.generation}_judge`,
             role: "judge",
             result,
             delta,
             provider: result.provider ?? args.config.provider,
             model: result.model ?? args.config.judgeModel
-          }));
+          });
+          receiptUsage.push(usageRecord);
+          await args.trace.writeUsage(usageRecord);
           await args.guards.afterCall(`${args.generation} comparison call`);
           inputTokens += result.usage?.inputTokens ?? 0;
           inputCacheHitTokens += result.usage?.inputCacheHitTokens ?? 0;
@@ -1149,20 +1408,27 @@ async function judgePairs(args: {
             scheduled_candidate_a_id: job.originalA.id,
             scheduled_candidate_b_id: job.originalB.id,
             provider_retry_count: resultRetryCount || undefined,
-            prompt: args.config.output.includePrompts ? job.prompt : undefined
+            promptRef: job.promptRef
           })
         };
-        await args.trace.writeComparison(comparison);
-        await args.trace.event({
-          type: "comparison.completed",
-          run_id: args.runId,
-          comparison_id: comparison.id,
-          generation: args.generation
-        });
         return comparison;
-      }),
-    args.config.concurrency.judge
-  );
+      }
+    };
+    }),
+    concurrency: args.config.concurrency.judge,
+    signal: args.signal,
+    validateOutput: isComparisonCheckpoint,
+    onResult: async (comparison, context) => {
+      if (context.reused) await restoreCheckpointUsage(context.receiptUsage, args.tracker, args.trace);
+      await args.trace.writeComparison(comparison);
+      await args.trace.event({
+        type: "comparison.completed",
+        run_id: args.runId,
+        comparison_id: comparison.id,
+        generation: args.generation
+      });
+    }
+  });
   return comparisons;
 }
 
@@ -1175,11 +1441,31 @@ async function mutateSurvivors(args: {
   critiquesByCandidate: Map<string, string>;
   tracker: BudgetTracker;
   guards: RunGuards;
+  signal?: AbortSignal;
 }): Promise<Candidate[]> {
-  const mutants = await runLimitedPhase(
-    args.survivors.map((candidate, index) => async () => {
+  const mutants = await runCheckpointedPhase({
+    runDir: args.config.runDir,
+    phaseKey: `generation_mutation:${args.generation}`,
+    jobs: args.survivors.map((candidate, index) => {
         const critique = args.critiquesByCandidate.get(candidate.id) ?? "";
         const prompt = mutatePrompt(args.config.task, candidate, critique, args.config.rubric, args.config.promptStyle, args.config.promptOverrides?.mutate);
+        const receiptUsage: UsageRecord[] = [];
+        let promptRef: Awaited<ReturnType<TraceStore["writePrompt"]>> | undefined;
+        return {
+          id: `g${args.generation}_m${index}_${candidate.id}`,
+          input: {
+            task: args.config.task,
+            rubric: args.config.rubric,
+            model: args.config.mutatorModel,
+            temperature: args.config.profile.mutateTemperature,
+            candidate,
+            critique,
+            prompt,
+            maxOutputTokens: args.config.modelOutputTokens?.mutation ?? 4_096
+          },
+          receiptUsage: () => receiptUsage,
+          run: async (phaseSignal: AbortSignal) => {
+        if (args.config.output.includePrompts && !promptRef) promptRef = await args.trace.writePrompt(prompt);
         const reservation = await args.guards.beforeCall(`generation ${args.generation} mutation call`);
         let result: ModelTextResult;
         try {
@@ -1190,7 +1476,9 @@ async function mutateSurvivors(args: {
             temperature: args.config.profile.mutateTemperature,
             candidate,
             critique,
-            prompt
+            prompt,
+            signal: phaseSignal,
+            maxOutputTokens: args.config.modelOutputTokens?.mutation ?? 4_096
           });
         } catch (error) {
           await recordFailedInvocation({
@@ -1206,14 +1494,16 @@ async function mutateSurvivors(args: {
           throw error;
         }
         const delta = args.tracker.record(result, { provider: args.config.provider, model: args.config.mutatorModel }, reservation);
-        await args.trace.writeUsage(buildUsageRecord({
+        const usageRecord = buildUsageRecord({
           phase: `gen${args.generation}_mutate`,
           role: "mutator",
           result,
           delta,
           provider: result.provider ?? args.config.provider,
           model: result.model ?? args.config.mutatorModel
-        }));
+        });
+        receiptUsage.push(usageRecord);
+        await args.trace.writeUsage(usageRecord);
         await args.guards.afterCall(`generation ${args.generation} mutation call`);
         const mutant: Candidate = {
           id: `g${args.generation}_m${index}_${candidate.id}`,
@@ -1222,14 +1512,21 @@ async function mutateSurvivors(args: {
           kind: "mutation",
           content: result.text,
           status: "mutated",
-          metadata: resultMetadata(result, args.config, prompt)
+          metadata: resultMetadata(result, args.config, promptRef)
         };
-        await args.trace.writeCandidate(mutant);
-        await args.trace.event({ type: "candidate.mutated", candidate_id: mutant.id, parent_id: mutant.parentId });
         return mutant;
+          }
+        };
       }),
-    args.config.concurrency.mutate
-  );
+    concurrency: args.config.concurrency.mutate,
+    signal: args.signal,
+    validateOutput: isCandidateCheckpoint,
+    onResult: async (mutant, context) => {
+      if (context.reused) await restoreCheckpointUsage(context.receiptUsage, args.tracker, args.trace);
+      await args.trace.writeCandidate(mutant);
+      await args.trace.event({ type: "candidate.mutated", candidate_id: mutant.id, parent_id: mutant.parentId });
+    }
+  });
   return mutants;
 }
 
@@ -1239,44 +1536,92 @@ async function maybeFinalize(
   driver: ModelDriver,
   trace: TraceStore,
   tracker: BudgetTracker,
-  guards: RunGuards
+  guards: RunGuards,
+  signal?: AbortSignal
 ): Promise<string> {
-  if (!config.finalizerModel || !driver.finalize) return winner.content;
-  const reservation = await guards.beforeCall("finalization call");
-  let result: ModelTextResult;
-  try {
-    result = await driver.finalize({
-      task: config.task,
-      rubric: config.rubric,
-      model: config.finalizerModel,
-      candidate: winner,
-      prompt: finalizePrompt(config.task, winner, config.rubric, config.promptStyle, config.promptOverrides?.finalize)
-    });
-  } catch (error) {
-    await recordFailedInvocation({
-      tracker,
-      reservation,
-      trace,
-      phase: "finalize",
-      role: "finalizer",
-      provider: config.provider,
-      model: config.finalizerModel,
-      error
-    });
-    throw error;
-  }
-  const delta = tracker.record(result, { provider: config.provider, model: config.finalizerModel }, reservation);
-  await trace.writeUsage(buildUsageRecord({
-    phase: "finalize",
-    role: "finalizer",
-    result,
-    delta,
-    provider: result.provider ?? config.provider,
-    model: result.model ?? config.finalizerModel
-  }));
-  await guards.afterCall("finalization call");
-  await trace.event({ type: "finalized", winner_id: winner.id, model: result.model, provider: result.provider });
-  return result.text;
+  const enabled = Boolean(config.finalizerModel && driver.finalize);
+  const prompt = finalizePrompt(config.task, winner, config.rubric, config.promptStyle, config.promptOverrides?.finalize);
+  const promptRef = enabled && config.output.includePrompts ? await trace.writePrompt(prompt) : undefined;
+  let finalModel: string | undefined;
+  let finalProvider: string | undefined;
+  const receiptUsage: UsageRecord[] = [];
+  const [finalized] = await runCheckpointedPhase({
+    runDir: config.runDir,
+    phaseKey: "finalizing",
+    jobs: [
+      {
+        id: `finalizer:${winner.id}`,
+        input: {
+          enabled,
+          task: config.task,
+          rubric: config.rubric,
+          model: config.finalizerModel,
+          candidate: winner,
+          prompt,
+          maxOutputTokens: config.modelOutputTokens?.finalizer ?? 4_096
+        },
+        receiptUsage: () => receiptUsage,
+        run: async (phaseSignal: AbortSignal) => {
+          if (!enabled || !config.finalizerModel || !driver.finalize) return { answer: winner.content, promptRef: undefined };
+          const reservation = await guards.beforeCall("finalization call");
+          let result: ModelTextResult;
+          try {
+            result = await driver.finalize({
+              task: config.task,
+              rubric: config.rubric,
+              model: config.finalizerModel,
+              candidate: winner,
+              prompt,
+              signal: phaseSignal,
+              maxOutputTokens: config.modelOutputTokens?.finalizer ?? 4_096
+            });
+          } catch (error) {
+            await recordFailedInvocation({
+              tracker,
+              reservation,
+              trace,
+              phase: "finalize",
+              role: "finalizer",
+              provider: config.provider,
+              model: config.finalizerModel,
+              error
+            });
+            throw error;
+          }
+          const delta = tracker.record(result, { provider: config.provider, model: config.finalizerModel }, reservation);
+          const usageRecord = buildUsageRecord({
+            phase: "finalize",
+            role: "finalizer",
+            result,
+            delta,
+            provider: result.provider ?? config.provider,
+            model: result.model ?? config.finalizerModel
+          });
+          receiptUsage.push(usageRecord);
+          await trace.writeUsage(usageRecord);
+          await guards.afterCall("finalization call");
+          finalModel = result.model;
+          finalProvider = result.provider;
+          return { answer: result.text, promptRef };
+        }
+      }
+    ],
+    concurrency: 1,
+    signal,
+    validateOutput: (output): output is { answer: string; promptRef?: { sha256: string; path: string } } =>
+      Boolean(
+        output &&
+        typeof output === "object" &&
+        typeof (output as { answer?: unknown }).answer === "string"
+      ),
+    onResult: async (_output, context) => {
+      if (context.reused) await restoreCheckpointUsage(context.receiptUsage, tracker, trace);
+      if (enabled) {
+        await trace.event({ type: "finalized", winner_id: winner.id, model: finalModel, provider: finalProvider, prompt_ref: promptRef });
+      }
+    }
+  });
+  return finalized.answer;
 }
 
 function resultMetadata(result: {
@@ -1286,7 +1631,7 @@ function resultMetadata(result: {
   latencyMs?: number;
   retryCount?: number;
   raw?: unknown;
-}, config: RunConfig, prompt?: { system: string; user: string }): Candidate["metadata"] {
+}, config: RunConfig, promptRef?: { sha256: string; path: string }): Candidate["metadata"] {
   return compactMetadata({
     model: result.model,
     provider: result.provider,
@@ -1298,13 +1643,69 @@ function resultMetadata(result: {
     latencyMs: result.latencyMs,
     retryCount: result.retryCount,
     rawOutput: config.output.includeRawModelOutputs ? result.raw : undefined,
-    prompt: config.output.includePrompts ? prompt : undefined,
+    promptRef: config.output.includePrompts ? promptRef : undefined,
     createdAt: new Date().toISOString()
   }) as Candidate["metadata"];
 }
 
 function compactMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== undefined));
+}
+
+const restoredUsageByTracker = new WeakMap<BudgetTracker, Set<string>>();
+
+async function restoreCheckpointUsage(usage: unknown, tracker: BudgetTracker, trace: TraceStore): Promise<void> {
+  if (usage === undefined) return;
+  if (!Array.isArray(usage)) {
+    throw new ConfigError("Trace-v2 checkpoint usage must be an array of UsageRecord rows.", {
+      code: "resume.usage_invalid",
+      retryable: false
+    });
+  }
+  const ids = validatedReceiptUsageIds(usage);
+  const restored = restoredUsageByTracker.get(tracker) ?? new Set<string>();
+  for (const id of ids) {
+    if (restored.has(id)) {
+      throw new ConfigError(`Trace-v2 usage ${id} was restored more than once.`, {
+        code: "resume.usage_invalid",
+        retryable: false
+      });
+    }
+    restored.add(id);
+  }
+  restoredUsageByTracker.set(tracker, restored);
+  const records = usage as UsageRecord[];
+  applyUsageRecords(tracker, records);
+  for (const record of records) await trace.writeUsage(record);
+}
+
+function isCandidateCheckpoint(output: unknown): output is Candidate {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return false;
+  const candidate = output as Partial<Candidate>;
+  return (
+    typeof candidate.id === "string" &&
+    candidate.id.length > 0 &&
+    Number.isInteger(candidate.generation) &&
+    typeof candidate.content === "string" &&
+    typeof candidate.kind === "string" &&
+    Boolean(candidate.metadata && typeof candidate.metadata === "object" && typeof candidate.metadata.createdAt === "string")
+  );
+}
+
+function isComparisonCheckpoint(output: unknown): output is Comparison {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return false;
+  const comparison = output as Partial<Comparison>;
+  return (
+    typeof comparison.id === "string" &&
+    typeof comparison.runId === "string" &&
+    (typeof comparison.generation === "number" || comparison.generation === "final") &&
+    typeof comparison.candidateAId === "string" &&
+    typeof comparison.candidateBId === "string" &&
+    (comparison.winner === "A" || comparison.winner === "B" || comparison.winner === "tie") &&
+    typeof comparison.critiqueForA === "string" &&
+    typeof comparison.critiqueForB === "string" &&
+    typeof comparison.selectionReason === "string"
+  );
 }
 
 function summaryProfile(profile: RunConfig["profile"]): Record<string, number> {
@@ -1361,6 +1762,7 @@ function buildUsageRecord(args: {
 }): UsageRecord {
   return {
     schema_version: 1,
+    usage_id: randomUUID(),
     ts: new Date().toISOString(),
     phase: args.phase,
     role: args.role,
@@ -1413,11 +1815,77 @@ function enforceBudget(config: RunConfig): void {
     invalidJsonRetries: config.retry.invalidJsonRetries,
     includeFinalizer: Boolean(config.finalizerModel)
   });
-  const plannedCalls = plan.calls + plan.finalizer_calls;
+  const explicitFinalCalls = config.rank ? configuredFinalPairCount(config.profile.n, config.rank) : plan.final_judge_calls;
+  const plannedCalls = plan.calls - plan.final_judge_calls + explicitFinalCalls + plan.finalizer_calls;
   if (config.budget?.maxCalls !== undefined && plannedCalls > config.budget.maxCalls) {
     throw new BudgetExceededError(`Planned call count ${plannedCalls} exceeds maxCalls ${config.budget.maxCalls}.`, {
       code: "budget.planned_calls_exceeded",
       fix: "Raise maxCalls or use a smaller profile."
+    });
+  }
+}
+
+function configuredFinalPairs(
+  candidateIds: string[],
+  rank: NonNullable<RunConfig["rank"]>,
+  rng: Rng
+): Pair[] {
+  if (rank.mode === "k-regular") {
+    if (rank.k === undefined) {
+      throw new ConfigError("rank.mode k-regular requires rank.k.", { code: "rank.k_required", retryable: false });
+    }
+    const pairs = makeKRegularPairs(candidateIds, rank.k, rng);
+    assertRankCallLimit(pairs.length, rank.maxCalls);
+    return pairs;
+  }
+  const pairs: Pair[] = [];
+  for (let left = 0; left < candidateIds.length; left += 1) {
+    for (let right = left + 1; right < candidateIds.length; right += 1) {
+      pairs.push({ a: candidateIds[left], b: candidateIds[right] });
+    }
+  }
+  if (pairs.length > 100 && (rank.maxCalls === undefined || rank.maxCalls < pairs.length)) {
+    throw new ConfigError(`All-pairs final ranking requires explicit rank.maxCalls >= ${pairs.length}.`, {
+      code: "rank.max_calls_required",
+      retryable: false,
+      fix: "Raise rank.maxCalls or select k-regular mode."
+    });
+  }
+  assertRankCallLimit(pairs.length, rank.maxCalls);
+  return rng.shuffle(pairs);
+}
+
+function configuredFinalPairCount(n: number, rank: NonNullable<RunConfig["rank"]>): number {
+  if (rank.mode === "all-pairs") {
+    const calls = (n * (n - 1)) / 2;
+    if (calls > 100 && (rank.maxCalls === undefined || rank.maxCalls < calls)) {
+      throw new ConfigError(`All-pairs final ranking requires explicit rank.maxCalls >= ${calls}.`, {
+        code: "rank.max_calls_required",
+        retryable: false
+      });
+    }
+    assertRankCallLimit(calls, rank.maxCalls);
+    return calls;
+  }
+  if (rank.k === undefined) {
+    throw new ConfigError("rank.mode k-regular requires rank.k.", { code: "rank.k_required", retryable: false });
+  }
+  if (rank.k >= n || (n * rank.k) % 2 !== 0) {
+    throw new ConfigError(`Invalid k-regular final ranking for n=${n}, k=${rank.k}.`, {
+      code: "rank.k_invalid",
+      retryable: false
+    });
+  }
+  const calls = (n * rank.k) / 2;
+  assertRankCallLimit(calls, rank.maxCalls);
+  return calls;
+}
+
+function assertRankCallLimit(calls: number, maxCalls: number | undefined): void {
+  if (maxCalls !== undefined && calls > maxCalls) {
+    throw new ConfigError(`Final ranking requires ${calls} calls, exceeding rank.maxCalls ${maxCalls}.`, {
+      code: "rank.max_calls_exceeded",
+      retryable: false
     });
   }
 }

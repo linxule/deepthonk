@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -14,7 +14,14 @@ import {
   TraceStore,
   type RunConfig
 } from "@deepthonk/core";
-import { FakeDriver, type GenerateInput, type ModelTextResult } from "@deepthonk/providers";
+import {
+  FakeDriver,
+  type CompareInput,
+  type FinalizeInput,
+  type GenerateInput,
+  type ModelTextResult,
+  type MutateInput
+} from "@deepthonk/providers";
 
 describe("runDeepThonk", () => {
   it("completes quick profile with fake provider and writes trace", async () => {
@@ -284,7 +291,9 @@ describe("runDeepThonk", () => {
       retry: { httpRetries: 0, invalidJsonRetries: 1 },
       output: { includeRawModelOutputs: false, includePrompts: false }
     } as RunConfig & { apiKey: string; nested: { secretToken: string } };
-    await new TraceStore(runDir).init(config, "redaction-test");
+    const trace = new TraceStore(runDir);
+    await trace.init(config, "redaction-test");
+    await trace.close();
     const traceConfig = await readFile(join(runDir, "config.json"), "utf8");
     expect(traceConfig).not.toContain("do-not-write");
     expect(traceConfig).toContain("[redacted]");
@@ -311,7 +320,9 @@ describe("runDeepThonk", () => {
       },
       secretToken: "do-not-write"
     } as RunConfig & { secretToken: string };
-    await new TraceStore(runDir).init(config, "token-redaction-test");
+    const trace = new TraceStore(runDir);
+    await trace.init(config, "token-redaction-test");
+    await trace.close();
     const stored = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as typeof config;
     expect(stored.budget.maxInputTokens).toBe(123);
     expect(stored.budget.maxOutputTokens).toBe(456);
@@ -334,6 +345,83 @@ describe("runDeepThonk", () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-max-calls-"));
     const result = await runDeepThonk({ ...baseConfig(runDir), budget: { maxCalls: 15 } }, new FakeDriver());
     expect(result.calls).toBe(15);
+  });
+
+  it("passes resolved per-role output caps to every ModelDriver call", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-output-caps-"));
+    const driver = new OutputCapDriver();
+    await runDeepThonk(
+      {
+        ...baseConfig(runDir),
+        finalizerModel: "fake-model",
+        modelOutputTokens: { generation: 111, mutation: 222, judge: 333, finalizer: 444 }
+      },
+      driver
+    );
+    expect(new Set(driver.generationCaps)).toEqual(new Set([111]));
+    expect(new Set(driver.mutationCaps)).toEqual(new Set([222]));
+    expect(new Set(driver.judgeCaps)).toEqual(new Set([333]));
+    expect(new Set(driver.finalizerCaps)).toEqual(new Set([444]));
+    const stored = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as {
+      critiqueLimits: { aggregateChars: number };
+      modelOutputTokens: Record<string, number>;
+    };
+    expect(stored.modelOutputTokens).toEqual({ generation: 111, mutation: 222, judge: 333, finalizer: 444 });
+    expect(stored.critiqueLimits.aggregateChars).toBe(16_000);
+  });
+
+  it("rejects an impossible explicit final rank schedule before any driver call", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-rank-preflight-"));
+    const driver = new CountingGenerateDriver();
+    await expect(
+      runDeepThonk(
+        { ...baseConfig(runDir), rank: { mode: "all-pairs", maxCalls: 5 } },
+        driver
+      )
+    ).rejects.toMatchObject({ code: "rank.max_calls_exceeded" });
+    expect(driver.generateCalls).toBe(0);
+  });
+
+  it.each([
+    ["phase", (config: RunConfig) => ({ ...config, concurrency: { ...config.concurrency, generate: 1_025 } })],
+    ["provider", (config: RunConfig) => ({ ...config, providerMaxConcurrency: 1_025 })]
+  ])("rejects absurd %s concurrency during config validation", async (_label, mutate) => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-concurrency-cap-"));
+    const driver = new CountingGenerateDriver();
+    await expect(runDeepThonk(mutate(baseConfig(runDir)), driver)).rejects.toThrow(/less than or equal to 1024/i);
+    expect(driver.generateCalls).toBe(0);
+  });
+
+  it.each([
+    { rank: { mode: "all-pairs" as const, maxCalls: 6 }, finalCalls: 6, totalCalls: 17 },
+    { rank: { mode: "k-regular" as const, k: 1, maxCalls: 2 }, finalCalls: 2, totalCalls: 13 }
+  ])("honors $rank.mode final ranking in a full run", async ({ rank, finalCalls, totalCalls }) => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-rank-mode-"));
+    const result = await runDeepThonk({ ...baseConfig(runDir), rank }, new FakeDriver());
+    const comparisons = (await readFile(join(runDir, "comparisons.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { generation: number | "final" });
+    expect(comparisons.filter((comparison) => comparison.generation === "final")).toHaveLength(finalCalls);
+    expect(result.calls).toBe(totalCalls);
+  });
+
+  it("stores rendered prompts once as content-addressed blobs and traces references", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-prompt-refs-"));
+    const config = baseConfig(runDir);
+    config.output.includePrompts = true;
+    const result = await runDeepThonk(config, new FakeDriver());
+    const candidates = (await readFile(join(runDir, "candidates.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { generation: number; metadata: { prompt?: unknown; promptRef?: { sha256: string; path: string } } });
+    const initialRefs = candidates.filter((candidate) => candidate.generation === 0).map((candidate) => candidate.metadata.promptRef);
+    expect(initialRefs.every((reference) => reference?.sha256 === initialRefs[0]?.sha256)).toBe(true);
+    expect(candidates.every((candidate) => candidate.metadata.prompt === undefined)).toBe(true);
+    const promptFiles = await readdir(join(runDir, "artifacts", "prompts"));
+    expect(promptFiles.length).toBeLessThan(result.calls);
+    const prompt = await new TraceStore(runDir).readPrompt(initialRefs[0]!);
+    expect(prompt.user).toContain("solve toy");
   });
 
   it("automatically reclaims only a same-host dead-pid lock", async () => {
@@ -423,7 +511,9 @@ describe("runDeepThonk", () => {
       retry: { httpRetries: 0, invalidJsonRetries: 1 },
       output: { includeRawModelOutputs: false, includePrompts: false }
     } as RunConfig & { apiKey: string; authorization: string };
-    await new TraceStore(runDir).init(config, "redaction-test");
+    const trace = new TraceStore(runDir);
+    await trace.init(config, "redaction-test");
+    await trace.close();
 
     const traceConfigText = await readFile(join(runDir, "config.json"), "utf8");
     const traceConfig = JSON.parse(traceConfigText) as typeof config;
@@ -486,5 +576,41 @@ class InvalidJudgeDriver extends FakeDriver {
   override async compare(): Promise<ModelTextResult> {
     await new Promise((resolve) => setTimeout(resolve, 5));
     return { text: "not json" };
+  }
+}
+
+class OutputCapDriver extends FakeDriver {
+  readonly generationCaps: Array<number | undefined> = [];
+  readonly mutationCaps: Array<number | undefined> = [];
+  readonly judgeCaps: Array<number | undefined> = [];
+  readonly finalizerCaps: Array<number | undefined> = [];
+
+  override generate(input: GenerateInput): Promise<ModelTextResult> {
+    this.generationCaps.push(input.maxOutputTokens);
+    return super.generate(input);
+  }
+
+  override compare(input: CompareInput): Promise<ModelTextResult> {
+    this.judgeCaps.push(input.maxOutputTokens);
+    return super.compare(input);
+  }
+
+  override mutate(input: MutateInput): Promise<ModelTextResult> {
+    this.mutationCaps.push(input.maxOutputTokens);
+    return super.mutate(input);
+  }
+
+  override finalize(input: FinalizeInput): Promise<ModelTextResult> {
+    this.finalizerCaps.push(input.maxOutputTokens);
+    return super.finalize(input);
+  }
+}
+
+class CountingGenerateDriver extends FakeDriver {
+  generateCalls = 0;
+
+  override generate(input: GenerateInput): Promise<ModelTextResult> {
+    this.generateCalls += 1;
+    return super.generate(input);
   }
 }

@@ -90,4 +90,59 @@ describe("core services", () => {
     });
     expect(result.comparisons[0]).toMatchObject({ critiqueForA: "", critiqueForB: "", selectionReason: "" });
   });
+
+  it("defaults to all-pairs only through 100 computed pairs", async () => {
+    const fourteen = Array.from({ length: 14 }, (_, index) => `FAKE_QUALITY:${index}`);
+    const result = await rankCandidates({
+      task: "rank",
+      candidates: fourteen,
+      driver: new FakeDriver(),
+      judgeModel: "fake-model",
+      concurrency: 16
+    });
+    expect(result.comparisons).toHaveLength(91);
+
+    const fifteen = Array.from({ length: 15 }, (_, index) => `FAKE_QUALITY:${index}`);
+    await expect(
+      rankCandidates({ task: "rank", candidates: fifteen, driver: new FakeDriver(), judgeModel: "fake-model" })
+    ).rejects.toMatchObject({ code: "rank.explicit_schedule_required" });
+  });
+
+  it("allows explicitly budgeted all-pairs and scalable k-regular ranking", async () => {
+    const fifteen = Array.from({ length: 15 }, (_, index) => `FAKE_QUALITY:${index}`);
+    const dense = await rankCandidates({
+      task: "rank",
+      candidates: fifteen,
+      driver: new FakeDriver(),
+      judgeModel: "fake-model",
+      mode: "all-pairs",
+      maxCalls: 105,
+      concurrency: 32
+    });
+    expect(dense.comparisons).toHaveLength(105);
+
+    const thousand = Array.from({ length: 1_000 }, (_, index) => `FAKE_QUALITY:${index}`);
+    const sparse = await rankCandidates({
+      task: "rank",
+      candidates: thousand,
+      driver: new FakeDriver(),
+      judgeModel: "fake-model",
+      mode: "k-regular",
+      k: 8,
+      seed: 42,
+      maxCalls: 4_000,
+      concurrency: 64
+    });
+    expect(sparse.comparisons).toHaveLength(4_000);
+  });
+
+  it("uses rank seed for deterministic all-pairs scheduling and presentation", async () => {
+    const candidates = Array.from({ length: 5 }, (_, index) => ({ id: `c${index}`, content: `FAKE_QUALITY:${index}` }));
+    const run = (seed: number) =>
+      rankCandidates({ task: "rank", candidates, driver: new FakeDriver(), judgeModel: "fake-model", seed, concurrency: 4 });
+    const [first, repeated, different] = await Promise.all([run(11), run(11), run(12)]);
+    const schedule = (result: typeof first) => result.comparisons.map((comparison) => `${comparison.candidateAId}:${comparison.candidateBId}`);
+    expect(schedule(first)).toEqual(schedule(repeated));
+    expect(schedule(first)).not.toEqual(schedule(different));
+  });
 });

@@ -1,6 +1,6 @@
 {
   "name": "deepthonk",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Provider-neutral OpenDeepThink CLI and MCP server. Population-based reasoning via pairwise judging and Bradley-Terry ranking.",
   "license": "MIT",
   "author": "Xule Lin",

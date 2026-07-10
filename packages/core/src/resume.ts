@@ -4,7 +4,7 @@ import { readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { runArtifactFiles } from "./artifacts.js";
-import { fitBradleyTerry } from "./bradleyTerry.js";
+import { canonicalizeComparisons, fitBradleyTerry } from "./bradleyTerry.js";
 import { BudgetTracker } from "./budgetTracker.js";
 import { ConfigError } from "./errors.js";
 import { claimRunLockOwnership, releaseRunLock, type RunStatus, type UsageRecord } from "./lifecycle.js";
@@ -233,7 +233,11 @@ export function toResumePlanStatus(runDir: string, runId: string, plan: Internal
   };
 }
 
-export function pruneTraceToPlan(trace: ResumeTrace, plan: InternalResumePlan): ResumeTrace {
+export function pruneTraceToPlan(
+  trace: ResumeTrace,
+  plan: InternalResumePlan,
+  options: { dropUsageIds?: ReadonlySet<string> } = {}
+): ResumeTrace {
   const candidates = trace.candidates.filter((candidate) => keepCandidate(candidate, plan.completed));
   const comparisons = trace.comparisons.filter((comparison) => plan.completed.has(phaseKeyForComparison(comparison)));
   const scores = trace.scores.filter((score) => plan.completed.has(phaseKeyForScore(score)));
@@ -248,7 +252,7 @@ export function pruneTraceToPlan(trace: ResumeTrace, plan: InternalResumePlan): 
     populations: new Map([...trace.populations].filter(([generation]) => keepPopulationGeneration(generation, plan.completed))),
     // Usage is append-only accounting. Calls made during an interrupted phase
     // still consumed provider budget and must survive conservative v1 replay.
-    usage: trace.usage
+    usage: trace.usage.filter((record) => !record.usage_id || !options.dropUsageIds?.has(record.usage_id))
   };
 }
 
@@ -326,6 +330,7 @@ export function groupComparisons(comparisons: Comparison[]): Map<number | "final
     bucket.push(comparison);
     grouped.set(comparison.generation, bucket);
   }
+  for (const [generation, bucket] of grouped) grouped.set(generation, canonicalizeComparisons(bucket));
   return grouped;
 }
 
@@ -360,7 +365,11 @@ export function reconstructScores(
 
 export function replayBudgetUsage(config: RunConfig, usage: UsageRecord[]): BudgetTracker {
   const tracker = new BudgetTracker(config);
-  let hasUsd = false;
+  applyUsageRecords(tracker, usage);
+  return tracker;
+}
+
+export function applyUsageRecords(tracker: BudgetTracker, usage: UsageRecord[]): void {
   for (const record of usage) {
     validateUsageRecord(record);
     tracker.usage.calls += 1;
@@ -374,12 +383,30 @@ export function replayBudgetUsage(config: RunConfig, usage: UsageRecord[]): Budg
     tracker.usage.outputTokens += record.output_tokens;
     tracker.usage.totalTokens += record.total_tokens;
     if (record.total_usd !== undefined) {
-      hasUsd = true;
       tracker.usage.usd = (tracker.usage.usd ?? 0) + record.total_usd;
     }
   }
-  if (!hasUsd) delete tracker.usage.usd;
-  return tracker;
+}
+
+export function validateUsageRecords(usage: UsageRecord[]): void {
+  for (const record of usage) validateUsageRecord(record);
+}
+
+export function validatedReceiptUsageIds(usage: unknown[]): Set<string> {
+  const ids = new Set<string>();
+  for (const value of usage) {
+    validateUsageRecord(value as UsageRecord);
+    const usageId = (value as UsageRecord).usage_id;
+    if (typeof usageId !== "string" || !usageId || ids.has(usageId)) {
+      resumeConfigError(
+        "A trace-v2 receipt contains a missing or duplicate usage_id.",
+        "resume.usage_invalid",
+        "Restore the original checkpoint receipt."
+      );
+    }
+    ids.add(usageId);
+  }
+  return ids;
 }
 
 function validateUsageRecord(record: UsageRecord): void {
@@ -406,6 +433,7 @@ function validateUsageRecord(record: UsageRecord): void {
     (record.outcome === "failed" && /^[A-Za-z0-9._-]{1,128}$/.test(record.error_code));
   if (
     record.schema_version !== 1 ||
+    (record.usage_id !== undefined && (typeof record.usage_id !== "string" || !/^[A-Za-z0-9-]{1,128}$/.test(record.usage_id))) ||
     expectedRole === undefined ||
     record.role !== expectedRole ||
     typeof record.ts !== "string" ||
@@ -659,8 +687,8 @@ function validateComparisons(
   comparisons: Comparison[],
   runId?: string
 ): void {
-  const degree = generation === "final" ? config.profile.m : config.profile.k;
-  const expectedCount = (population.length * degree) / 2;
+  const expectedSchedule = expectedComparisonSchedule(config, generation, population);
+  const expectedCount = expectedSchedule.length;
   if (comparisons.length !== expectedCount) {
     resumeConfigError(
       `comparisons.jsonl for generation ${generation} has ${comparisons.length} rows; expected ${expectedCount}.`,
@@ -671,7 +699,6 @@ function validateComparisons(
   const ids = new Set(population.map((candidate) => candidate.id));
   const comparisonIds = new Set<string>();
   const pairs = new Set<string>();
-  const critiqueChars = new Map(population.map((candidate) => [candidate.id, 0]));
   for (const comparison of comparisons) {
     assertComparisonShape(comparison, runId);
     const pair = [comparison.candidateAId, comparison.candidateBId].sort().join("\u0000");
@@ -695,30 +722,9 @@ function validateComparisons(
     }
     comparisonIds.add(comparison.id);
     pairs.add(pair);
-    critiqueChars.set(
-      comparison.candidateAId,
-      (critiqueChars.get(comparison.candidateAId) ?? 0) + comparison.critiqueForA.length
-    );
-    critiqueChars.set(
-      comparison.candidateBId,
-      (critiqueChars.get(comparison.candidateBId) ?? 0) + comparison.critiqueForB.length
-    );
   }
-  if ([...critiqueChars.values()].some((length) => length > 16_000)) {
-    resumeConfigError(
-      `comparisons.jsonl for generation ${generation} exceeds the 16000-character per-candidate critique bound.`,
-      "resume.comparison_field_too_large",
-      "Restore bounded comparison feedback from the original run."
-    );
-  }
-  const phase = generation === "final" ? "final_judging" : "generation_judging";
-  const rng = createRng(hashPhaseSeed(`${config.seed}:${phase}:${generation === "final" ? "" : generation}`));
   const expectedPairs = new Set(
-    makeKRegularPairs(
-      population.map((candidate) => candidate.id),
-      degree,
-      rng
-    ).map((pair) => [pair.a, pair.b].sort().join("\u0000"))
+    expectedSchedule.map((pair) => [pair.a, pair.b].sort().join("\u0000"))
   );
   if (!isDeepStrictEqual([...pairs].sort(), [...expectedPairs].sort())) {
     resumeConfigError(
@@ -727,6 +733,29 @@ function validateComparisons(
       "Restore comparisons.jsonl from the original run."
     );
   }
+}
+
+function expectedComparisonSchedule(config: RunConfig, generation: number | "final", population: Candidate[]) {
+  const ids = population.map((candidate) => candidate.id);
+  const phase = generation === "final" ? "final_judging" : "generation_judging";
+  const configuredSeed = generation === "final" ? config.rank?.seed : undefined;
+  const rng = createRng(
+    configuredSeed ?? hashPhaseSeed(`${config.seed}:${phase}:${generation === "final" ? "" : generation}`)
+  );
+  if (generation !== "final" || !config.rank) {
+    return makeKRegularPairs(ids, generation === "final" ? config.profile.m : config.profile.k, rng);
+  }
+  if (config.rank.mode === "k-regular") {
+    if (config.rank.k === undefined) {
+      resumeConfigError("Stored k-regular rank config is missing k.", "resume.config_incomplete");
+    }
+    return makeKRegularPairs(ids, config.rank.k, rng);
+  }
+  const pairs: Array<{ a: string; b: string }> = [];
+  for (let left = 0; left < ids.length; left += 1) {
+    for (let right = left + 1; right < ids.length; right += 1) pairs.push({ a: ids[left], b: ids[right] });
+  }
+  return rng.shuffle(pairs);
 }
 
 function assertComparisonShape(comparison: Comparison, runId?: string): void {
@@ -739,12 +768,14 @@ function assertComparisonShape(comparison: Comparison, runId?: string): void {
   }
   const boundedString = (value: unknown, max: number, allowEmpty = true): value is string =>
     typeof value === "string" && (allowEmpty || value.length > 0) && value.length <= max;
+  const boundedRawString = (value: unknown): value is string =>
+    typeof value === "string" && Buffer.byteLength(value, "utf8") <= 1_048_576;
   const metadataValid =
     comparison.metadata === undefined ||
     (comparison.metadata !== null &&
       typeof comparison.metadata === "object" &&
       !Array.isArray(comparison.metadata) &&
-      JSON.stringify(comparison.metadata).length <= 1_048_576);
+      Buffer.byteLength(JSON.stringify(comparison.metadata), "utf8") <= 1_048_576);
   if (
     !boundedString(comparison.id, 512, false) ||
     !boundedString(comparison.runId, 128, false) ||
@@ -753,9 +784,9 @@ function assertComparisonShape(comparison: Comparison, runId?: string): void {
     !boundedString(comparison.candidateBId, 512, false) ||
     !boundedString(comparison.presentedAOriginalId, 512, false) ||
     !boundedString(comparison.presentedBOriginalId, 512, false) ||
-    !boundedString(comparison.critiqueForA, 16_000) ||
-    !boundedString(comparison.critiqueForB, 16_000) ||
-    !boundedString(comparison.selectionReason, 16_000) ||
+    !boundedRawString(comparison.critiqueForA) ||
+    !boundedRawString(comparison.critiqueForB) ||
+    !boundedRawString(comparison.selectionReason) ||
     (comparison.model !== undefined && !boundedString(comparison.model, 256, false)) ||
     (comparison.provider !== undefined && !boundedString(comparison.provider, 256, false)) ||
     (comparison.confidence !== undefined &&
@@ -764,7 +795,7 @@ function assertComparisonShape(comparison: Comparison, runId?: string): void {
         comparison.confidence < 0 ||
         comparison.confidence > 1)) ||
     !metadataValid ||
-    JSON.stringify(comparison).length > 2_097_152
+    Buffer.byteLength(JSON.stringify(comparison), "utf8") > 1_048_576
   ) {
     resumeConfigError(
       "comparisons.jsonl contains a malformed or oversized completed comparison row.",

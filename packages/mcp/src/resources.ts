@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -25,6 +26,18 @@ export const resourceTemplates = [
   "deepthonk://runs/{run_id}/winner",
   "deepthonk://runs/{run_id}/status",
   "deepthonk://runs/{run_id}/population/{generation}",
+  "deepthonk://runs/{run_id}/prompts/{sha256}",
+  "deepthonk://runs/{run_id}/prompts/{sha256}/page/{cursor}",
+  "deepthonk://runs/{run_id}/trace-v2",
+  "deepthonk://runs/{run_id}/trace-v2/page/{cursor}",
+  "deepthonk://runs/{run_id}/trace-v2/manifests/{phase_id}",
+  "deepthonk://runs/{run_id}/trace-v2/manifests/{phase_id}/page/{cursor}",
+  "deepthonk://runs/{run_id}/trace-v2/commits/{phase_id}",
+  "deepthonk://runs/{run_id}/trace-v2/commits/{phase_id}/page/{cursor}",
+  "deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}",
+  "deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}/page/{cursor}",
+  "deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}/{checkpoint_id}",
+  "deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}/{checkpoint_id}/page/{cursor}",
   "deepthonk://runs/{run_id}/{resource}/page/{cursor}",
   "deepthonk://runs/{run_id}/population/{generation}/page/{cursor}",
   "deepthonk://jobs/{job_id}/status",
@@ -37,7 +50,19 @@ export const resourceTemplates = [
   "deepthonk://jobs/{job_id}/trace",
   "deepthonk://jobs/{job_id}/final",
   "deepthonk://jobs/{job_id}/winner",
-  "deepthonk://jobs/{job_id}/population/{generation}"
+  "deepthonk://jobs/{job_id}/population/{generation}",
+  "deepthonk://jobs/{job_id}/prompts/{sha256}",
+  "deepthonk://jobs/{job_id}/prompts/{sha256}/page/{cursor}",
+  "deepthonk://jobs/{job_id}/trace-v2",
+  "deepthonk://jobs/{job_id}/trace-v2/page/{cursor}",
+  "deepthonk://jobs/{job_id}/trace-v2/manifests/{phase_id}",
+  "deepthonk://jobs/{job_id}/trace-v2/manifests/{phase_id}/page/{cursor}",
+  "deepthonk://jobs/{job_id}/trace-v2/commits/{phase_id}",
+  "deepthonk://jobs/{job_id}/trace-v2/commits/{phase_id}/page/{cursor}",
+  "deepthonk://jobs/{job_id}/trace-v2/checkpoints/{phase_id}",
+  "deepthonk://jobs/{job_id}/trace-v2/checkpoints/{phase_id}/page/{cursor}",
+  "deepthonk://jobs/{job_id}/trace-v2/checkpoints/{phase_id}/{checkpoint_id}",
+  "deepthonk://jobs/{job_id}/trace-v2/checkpoints/{phase_id}/{checkpoint_id}/page/{cursor}"
 ] as const;
 
 export function jobArtifactResources(jobId: string, runDir: string): Record<string, string> {
@@ -45,6 +70,8 @@ export function jobArtifactResources(jobId: string, runDir: string): Record<stri
   return {
     ...Object.fromEntries(jobResources.map((resource) => [resource, `deepthonk://jobs/${jobId}/${resource}?run_dir=${encodedRunDir}`])),
     population_template: `deepthonk://jobs/${jobId}/population/{generation}?run_dir=${encodedRunDir}`,
+    prompt_template: `deepthonk://jobs/${jobId}/prompts/{sha256}?run_dir=${encodedRunDir}`,
+    trace_v2_template: `deepthonk://jobs/${jobId}/trace-v2?run_dir=${encodedRunDir}`,
     page_template: `deepthonk://jobs/${jobId}/{resource}/page/{cursor}?run_dir=${encodedRunDir}`,
     population_page_template: `deepthonk://jobs/${jobId}/population/{generation}/page/{cursor}?run_dir=${encodedRunDir}`
   };
@@ -59,6 +86,13 @@ export async function readRunResource(uri: string, runsRoot = "runs"): Promise<s
   }
   const runsPageMatch = uri.match(/^deepthonk:\/\/runs\/page\/([^/]+)$/);
   if (runsPageMatch) return pagePayload(await listRunRecords(runsRoot), decodeCursor(runsPageMatch[1]));
+  const parsed = new URL(uri);
+  const segments = parsed.pathname.replace(/^\/+/, "").split("/");
+  if (parsed.hostname === "runs" && segments.length >= 2 && (segments[1] === "prompts" || segments[1] === "trace-v2")) {
+    const runId = validatedRunId(segments[0]);
+    const base = await resolveRunDir(runId, runsRoot);
+    return readSpecialResource(base, segments.slice(1), `deepthonk://runs/${encodeURIComponent(runId)}`);
+  }
   const pageMatch = uri.match(/^deepthonk:\/\/runs\/([^/]+)\/(population\/[^/]+|[^/]+)\/page\/([^/]+)$/);
   if (pageMatch) {
     const [, rawRunId, resourcePath, cursor] = pageMatch;
@@ -97,6 +131,10 @@ export async function readJobResource(uri: string): Promise<string> {
       retryable: false,
       fix: "Use the job_id and run_dir pair returned by deepthonk.start."
     });
+  }
+  if (resource === "prompts" || resource === "trace-v2") {
+    const prefix = `deepthonk://jobs/${encodeURIComponent(requestedJobId)}`;
+    return readSpecialResource(runDir, segments.slice(1), prefix, runDir);
   }
   if (resource === "population" && segments[3] === "page" && segments[4]) {
     if (!generation || !/^\d+$/.test(generation)) throw new Error(`Job population resource requires generation: ${uri}`);
@@ -458,6 +496,173 @@ function boundedJobJson(value: unknown, pageUri: string): string {
     });
   }
   return compact;
+}
+
+async function readSpecialResource(
+  runDir: string,
+  segments: string[],
+  scopePrefix: string,
+  jobRunDir?: string
+): Promise<string> {
+  if (segments[0] === "prompts") {
+    const sha256 = validatedPromptSha(segments[1]);
+    const pageCursor = segments[2] === "page" && segments[3] ? decodeCursor(segments[3]) : undefined;
+    if (segments.length !== (pageCursor === undefined ? 2 : 4)) throw unsupportedSpecialResource(segments);
+    const baseUri = `${scopePrefix}/prompts/${encodeURIComponent(sha256)}`;
+    return readPromptBlob(runDir, sha256, pageCursor, scopedUri(`${baseUri}/page/${encodeCursor(0)}`, jobRunDir));
+  }
+  if (segments[0] !== "trace-v2") throw unsupportedSpecialResource(segments);
+
+  const tracePrefix = `${scopePrefix}/trace-v2`;
+  if (segments.length === 1) return traceV2PhaseIndex(runDir, tracePrefix, jobRunDir, 0);
+  if (segments[1] === "page" && segments[2] && segments.length === 3) {
+    return traceV2PhaseIndex(runDir, tracePrefix, jobRunDir, decodeCursor(segments[2]));
+  }
+
+  const kind = segments[1];
+  const phaseId = validatedPhaseId(segments[2]);
+  if (kind === "manifests" || kind === "commits") {
+    const pageCursor = segments[3] === "page" && segments[4] ? decodeCursor(segments[4]) : undefined;
+    if (segments.length !== (pageCursor === undefined ? 3 : 5)) throw unsupportedSpecialResource(segments);
+    const path = join(runDir, kind, `${phaseId}.json`);
+    const baseUri = `${tracePrefix}/${kind}/${phaseId}`;
+    return pageCursor === undefined
+      ? readWholeResource(path, scopedUri(`${baseUri}/page/${encodeCursor(0)}`, jobRunDir))
+      : readResourcePage(path, pageCursor);
+  }
+  if (kind !== "checkpoints") throw unsupportedSpecialResource(segments);
+  if (segments.length === 3) return checkpointIndex(runDir, phaseId, tracePrefix, jobRunDir, 0);
+  if (segments[3] === "page" && segments[4] && segments.length === 5) {
+    return checkpointIndex(runDir, phaseId, tracePrefix, jobRunDir, decodeCursor(segments[4]));
+  }
+  const checkpointId = validatedCheckpointId(segments[3]);
+  const pageCursor = segments[4] === "page" && segments[5] ? decodeCursor(segments[5]) : undefined;
+  if (segments.length !== (pageCursor === undefined ? 4 : 6)) throw unsupportedSpecialResource(segments);
+  const path = join(runDir, "checkpoints", phaseId, `${checkpointId}.json`);
+  const baseUri = `${tracePrefix}/checkpoints/${phaseId}/${checkpointId}`;
+  return pageCursor === undefined
+    ? readWholeResource(path, scopedUri(`${baseUri}/page/${encodeCursor(0)}`, jobRunDir))
+    : readResourcePage(path, pageCursor);
+}
+
+async function readPromptBlob(
+  runDir: string,
+  sha256: string,
+  pageCursor: number | undefined,
+  firstPage: string
+): Promise<string> {
+  const path = join(runDir, "artifacts", "prompts", `${sha256.slice("sha256:".length)}.json`);
+  await assertFileHash(path, sha256);
+  return pageCursor === undefined ? readWholeResource(path, firstPage) : readResourcePage(path, pageCursor);
+}
+
+async function assertFileHash(path: string, expected: string): Promise<void> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  const actual = `sha256:${hash.digest("hex")}`;
+  if (actual !== expected) {
+    throw new ConfigError(`Prompt blob hash mismatch: expected ${expected}, received ${actual}.`, {
+      code: "mcp.prompt_hash_mismatch",
+      retryable: false,
+      fix: "Restore the prompt blob matching the promptRef digest."
+    });
+  }
+}
+
+async function traceV2PhaseIndex(
+  runDir: string,
+  tracePrefix: string,
+  jobRunDir: string | undefined,
+  offset: number
+): Promise<string> {
+  const phaseIds = new Set<string>();
+  for (const directory of ["manifests", "commits"] as const) {
+    for (const file of await readdir(join(runDir, directory)).catch(() => [])) {
+      const match = /^([A-Za-z0-9._~-]{1,256})\.json$/.exec(file);
+      if (match) phaseIds.add(match[1]);
+    }
+  }
+  for (const entry of await readdir(join(runDir, "checkpoints"), { withFileTypes: true }).catch(() => [])) {
+    if (entry.isDirectory() && /^[A-Za-z0-9._~-]{1,256}$/.test(entry.name)) phaseIds.add(entry.name);
+  }
+  const records = [...phaseIds].sort().map((phaseId) => ({
+    phase_id: phaseId,
+    manifest_uri: scopedUri(`${tracePrefix}/manifests/${phaseId}`, jobRunDir),
+    commit_uri: scopedUri(`${tracePrefix}/commits/${phaseId}`, jobRunDir),
+    checkpoints_uri: scopedUri(`${tracePrefix}/checkpoints/${phaseId}`, jobRunDir)
+  }));
+  return pagePayload(records, offset);
+}
+
+async function checkpointIndex(
+  runDir: string,
+  phaseId: string,
+  tracePrefix: string,
+  jobRunDir: string | undefined,
+  offset: number
+): Promise<string> {
+  const records = (await readdir(join(runDir, "checkpoints", phaseId)).catch(() => []))
+    .flatMap((file) => {
+      const match = /^([0-9a-f]{64})\.json$/.exec(file);
+      return match ? [{ checkpoint_id: match[1], uri: scopedUri(`${tracePrefix}/checkpoints/${phaseId}/${match[1]}`, jobRunDir) }] : [];
+    })
+    .sort((left, right) => left.checkpoint_id.localeCompare(right.checkpoint_id));
+  return pagePayload(records, offset);
+}
+
+function scopedUri(uri: string, runDir?: string): string {
+  return runDir ? `${uri}?run_dir=${encodeURIComponent(runDir)}` : uri;
+}
+
+function validatedPromptSha(value: string | undefined): string {
+  const decoded = decodePathSegment(value, "prompt SHA-256");
+  if (!/^sha256:[0-9a-f]{64}$/.test(decoded)) {
+    throw new ConfigError("Invalid prompt SHA-256 in resource URI.", {
+      code: "mcp.invalid_prompt_hash",
+      retryable: false,
+      fix: "Use metadata.promptRef.sha256 exactly as returned by DeepThonk."
+    });
+  }
+  return decoded;
+}
+
+function validatedPhaseId(value: string | undefined): string {
+  const decoded = decodePathSegment(value, "trace-v2 phase ID");
+  if (!/^[A-Za-z0-9._~-]{1,256}$/.test(decoded)) {
+    throw new ConfigError("Invalid trace-v2 phase ID in resource URI.", {
+      code: "mcp.invalid_trace_phase",
+      retryable: false,
+      fix: "Use a phase_id returned by the trace-v2 index resource."
+    });
+  }
+  return decoded;
+}
+
+function validatedCheckpointId(value: string | undefined): string {
+  const decoded = decodePathSegment(value, "checkpoint ID");
+  if (!/^[0-9a-f]{64}$/.test(decoded)) {
+    throw new ConfigError("Invalid trace-v2 checkpoint ID in resource URI.", {
+      code: "mcp.invalid_checkpoint_id",
+      retryable: false,
+      fix: "Use a checkpoint_id returned by the phase checkpoint index."
+    });
+  }
+  return decoded;
+}
+
+function decodePathSegment(value: string | undefined, label: string): string {
+  try {
+    return decodeURIComponent(value ?? "");
+  } catch {
+    throw new ConfigError(`Invalid encoded ${label} in resource URI.`, { code: "mcp.invalid_resource_path", retryable: false });
+  }
+}
+
+function unsupportedSpecialResource(segments: string[]): ConfigError {
+  return new ConfigError(`Unsupported bounded resource path: ${segments.join("/")}.`, {
+    code: "mcp.unsupported_resource",
+    retryable: false
+  });
 }
 
 function resourceFile(runDir: string, resourcePath: string): string {

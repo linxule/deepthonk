@@ -72,4 +72,26 @@ describe("provider replay", () => {
       code: "provider.identity_driver_call"
     });
   });
+
+  it("restores provider concurrency onto base and role routes", () => {
+    const replay = providerReplayFromConfig(
+      resolveProviderConfig({
+        provider: "openai-compatible",
+        baseUrl: "https://provider.example.test/v1",
+        apiKeyEnv: "BASE_KEY",
+        models: { generator: "g", mutator: "m", judge: "j" },
+        roleProviders: {
+          judge: {
+            provider: "openai-compatible",
+            baseUrl: "https://judge.example.test/v1",
+            apiKeyEnv: "JUDGE_KEY",
+            model: "judge"
+          }
+        }
+      })
+    );
+    const restored = providerConfigFromReplay(replay, undefined, { providerMaxConcurrency: 6 });
+    expect(restored.providerMaxConcurrency).toBe(6);
+    expect(restored.roleProviders?.judge?.providerMaxConcurrency).toBe(6);
+  });
 });

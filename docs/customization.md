@@ -15,6 +15,10 @@ DeepThonk exposes the same core run config through CLI, MCP, and YAML, with one 
 | Prompt style | `--prompt-style` | `prompt_style` | `prompt_style` |
 | Per-phase prompts | `--prompts <yaml-path>`, `--prompts-json <json>` | `prompts` | `prompts` |
 | Concurrency | `--max-concurrency`, `--generate-concurrency`, `--judge-concurrency`, `--mutate-concurrency` | `concurrency.generate`, `concurrency.judge`, `concurrency.mutate` | `concurrency.generate`, `concurrency.judge`, `concurrency.mutate` |
+| Shared provider ceiling | `--provider-max-concurrency` | `provider_max_concurrency` | `provider_max_concurrency` |
+| Per-role output caps | `--generation-output-tokens`, `--mutation-output-tokens`, `--judge-output-tokens`, `--finalizer-output-tokens` | `model_output_tokens.*` | `model_output_tokens.*` |
+| Critique aggregate cap | `--max-critique-chars` | `critique_limits.aggregate_chars` | `critique_limits.aggregate_chars` |
+| Final ranking schedule | `--rank-mode`, `--rank-k`, `--rank-seed`, `--rank-max-calls` | `rank.mode`, `rank.k`, `rank.seed`, `rank.max_calls` | `rank.mode`, `rank.k`, `rank.seed`, `rank.max_calls` |
 | JSON-mode support | `--supports-json-mode <true|false>` | `supports_json_mode` | `supports_json_mode`, `providers.<role>.supports_json_mode` |
 
 The built-in profiles are `quick`, `balanced`, and `paper`.
@@ -81,6 +85,32 @@ Default concurrency:
 | `judge` | `max(1, (n * max(k, m)) / 2)` |
 | `mutate` | `n - floor(n / 4)` |
 
+Phase concurrency controls how much work the core may dispatch. `provider_max_concurrency` is a second, process-shared safety ceiling for calls that resolve to the same provider, normalized endpoint, and credential identity. Direct routes start at 8 concurrent calls and Sampling routes start at 4. A rate-limit response halves the live ceiling, with a minimum of 1; 32 successful logical calls restore one slot up to the configured maximum. Queued calls are FIFO and cancellation-aware.
+
+Per-phase and shared provider concurrency values are capped at 1,024. Larger values are rejected before worker promises are allocated; practical provider ceilings should usually be far lower.
+
+## Output, critique, and ranking bounds
+
+DeepThonk passes an explicit output-token cap to every model call. Defaults are 4,096 tokens for generation, mutation, and finalization, and 1,024 for judging. Override them independently with `model_output_tokens` or the matching CLI/MCP fields. These per-call limits complement the run-wide `budget.max_output_tokens`; they do not replace it.
+
+Rendered prompt capture remains opt-in through `output.include_prompts` / `--include-prompts` / MCP `include_prompts`. Captured prompts are stored once by SHA-256 under `artifacts/prompts/`; candidate and comparison rows contain a `promptRef` rather than duplicating the full prompt. Prompt resources validate the digest before returning content.
+
+Critiques are deduplicated before mutation and the combined text for one candidate is truncated deterministically. `critique_limits.aggregate_chars` defaults to 16,000 and must be at least 256.
+
+The optional `rank` block replaces the profile's `m` schedule for the final ranking round:
+
+```yaml
+rank:
+  mode: k-regular
+  k: 8
+  seed: 42
+  max_calls: 80
+```
+
+`all-pairs` schedules every unordered candidate pair. DeepThonk permits it implicitly only when the computed schedule is at most 100 judge calls; larger schedules require an explicit `max_calls` high enough for the whole schedule. `k-regular` requires `k`, uses the seed for pair construction, and also respects `max_calls`. Invalid schedules fail at run start before generation calls are spent.
+
+The standalone `deepthonk rank` command follows the same rule. Its `--max-calls` flag caps that one-shot rank operation; on `deepthonk run`, `--max-calls` remains the whole-run budget and `--rank-max-calls` controls only the final ranking schedule.
+
 ## Provider JSON mode and replay
 
 OpenAI-compatible providers use `response_format: { "type": "json_object" }` for pairwise comparison calls when JSON mode is enabled.
@@ -98,14 +128,14 @@ If a v0.1.4 trace reports `resume.legacy_redacted_budget`, restore the exact ori
 
 ## MCP Sampling provider
 
-Use `provider: "sampling"` only through stdio in the v0.1 patch line and only inside an MCP host that can answer Sampling `createMessage` requests. Streamable HTTP and mixed Sampling/direct role routes require direct providers in v0.1.
+Use `provider: "sampling"` only inside an MCP host that can answer Sampling `createMessage` requests. Blocking `deepthonk.run`, `deepthonk.rank`, and `deepthonk.mutate` work over stdio and stateful Streamable HTTP. HTTP background Sampling remains unsupported: `deepthonk.start` rejects it because a later background request cannot safely depend on the initiating HTTP request's nested Sampling channel. Mixed Sampling/direct role routes remain unsupported.
 Standalone CLI runs cannot use sampling; use `deepseek`, `openrouter`, or `openai-compatible` from the CLI.
 
 Sampling model fields are hints, not enforcement. `generator_model`, `mutator_model`, `judge_model`, and `finalizer_model` become per-role model hints, and MCP `sampling_model_hints` adds extra host-facing hints. A sampling-capable client may ignore any hint and choose another model.
 
 Before a sampling run starts, the MCP server checks `server.getClientCapabilities()`. If the connected client does not advertise `sampling`, `deepthonk.run` and `deepthonk.start` fail with `provider.sampling_capability_missing` before claiming the run directory or making model calls.
 
-Sampling adds a host round trip for every model call, so latency depends on both DeepThonk's phase concurrency and the host's sampling queue. DeepThonk caps sampling concurrency at `min(n, 4)` even when higher per-phase concurrency is configured.
+Sampling adds a host round trip for every model call, so latency depends on both DeepThonk's phase concurrency and the host's sampling queue. Its adaptive provider limiter starts at 4. Set `provider_max_concurrency` to allow gradual recovery above 4 after successful calls; without an explicit value, 4 remains the ceiling.
 
 MCP Sampling responses do not provide standardized token usage. `maxCalls` still works, but DeepThonk rejects token/USD caps for Sampling rather than pretending they are enforceable.
 

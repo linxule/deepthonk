@@ -1,16 +1,26 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readFile, readdir, rename, writeFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { runArtifactFiles, traceJsonlFiles } from "./artifacts.js";
 import { TraceError } from "./errors.js";
 import type { RunStatus, UsageRecord } from "./lifecycle.js";
 import type { BtScore, Candidate, Comparison, RunConfig } from "./schemas.js";
+import { traceSchemaVersion } from "./checkpointStore.js";
 
 export class TraceStore {
   readonly runDir: string;
   // Single-writer queue: every appendJsonl chains onto this promise so concurrent
   // writes (e.g. from pLimit closures writing candidates/comparisons as each
   // call completes) cannot interleave on disk.
-  private writeQueue: Promise<void> = Promise.resolve();
+  private readonly appendHandles = new Map<string, Promise<FileHandle>>();
+  private readonly pendingBatches = new Map<
+    string,
+    { rows: string[]; waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }>; scheduled: boolean }
+  >();
+  private readonly flushes = new Map<string, Promise<void>>();
+  private readonly dirtyHandles = new Set<string>();
+  private appendWrites = 0;
+  private appendRows = 0;
 
   constructor(runDir: string) {
     this.runDir = runDir;
@@ -19,7 +29,7 @@ export class TraceStore {
   async init(config: RunConfig, runId: string, preflight: { allowOwnedLock?: boolean; pendingJobId?: string } = {}): Promise<void> {
     await mkdir(join(this.runDir, "artifacts"), { recursive: true });
     await this.assertFreshTrace(preflight);
-    await this.writeJson(runArtifactFiles.config, redactConfig({ ...config, runId }));
+    await this.writeJson(runArtifactFiles.config, redactConfig({ ...config, runId, traceSchemaVersion }));
     await this.event({ type: "run.started", run_id: runId, created_at: new Date().toISOString() });
   }
 
@@ -45,13 +55,21 @@ export class TraceStore {
   }
 
   async writeSummary(summary: Record<string, unknown>, finalAnswer: string, winnerAnswer?: string): Promise<void> {
+    await this.flush();
     if (winnerAnswer !== undefined) await writeFile(join(this.runDir, runArtifactFiles.winner), winnerAnswer, "utf8");
     await writeFile(join(this.runDir, runArtifactFiles.final), finalAnswer, "utf8");
     await this.writeJson(runArtifactFiles.summary, summary);
   }
 
   async writeStatus(status: RunStatus): Promise<void> {
+    let flushError: unknown;
+    try {
+      await this.flush();
+    } catch (error) {
+      flushError = error;
+    }
     await this.writeJson(runArtifactFiles.status, status);
+    if (flushError !== undefined) throw flushError;
   }
 
   async writeUsage(record: UsageRecord): Promise<void> {
@@ -64,6 +82,7 @@ export class TraceStore {
 
   async readJsonl<T>(fileName: string): Promise<T[]> {
     try {
+      await this.flush();
       const text = await readFile(join(this.runDir, fileName), "utf8");
       return text
         .split("\n")
@@ -78,6 +97,65 @@ export class TraceStore {
     return readdir(this.runDir);
   }
 
+  async writePrompt(prompt: { system: string; user: string }): Promise<{ sha256: string; path: string }> {
+    const serialized = `${JSON.stringify(prompt, null, 2)}\n`;
+    const sha256 = `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
+    const relativePath = `artifacts/prompts/${sha256.slice("sha256:".length)}.json`;
+    const path = join(this.runDir, relativePath);
+    await mkdir(join(this.runDir, "artifacts", "prompts"), { recursive: true });
+    try {
+      await writeFile(path, serialized, { encoding: "utf8", flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const existing = await readFile(path, "utf8");
+      if (`sha256:${createHash("sha256").update(existing).digest("hex")}` !== sha256) {
+        throw new TraceError(`Prompt blob hash mismatch at ${relativePath}.`);
+      }
+    }
+    return { sha256, path: relativePath };
+  }
+
+  async readPrompt(reference: { sha256: string; path: string }): Promise<{ system: string; user: string }> {
+    if (!/^sha256:[0-9a-f]{64}$/.test(reference.sha256)) throw new TraceError("Prompt reference has an invalid SHA-256 digest.");
+    const expectedPath = `artifacts/prompts/${reference.sha256.slice("sha256:".length)}.json`;
+    if (reference.path !== expectedPath) throw new TraceError("Prompt reference path does not match its content digest.");
+    const raw = await readFile(join(this.runDir, expectedPath), "utf8");
+    if (`sha256:${createHash("sha256").update(raw).digest("hex")}` !== reference.sha256) {
+      throw new TraceError(`Prompt blob hash mismatch at ${reference.path}.`);
+    }
+    return JSON.parse(raw) as { system: string; user: string };
+  }
+
+  metrics(): { appendWrites: number; appendRows: number } {
+    return { appendWrites: this.appendWrites, appendRows: this.appendRows };
+  }
+
+  async flush(): Promise<void> {
+    for (const fileName of [...this.pendingBatches.keys()]) await this.flushFile(fileName);
+    await Promise.all([...this.flushes.values()]);
+    const dirty = [...this.dirtyHandles];
+    await Promise.all(
+      dirty.map(async (fileName) => {
+        const handle = this.appendHandles.get(fileName);
+        if (handle) await (await handle).sync();
+        this.dirtyHandles.delete(fileName);
+      })
+    );
+  }
+
+  async close(): Promise<void> {
+    let flushError: unknown;
+    try {
+      await this.flush();
+    } catch (error) {
+      flushError = error;
+    }
+    const handles = await Promise.allSettled([...this.appendHandles.values()]);
+    this.appendHandles.clear();
+    await Promise.all(handles.flatMap((result) => (result.status === "fulfilled" ? [result.value.close()] : [])));
+    if (flushError !== undefined) throw flushError;
+  }
+
   private async appendJsonl(fileName: string, value: unknown): Promise<void> {
     await this.appendJsonlMany(fileName, [value]);
   }
@@ -85,20 +163,63 @@ export class TraceStore {
   private async appendJsonlMany(fileName: string, values: readonly unknown[]): Promise<void> {
     if (values.length === 0) return;
     await mkdir(this.runDir, { recursive: true });
-    const next = this.writeQueue.then(() =>
-      writeFile(join(this.runDir, fileName), values.map((value) => JSON.stringify(value)).join("\n") + "\n", { encoding: "utf8", flag: "a" })
-    );
-    // Keep the queue alive even if one write rejects, so subsequent appends are not blocked.
-    this.writeQueue = next.then(
-      () => undefined,
-      () => undefined
-    );
-    await next;
+    await new Promise<void>((resolve, reject) => {
+      const batch = this.pendingBatches.get(fileName) ?? { rows: [], waiters: [], scheduled: false };
+      batch.rows.push(...values.map((value) => JSON.stringify(value)));
+      batch.waiters.push({ resolve, reject });
+      this.pendingBatches.set(fileName, batch);
+      if (!batch.scheduled) {
+        batch.scheduled = true;
+        setImmediate(() => void this.flushFile(fileName));
+      }
+    });
+  }
+
+  private async flushFile(fileName: string): Promise<void> {
+    const active = this.flushes.get(fileName);
+    if (active) return active;
+    const flushing = (async () => {
+      while (true) {
+        const batch = this.pendingBatches.get(fileName);
+        if (!batch || batch.rows.length === 0) break;
+        this.pendingBatches.delete(fileName);
+        let handle: FileHandle | undefined;
+        try {
+          const handlePromise = this.appendHandles.get(fileName) ?? open(join(this.runDir, fileName), "a");
+          this.appendHandles.set(fileName, handlePromise);
+          handle = await handlePromise;
+          await handle.appendFile(`${batch.rows.join("\n")}\n`, "utf8");
+          this.dirtyHandles.add(fileName);
+          this.appendWrites += 1;
+          this.appendRows += batch.rows.length;
+          for (const waiter of batch.waiters) waiter.resolve();
+        } catch (error) {
+          this.appendHandles.delete(fileName);
+          this.dirtyHandles.delete(fileName);
+          if (handle) await handle.close().catch(() => undefined);
+          for (const waiter of batch.waiters) waiter.reject(error);
+        }
+      }
+    })();
+    this.flushes.set(fileName, flushing);
+    try {
+      await flushing;
+    } finally {
+      if (this.flushes.get(fileName) === flushing) this.flushes.delete(fileName);
+      const pending = this.pendingBatches.get(fileName);
+      if (pending && pending.rows.length > 0) {
+        pending.scheduled = true;
+        setImmediate(() => void this.flushFile(fileName));
+      }
+    }
   }
 
   private async writeJson(fileName: string, value: unknown): Promise<void> {
     await mkdir(this.runDir, { recursive: true });
-    await writeFile(join(this.runDir, fileName), `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    const target = join(this.runDir, fileName);
+    const temporary = `${target}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await rename(temporary, target);
   }
 
   private async assertFreshTrace(preflight: { allowOwnedLock?: boolean; pendingJobId?: string }): Promise<void> {
@@ -122,7 +243,8 @@ export class TraceStore {
         /^population-\d+\.json$/.test(base) ||
         normalized.startsWith("manifests/") ||
         normalized.startsWith("checkpoints/") ||
-        normalized.startsWith("commits/");
+        normalized.startsWith("commits/") ||
+        normalized.startsWith("artifacts/prompts/");
       if (isManaged) {
         throw new TraceError(`Run directory already contains ${normalized}; choose a new --out directory or remove the old trace first.`);
       }

@@ -46,4 +46,27 @@ describe("aggregateCritiques", () => {
     expect(b).toContain("Feedback from comparisons this solution lost");
     expect(b).toContain("your solution missed edge cases");
   });
+
+  it("deduplicates repeated feedback and truncates deterministically", () => {
+    const repeated = "Solution A should add a boundary proof. ".repeat(20);
+    const comparisons: Comparison[] = Array.from({ length: 3 }, (_, index) => ({
+      id: `repeat-${index}`,
+      runId: "r",
+      generation: 1,
+      candidateAId: "A",
+      candidateBId: "B",
+      presentedAOriginalId: "A",
+      presentedBOriginalId: "B",
+      winner: "B",
+      critiqueForA: repeated,
+      critiqueForB: "",
+      selectionReason: ""
+    }));
+    const first = aggregateCritiques(candidates, comparisons, { aggregateChars: 200 }).get("A")!;
+    const second = aggregateCritiques(candidates, comparisons, { aggregateChars: 200 }).get("A")!;
+    expect(first).toBe(second);
+    expect(first).toHaveLength(200);
+    expect(first).toContain("[Critique truncated.]");
+    expect(first.match(/boundary proof/g)?.length).toBe(3);
+  });
 });

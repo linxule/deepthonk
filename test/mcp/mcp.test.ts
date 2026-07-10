@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { describe, expect, it } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   deepthonkCancel,
   deepthonkLockInspect,
@@ -11,6 +14,7 @@ import {
   deepthonkPlan,
   deepthonkPlanAsync,
   deepthonkResult,
+  deepthonkRank,
   deepthonkRun,
   deepthonkStart,
   deepthonkStatus,
@@ -54,6 +58,8 @@ describe("MCP helpers", () => {
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/usage");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/population/{generation}");
     expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/{resource}/page/{cursor}");
+    expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/prompts/{sha256}");
+    expect(resourceTemplates).toContain("deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}/{checkpoint_id}");
     expect(resourceTemplates).toContain("deepthonk://jobs/{job_id}/config");
     expect(resourceTemplates).toContain("deepthonk://jobs/{job_id}/population/{generation}");
     expect(promptNames).toContain("deepthonk/compare");
@@ -66,6 +72,9 @@ describe("MCP helpers", () => {
   });
 
   it("runs background jobs FIFO with two active slots and bounded reservations", async () => {
+    expect(new BackgroundJobManager(1, 1).stats()).toMatchObject({ maxActive: 1, maxQueued: 1 });
+    expect(() => new BackgroundJobManager(0, 1)).toThrow(/maxActive/);
+    expect(() => new BackgroundJobManager(1, -1)).toThrow(/maxQueued/);
     const manager = new BackgroundJobManager(2, 2);
     const reservations = Array.from({ length: 4 }, () => manager.reserve());
     expect(reservations.every(Boolean)).toBe(true);
@@ -145,6 +154,103 @@ describe("MCP helpers", () => {
     expect(summaryPage.next_cursor).toBeTruthy();
   });
 
+  it("reads content-addressed prompts by verified hash and pages them without accepting paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-prompt-resource-"));
+    const runId = "prompt-resource-run";
+    const runDir = join(root, runId);
+    const promptDir = join(runDir, "artifacts", "prompts");
+    await mkdir(promptDir, { recursive: true });
+    await writeFile(join(runDir, "summary.json"), JSON.stringify({ run_id: runId }));
+
+    const small = `${JSON.stringify({ system: "system", user: "user" }, null, 2)}\n`;
+    const smallSha = `sha256:${createHash("sha256").update(small).digest("hex")}`;
+    await writeFile(join(promptDir, `${smallSha.slice("sha256:".length)}.json`), small);
+    const smallUri = `deepthonk://runs/${runId}/prompts/${encodeURIComponent(smallSha)}?path=../../ignored`;
+    await expect(readRunResource(smallUri, root)).resolves.toBe(small);
+    await expect(readRunResource(`deepthonk://runs/${runId}/prompts/${encodeURIComponent("../secret")}`, root)).rejects.toMatchObject({
+      code: "mcp.invalid_prompt_hash"
+    });
+
+    const wrongSha = `sha256:${"f".repeat(64)}`;
+    await writeFile(join(promptDir, `${"f".repeat(64)}.json`), small);
+    await expect(readRunResource(`deepthonk://runs/${runId}/prompts/${encodeURIComponent(wrongSha)}`, root)).rejects.toMatchObject({
+      code: "mcp.prompt_hash_mismatch"
+    });
+
+    const large = `${JSON.stringify({ system: "system", user: "x".repeat(1_100_000) })}\n`;
+    const largeSha = `sha256:${createHash("sha256").update(large).digest("hex")}`;
+    await writeFile(join(promptDir, `${largeSha.slice("sha256:".length)}.json`), large);
+    const jobId = "job-prompt-resource";
+    await writeFile(join(runDir, "status.json"), JSON.stringify({ job_id: jobId, run_dir: runDir, state: "completed" }));
+    const jobUri = `deepthonk://jobs/${jobId}/prompts/${encodeURIComponent(largeSha)}?run_dir=${encodeURIComponent(runDir)}`;
+    let firstPage = "";
+    await expect(readJobResource(jobUri)).rejects.toSatisfy((error: unknown) => {
+      firstPage = ((error as { fix?: string }).fix ?? "").match(/deepthonk:\/\/\S+/)?.[0] ?? "";
+      return (error as { code?: string }).code === "mcp.resource_too_large" && firstPage.includes("/page/");
+    });
+    const pageText = await readJobResource(firstPage);
+    const page = JSON.parse(pageText) as { encoding: string; data: string; next_cursor?: string };
+    expect(page.encoding).toBe("base64");
+    expect(page.data.length).toBeGreaterThan(0);
+    expect(Buffer.byteLength(pageText, "utf8")).toBeLessThanOrEqual(1_000_000);
+  });
+
+  it("discovers and safely reads every trace-v2 manifest, commit, and checkpoint", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-trace-v2-resource-"));
+    const runId = "trace-v2-resource-run";
+    const runDir = join(root, runId);
+    const phaseId = "generation_judging_3A1";
+    const checkpointDir = join(runDir, "checkpoints", phaseId);
+    await mkdir(join(runDir, "manifests"), { recursive: true });
+    await mkdir(join(runDir, "commits"), { recursive: true });
+    await mkdir(checkpointDir, { recursive: true });
+    await writeFile(join(runDir, "summary.json"), JSON.stringify({ run_id: runId }));
+    await writeFile(join(runDir, "manifests", `${phaseId}.json`), JSON.stringify({ schema_version: 2, phase_key: "generation_judging:1" }));
+    await writeFile(join(runDir, "commits", `${phaseId}.json`), JSON.stringify({ schema_version: 2, phase_key: "generation_judging:1" }));
+    for (let index = 0; index < 1_001; index += 1) {
+      const checkpointId = index.toString(16).padStart(64, "0");
+      await writeFile(join(checkpointDir, `${checkpointId}.json`), JSON.stringify({ schema_version: 2, index }));
+    }
+
+    const traceIndex = JSON.parse(await readRunResource(`deepthonk://runs/${runId}/trace-v2`, root)) as {
+      records: Array<{ phase_id: string; manifest_uri: string; commit_uri: string; checkpoints_uri: string }>;
+    };
+    expect(traceIndex.records).toHaveLength(1);
+    expect(JSON.parse(await readRunResource(traceIndex.records[0].manifest_uri, root))).toMatchObject({ schema_version: 2 });
+    expect(JSON.parse(await readRunResource(traceIndex.records[0].commit_uri, root))).toMatchObject({ schema_version: 2 });
+
+    const checkpointIndex = JSON.parse(await readRunResource(traceIndex.records[0].checkpoints_uri, root)) as {
+      records: Array<{ checkpoint_id: string; uri: string }>;
+      next_cursor?: string;
+    };
+    expect(checkpointIndex.records).toHaveLength(1_000);
+    expect(checkpointIndex.next_cursor).toBeTruthy();
+    expect(checkpointIndex.next_cursor).not.toBe("1000");
+    expect(JSON.parse(await readRunResource(checkpointIndex.records[0].uri, root))).toMatchObject({ schema_version: 2 });
+    const secondPage = JSON.parse(await readRunResource(
+      `deepthonk://runs/${runId}/trace-v2/checkpoints/${phaseId}/page/${checkpointIndex.next_cursor}`,
+      root
+    )) as { records: unknown[] };
+    expect(secondPage.records).toHaveLength(1);
+
+    await expect(readRunResource(
+      `deepthonk://runs/${runId}/trace-v2/manifests/${encodeURIComponent("../escape")}`,
+      root
+    )).rejects.toMatchObject({ code: "mcp.invalid_trace_phase" });
+    await expect(readRunResource(
+      `deepthonk://runs/${runId}/trace-v2/checkpoints/${phaseId}/${encodeURIComponent("../escape")}`,
+      root
+    )).rejects.toMatchObject({ code: "mcp.invalid_checkpoint_id" });
+
+    const jobId = "job-trace-v2-resource";
+    await writeFile(join(runDir, "status.json"), JSON.stringify({ job_id: jobId, run_dir: runDir, state: "completed" }));
+    const jobIndex = JSON.parse(await readJobResource(
+      `deepthonk://jobs/${jobId}/trace-v2?run_dir=${encodeURIComponent(runDir)}`
+    )) as { records: Array<{ manifest_uri: string }> };
+    expect(jobIndex.records[0].manifest_uri).toContain("run_dir=");
+    await expect(readJobResource(jobIndex.records[0].manifest_uri)).resolves.toContain("generation_judging:1");
+  });
+
   it("refuses job resources without the exact recorded job ID and run directory pair", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-unowned-job-"));
     await writeFile(join(runDir, "config.json"), '{"not":"a job"}\n');
@@ -204,6 +310,50 @@ describe("MCP helpers", () => {
     }
   });
 
+  it("reads prompt and trace-v2 resources through the official Streamable HTTP SDK client", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-sdk-resource-read-"));
+    const jobId = "job-sdk-resource-read";
+    const promptDir = join(runDir, "artifacts", "prompts");
+    await mkdir(promptDir, { recursive: true });
+    await mkdir(join(runDir, "manifests"), { recursive: true });
+    const prompt = `${JSON.stringify({ system: "sdk", user: "resource" })}\n`;
+    const sha256 = `sha256:${createHash("sha256").update(prompt).digest("hex")}`;
+    await writeFile(join(promptDir, `${sha256.slice("sha256:".length)}.json`), prompt);
+    await writeFile(join(runDir, "manifests", "initial_generation.json"), JSON.stringify({ schema_version: 2, phase_key: "initial_generation" }));
+    await writeFile(join(runDir, "status.json"), JSON.stringify({ job_id: jobId, run_dir: runDir, state: "completed" }));
+
+    const httpServer = createMcpHttpServer({ port: 0 });
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(0, "127.0.0.1", resolve);
+    });
+    const address = httpServer.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP address");
+    const client = new Client({ name: "deepthonk-resource-test", version: "1.0.0" }, { capabilities: {} });
+    try {
+      await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`)));
+      const promptUri = `deepthonk://jobs/${jobId}/prompts/${encodeURIComponent(sha256)}?run_dir=${encodeURIComponent(runDir)}`;
+      const promptResult = await client.readResource({ uri: promptUri });
+      expect(promptResult.contents[0]).toMatchObject({ mimeType: "application/json", text: prompt });
+
+      const traceUri = `deepthonk://jobs/${jobId}/trace-v2?run_dir=${encodeURIComponent(runDir)}`;
+      const traceResult = await client.readResource({ uri: traceUri });
+      expect(JSON.parse((traceResult.contents[0] as { text: string }).text).records).toEqual([
+        expect.objectContaining({ phase_id: "initial_generation" })
+      ]);
+      const templates = await client.listResourceTemplates();
+      expect(templates.resourceTemplates.map((template) => template.uriTemplate)).toContain(
+        "deepthonk://jobs/{job_id}/prompts/{sha256}"
+      );
+      expect(templates.resourceTemplates.map((template) => template.uriTemplate)).toContain(
+        "deepthonk://jobs/{job_id}/trace-v2/checkpoints/{phase_id}/{checkpoint_id}"
+      );
+    } finally {
+      await client.close().catch(() => undefined);
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  });
+
   it("starts, polls, and reads result for a fake background job", async () => {
     const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-job-"));
     const started = await deepthonkStart({
@@ -218,6 +368,7 @@ describe("MCP helpers", () => {
     expect(artifactResources.status).toBe(started.status_resource);
     expect(artifactResources.result).toBe(started.result_resource);
     expect(artifactResources.config).toContain("deepthonk://jobs/");
+    expect(artifactResources.prompt_template).toContain("/prompts/{sha256}");
     await expect(readJobResource(artifactResources.status)).resolves.toContain(String(started.job_id));
     let result = await deepthonkResult({ run_dir: runDir });
     for (let attempt = 0; attempt < 100 && !result.complete; attempt += 1) {
@@ -627,11 +778,19 @@ describe("MCP helpers", () => {
         "  includePrompts: true"
       ].join("\n")
     );
-    await deepthonkRun({ task: "toy", config_path: configPath, run_dir: runDir });
+    const result = await deepthonkRun({ task: "toy", config_path: configPath, run_dir: runDir });
     const firstCandidate = JSON.parse((await readFile(join(runDir, "candidates.jsonl"), "utf8")).trim().split("\n")[0]) as {
-      metadata?: { prompt?: unknown };
+      metadata?: { prompt?: unknown; promptRef?: { sha256: string; path: string } };
     };
-    expect(firstCandidate.metadata?.prompt).toBeTruthy();
+    expect(firstCandidate.metadata).not.toHaveProperty("prompt");
+    const promptRef = firstCandidate.metadata?.promptRef;
+    expect(promptRef?.sha256).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(promptRef?.path).toBe(`artifacts/prompts/${promptRef?.sha256.slice("sha256:".length)}.json`);
+    const promptText = await readRunResource(
+      `deepthonk://runs/${String(result.run_id)}/prompts/${encodeURIComponent(promptRef!.sha256)}`,
+      root
+    );
+    expect(JSON.parse(promptText)).toMatchObject({ system: expect.any(String), user: expect.stringContaining("toy") });
   });
 
   it("exports non-empty MCP status output schema", () => {
@@ -660,6 +819,101 @@ describe("MCP helpers", () => {
     expect(config.profile.m).toBe(4);
     expect(config.profile.lambda).toBe(0.05);
     expect(config.profile.sampleTemperature).toBe(1.2);
+  });
+
+  it("persists inline v0.2 output, critique, rank, and provider limiter controls", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-mcp-v02-controls-"));
+    await deepthonkRun({
+      task: "toy",
+      profile: "quick",
+      provider: "fake",
+      run_dir: runDir,
+      provider_max_concurrency: 3,
+      model_output_tokens: { generation: 700, mutation: 701, judge: 300, finalizer: 702 },
+      critique_limits: { aggregate_chars: 2_000 },
+      rank: { mode: "all-pairs", seed: 19, max_calls: 100 }
+    });
+    const config = JSON.parse(await readFile(join(runDir, "config.json"), "utf8")) as Record<string, unknown>;
+    expect(config).toMatchObject({
+      providerMaxConcurrency: 3,
+      modelOutputTokens: { generation: 700, mutation: 701, judge: 300, finalizer: 702 },
+      critiqueLimits: { aggregateChars: 2_000 },
+      rank: { mode: "all-pairs", seed: 19, maxCalls: 100 }
+    });
+    expect(rankArgsSchema.safeParse({
+      task: "toy",
+      provider: "fake",
+      candidates: ["a", "b"],
+      model_output_tokens: { judge: 256 },
+      provider_max_concurrency: 2,
+      rank: { mode: "k-regular", k: 1, seed: 5, max_calls: 1 }
+    }).success).toBe(true);
+    expect(mutateArgsSchema.safeParse({
+      task: "toy",
+      provider: "fake",
+      candidate: "a",
+      critique: "improve",
+      model_output_tokens: { mutation: 512 },
+      provider_max_concurrency: 2
+    }).success).toBe(true);
+
+    const ranked = await deepthonkRank({
+      task: "toy",
+      provider: "fake",
+      candidates: ["a", "b", "c", "d", "e", "f"],
+      rank: { mode: "k-regular", k: 2, seed: 5, max_calls: 6 }
+    });
+    expect(ranked.comparisons).toHaveLength(6);
+  });
+
+  it("merges config-file v0.2 controls with field-level inline precedence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "deepthonk-mcp-v02-config-"));
+    const configPath = join(root, "config.yaml");
+    const runDir = join(root, "run");
+    await writeFile(configPath, [
+      "profile: quick",
+      "provider: fake",
+      "model_output_tokens:",
+      "  generation: 111",
+      "  mutation: 222",
+      "  judge: 333",
+      "  finalizer: 444",
+      "critique_limits:",
+      "  aggregate_chars: 1000",
+      "rank:",
+      "  mode: k-regular",
+      "  k: 2",
+      "  seed: 7",
+      "  max_calls: 6",
+      "provider_max_concurrency: 1"
+    ].join("\n"));
+
+    await deepthonkRun({
+      task: "toy",
+      config_path: configPath,
+      run_dir: runDir,
+      model_output_tokens: { generation: 555 },
+      critique_limits: { aggregate_chars: 1500 },
+      rank: { mode: "all-pairs", max_calls: 15 },
+      provider_max_concurrency: 2
+    });
+    expect(JSON.parse(await readFile(join(runDir, "config.json"), "utf8"))).toMatchObject({
+      modelOutputTokens: { generation: 555, mutation: 222, judge: 333, finalizer: 444 },
+      critiqueLimits: { aggregateChars: 1500 },
+      rank: { mode: "all-pairs", k: 2, seed: 7, maxCalls: 15 },
+      providerMaxConcurrency: 2
+    });
+
+    const candidates = ["a", "b", "c", "d", "e", "f"];
+    const fromFile = await deepthonkRank({ task: "toy", config_path: configPath, candidates });
+    expect(fromFile.comparisons).toHaveLength(6);
+    const inline = await deepthonkRank({
+      task: "toy",
+      config_path: configPath,
+      candidates,
+      rank: { mode: "all-pairs", max_calls: 15 }
+    });
+    expect(inline.comparisons).toHaveLength(15);
   });
 
   it("accepts inline prompt overrides via deepthonk.run", async () => {

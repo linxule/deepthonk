@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { maxPhaseConcurrency } from "./phaseRunner.js";
 
 export const candidateStatusSchema = z.enum(["generated", "mutated", "elite", "discarded"]);
 export type CandidateStatus = z.infer<typeof candidateStatusSchema>;
@@ -178,10 +179,35 @@ export const runConfigSchema = z.object({
   mutatorModel: z.string().min(1),
   judgeModel: z.string().min(1),
   finalizerModel: z.string().optional(),
+  modelOutputTokens: z
+    .object({
+      generation: z.number().int().min(1).optional(),
+      mutation: z.number().int().min(1).optional(),
+      judge: z.number().int().min(1).optional(),
+      finalizer: z.number().int().min(1).optional()
+    })
+    .strict()
+    .optional(),
+  critiqueLimits: z
+    .object({
+      aggregateChars: z.number().int().min(256).optional()
+    })
+    .strict()
+    .optional(),
+  rank: z
+    .object({
+      mode: z.enum(["all-pairs", "k-regular"]),
+      k: z.number().int().min(1).optional(),
+      seed: z.number().int().optional(),
+      maxCalls: z.number().int().min(1).optional()
+    })
+    .strict()
+    .optional(),
+  providerMaxConcurrency: z.number().int().min(1).max(maxPhaseConcurrency).optional(),
   concurrency: z.object({
-    generate: z.number().int().min(1),
-    judge: z.number().int().min(1),
-    mutate: z.number().int().min(1)
+    generate: z.number().int().min(1).max(maxPhaseConcurrency),
+    judge: z.number().int().min(1).max(maxPhaseConcurrency),
+    mutate: z.number().int().min(1).max(maxPhaseConcurrency)
   }),
   retry: z.object({
     httpRetries: z.number().int().min(0).default(12),
@@ -238,6 +264,37 @@ export const runConfigSchema = z.object({
 });
 export type RunConfig = z.infer<typeof runConfigSchema>;
 
+export interface ModelOutputTokens {
+  generation: number;
+  mutation: number;
+  judge: number;
+  finalizer: number;
+}
+
+export interface CritiqueLimits {
+  aggregateChars: number;
+}
+
+export const defaultModelOutputTokens: Readonly<ModelOutputTokens> = Object.freeze({
+  generation: 4_096,
+  mutation: 4_096,
+  judge: 1_024,
+  finalizer: 4_096
+});
+
+export const defaultCritiqueLimits: Readonly<CritiqueLimits> = Object.freeze({ aggregateChars: 16_000 });
+
+export function resolveRunConfigDefaults(config: RunConfig): RunConfig & {
+  modelOutputTokens: ModelOutputTokens;
+  critiqueLimits: CritiqueLimits;
+} {
+  return {
+    ...config,
+    modelOutputTokens: { ...defaultModelOutputTokens, ...config.modelOutputTokens },
+    critiqueLimits: { ...defaultCritiqueLimits, ...config.critiqueLimits }
+  };
+}
+
 export const phaseNameSchema = z.enum([
   "initial_generation",
   "generation_judging",
@@ -278,6 +335,8 @@ export interface GenerateInput {
   temperature: number;
   candidateIndex?: number;
   prompt?: PromptMessages;
+  signal?: AbortSignal;
+  maxOutputTokens?: number;
 }
 
 export interface CompareInput {
@@ -288,6 +347,8 @@ export interface CompareInput {
   candidateA: Candidate;
   candidateB: Candidate;
   prompt?: PromptMessages;
+  signal?: AbortSignal;
+  maxOutputTokens?: number;
 }
 
 export interface MutateInput {
@@ -298,6 +359,8 @@ export interface MutateInput {
   candidate: Candidate;
   critique: string;
   prompt?: PromptMessages;
+  signal?: AbortSignal;
+  maxOutputTokens?: number;
 }
 
 export interface FinalizeInput {
@@ -306,6 +369,8 @@ export interface FinalizeInput {
   model: string;
   candidate: Candidate;
   prompt?: PromptMessages;
+  signal?: AbortSignal;
+  maxOutputTokens?: number;
 }
 
 export interface PromptMessages {

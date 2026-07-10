@@ -13,6 +13,7 @@ export interface ProviderModelOverrides {
 export interface ProviderConfigOptions {
   provider: string;
   routeFingerprint?: string;
+  providerMaxConcurrency?: number;
   baseUrl?: string;
   apiKeyEnv?: string;
   apiKey?: string;
@@ -46,6 +47,7 @@ export function resolveProviderConfig(options: ProviderConfigOptions): ProviderC
   return {
     provider: options.provider,
     routeFingerprint: options.routeFingerprint,
+    providerMaxConcurrency: options.providerMaxConcurrency,
     baseUrl: options.baseUrl ?? (inheritProviderDefaults ? defaultBaseUrl(options.provider) : undefined),
     apiKeyEnv: options.apiKeyEnv ?? (inheritProviderDefaults ? defaultApiKeyEnv(options.provider) : undefined),
     apiKey: options.apiKey,
@@ -59,7 +61,14 @@ export function resolveProviderConfig(options: ProviderConfigOptions): ProviderC
     intelligencePriority: options.intelligencePriority,
     includeRawOutputs: options.includeRawOutputs,
     requestTimeoutMs: options.requestTimeoutMs,
-    roleProviders: resolveRoleProviders(options.provider, models, options.roleProviders, options.retry, options.supportsJsonMode)
+    roleProviders: resolveRoleProviders(
+      options.provider,
+      models,
+      options.roleProviders,
+      options.retry,
+      options.supportsJsonMode,
+      options.providerMaxConcurrency
+    )
   };
 }
 
@@ -90,7 +99,8 @@ function resolveRoleProviders(
   models: ProviderConfig["models"],
   roleProviders?: ProviderConfigOptions["roleProviders"],
   baseRetry?: ProviderConfig["retry"],
-  baseSupportsJsonMode?: boolean
+  baseSupportsJsonMode?: boolean,
+  providerMaxConcurrency?: number
 ): ProviderConfig["roleProviders"] {
   if (!roleProviders) return undefined;
   const resolved: ProviderConfig["roleProviders"] = {};
@@ -107,6 +117,7 @@ function resolveRoleProviders(
       apiKeyEnv: input.apiKeyEnv ?? (input.baseUrl === undefined ? defaultApiKeyEnv(provider) : undefined),
       apiKey: input.apiKey,
       model,
+      providerMaxConcurrency,
       retry: input.retry ?? baseRetry,
       supportsJsonMode: input.supportsJsonMode ?? (isolatedRoute ? undefined : baseSupportsJsonMode)
     };

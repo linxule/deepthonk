@@ -1,5 +1,6 @@
 import { ProviderError, type CompareInput, type FinalizeInput, type GenerateInput, type ModelDriver, type ModelTextResult, type MutateInput } from "@deepthonk/core";
 import { resolveProviderConfig } from "./defaults.js";
+import { getSharedRouteLimiter, type AdaptiveRouteLimiter } from "./routeLimiter.js";
 import type { ProviderConfig } from "./types.js";
 
 interface ChatMessage {
@@ -35,6 +36,7 @@ export class OpenAiCompatibleDriver implements ModelDriver {
   readonly supportsJsonMode: boolean;
   private jsonModeState: "unknown" | "supported" | "unsupported";
   private jsonModeProbe?: Promise<ModelTextResult>;
+  private readonly routeLimiter: AdaptiveRouteLimiter;
 
   constructor(private readonly config: ProviderConfig) {
     this.provider = config.provider;
@@ -46,6 +48,7 @@ export class OpenAiCompatibleDriver implements ModelDriver {
     this.maxRetryDelayMs = Math.min(config.retry?.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS, DEFAULT_MAX_RETRY_DELAY_MS);
     this.supportsJsonMode = config.supportsJsonMode ?? true;
     this.jsonModeState = this.supportsJsonMode ? "unknown" : "unsupported";
+    this.routeLimiter = getSharedRouteLimiter(config);
     if (!this.apiKey) {
       throw new ProviderError(`Missing API key. Set ${config.apiKeyEnv ?? "apiKey"} for provider ${config.provider}.`, {
         code: "provider.missing_api_key",
@@ -56,20 +59,18 @@ export class OpenAiCompatibleDriver implements ModelDriver {
   }
 
   async generate(input: GenerateInput): Promise<ModelTextResult> {
-    const controls = requestControls(input);
-    return this.chat(input.model, input.temperature, messages(input), false, controls.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, controls.signal);
+    return this.chat(input.model, input.temperature, messages(input), false, input.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, input.signal);
   }
 
   async compare(input: CompareInput): Promise<ModelTextResult> {
-    const controls = requestControls(input);
     const request = () =>
       this.chat(
         input.model,
         input.temperature,
         messages(input),
         this.jsonModeState !== "unsupported",
-        controls.maxOutputTokens ?? DEFAULT_JUDGE_OUTPUT_TOKENS,
-        controls.signal
+        input.maxOutputTokens ?? DEFAULT_JUDGE_OUTPUT_TOKENS,
+        input.signal
       );
     if (this.jsonModeState !== "unknown") return request();
     if (!this.jsonModeProbe) {
@@ -93,13 +94,11 @@ export class OpenAiCompatibleDriver implements ModelDriver {
   }
 
   async mutate(input: MutateInput): Promise<ModelTextResult> {
-    const controls = requestControls(input);
-    return this.chat(input.model, input.temperature, messages(input), false, controls.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, controls.signal);
+    return this.chat(input.model, input.temperature, messages(input), false, input.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, input.signal);
   }
 
   async finalize(input: FinalizeInput): Promise<ModelTextResult> {
-    const controls = requestControls(input);
-    return this.chat(input.model, 0.2, messages(input), false, controls.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, controls.signal);
+    return this.chat(input.model, 0.2, messages(input), false, input.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS, input.signal);
   }
 
   private async chat(
@@ -118,93 +117,105 @@ export class OpenAiCompatibleDriver implements ModelDriver {
     const deadline = deadlineSignal(this.requestTimeoutMs, inputSignal);
     try {
       while (true) {
-      try {
-        const body: Record<string, unknown> = {
-          model,
-          messages: messagesValue,
-          temperature,
-          max_tokens: maxOutputTokens
-        };
-        if (useJsonMode) body.response_format = { type: "json_object" };
-        const response = await fetch(`${this.baseUrl}/chat/completions`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${this.apiKey}`
-          },
-          body: JSON.stringify(body),
-          signal: deadline.signal
-        });
-        if (!response.ok) {
-          const text = await readBoundedBody(response, this.responseBodyLimitBytes, deadline.signal);
-          if ((response.status === 429 || response.status >= 500) && retryAttempt < this.httpRetries) {
-            retryCount += 1;
-            const delay = retryDelay(response, retryAttempt, this.maxRetryDelayMs);
-            retryAttempt += 1;
-            await sleep(delay, deadline.signal);
-            continue;
-          }
-          if (useJsonMode && rejectsJsonMode(response.status, text)) {
-            this.jsonModeState = "unsupported";
-            useJsonMode = false;
-            retryCount += 1;
-            continue;
-          }
-          throw providerHttpError(this.provider, response.status);
-        }
-        const responseText = await readBoundedBody(response, this.responseBodyLimitBytes, deadline.signal);
-        let json: OpenAiChatResponse;
+        let release: (() => void) | undefined;
         try {
-          json = JSON.parse(responseText) as OpenAiChatResponse;
-        } catch {
-          throw new ProviderError("Provider response was not valid JSON.", {
-            code: "provider.invalid_response_json",
-            retryable: false,
-            fix: "Check that the configured endpoint implements OpenAI-compatible chat completions."
+          release = await this.routeLimiter.acquire(deadline.signal);
+          const body: Record<string, unknown> = {
+            model,
+            messages: messagesValue,
+            temperature,
+            max_tokens: maxOutputTokens
+          };
+          if (useJsonMode) body.response_format = { type: "json_object" };
+          const response = await fetch(`${this.baseUrl}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${this.apiKey}`
+            },
+            body: JSON.stringify(body),
+            signal: deadline.signal
           });
-        }
-        const choice = json.choices?.[0];
-        if (choice?.finish_reason === "length") {
-          throw new ProviderError("Provider response was truncated by max_tokens.", {
-            code: "provider.output_truncated",
-            retryable: false,
-            fix: "Use a model/provider with shorter outputs or increase max output token support in provider config."
-          });
-        }
-        const text = choice?.message?.content;
-        if (!text) throw new ProviderError("Provider response did not include choices[0].message.content.", { code: "provider.empty_response" });
-        return {
-          text,
-          model: json.model ?? model,
-          provider: this.provider,
-          usage: {
-            inputTokens: json.usage?.prompt_tokens,
-            inputCacheHitTokens: json.usage?.prompt_cache_hit_tokens,
-            inputCacheMissTokens: json.usage?.prompt_cache_miss_tokens,
-            outputTokens: json.usage?.completion_tokens,
-            totalTokens: json.usage?.total_tokens
-          },
-          latencyMs: Date.now() - started,
-          retryCount,
-          raw: json
-        };
-      } catch (error) {
-        lastError = error;
-        if (!deadline.signal.aborted && retryAttempt < this.httpRetries && isRetryableError(error)) {
-          retryCount += 1;
-          const delay = backoff(retryAttempt, this.maxRetryDelayMs);
-          retryAttempt += 1;
-          try {
-            await sleep(delay, deadline.signal);
-          } catch (sleepError) {
-            lastError = sleepError;
-            break;
+          if (!response.ok) {
+            const text = await readBoundedBody(response, this.responseBodyLimitBytes, deadline.signal);
+            if (response.status === 429) this.routeLimiter.recordRateLimit();
+            if ((response.status === 429 || response.status >= 500) && retryAttempt < this.httpRetries) {
+              retryCount += 1;
+              const delay = retryDelay(response, retryAttempt, this.maxRetryDelayMs);
+              retryAttempt += 1;
+              release();
+              release = undefined;
+              await sleep(delay, deadline.signal);
+              continue;
+            }
+            if (useJsonMode && rejectsJsonMode(response.status, text)) {
+              this.jsonModeState = "unsupported";
+              useJsonMode = false;
+              retryCount += 1;
+              release();
+              release = undefined;
+              continue;
+            }
+            throw providerHttpError(this.provider, response.status);
           }
-          continue;
+          const responseText = await readBoundedBody(response, this.responseBodyLimitBytes, deadline.signal);
+          let json: OpenAiChatResponse;
+          try {
+            json = JSON.parse(responseText) as OpenAiChatResponse;
+          } catch {
+            throw new ProviderError("Provider response was not valid JSON.", {
+              code: "provider.invalid_response_json",
+              retryable: false,
+              fix: "Check that the configured endpoint implements OpenAI-compatible chat completions."
+            });
+          }
+          const choice = json.choices?.[0];
+          if (choice?.finish_reason === "length") {
+            throw new ProviderError("Provider response was truncated by max_tokens.", {
+              code: "provider.output_truncated",
+              retryable: false,
+              fix: "Use a model/provider with shorter outputs or increase max output token support in provider config."
+            });
+          }
+          const text = choice?.message?.content;
+          if (!text) throw new ProviderError("Provider response did not include choices[0].message.content.", { code: "provider.empty_response" });
+          this.routeLimiter.recordSuccess();
+          return {
+            text,
+            model: json.model ?? model,
+            provider: this.provider,
+            usage: {
+              inputTokens: json.usage?.prompt_tokens,
+              inputCacheHitTokens: json.usage?.prompt_cache_hit_tokens,
+              inputCacheMissTokens: json.usage?.prompt_cache_miss_tokens,
+              outputTokens: json.usage?.completion_tokens,
+              totalTokens: json.usage?.total_tokens
+            },
+            latencyMs: Date.now() - started,
+            retryCount,
+            raw: json
+          };
+        } catch (error) {
+          lastError = error;
+          release?.();
+          release = undefined;
+          if (!deadline.signal.aborted && retryAttempt < this.httpRetries && isRetryableError(error)) {
+            retryCount += 1;
+            const delay = backoff(retryAttempt, this.maxRetryDelayMs);
+            retryAttempt += 1;
+            try {
+              await sleep(delay, deadline.signal);
+            } catch (sleepError) {
+              lastError = sleepError;
+              break;
+            }
+            continue;
+          }
+          break;
+        } finally {
+          release?.();
         }
-        break;
       }
-    }
     } finally {
       deadline.dispose();
     }
@@ -397,8 +408,4 @@ function deadlineSignal(timeoutMs: number | undefined, inputSignal?: AbortSignal
 
 function abortError(): DOMException {
   return new DOMException("Aborted", "AbortError");
-}
-
-function requestControls(input: unknown): { maxOutputTokens?: number; signal?: AbortSignal } {
-  return input as { maxOutputTokens?: number; signal?: AbortSignal };
 }

@@ -50,4 +50,48 @@ describe("external config normalization", () => {
       expect(() => normalizeExternalConfig(value)).toThrow(expect.objectContaining({ code: "config.invalid_value" }));
     }
   });
+
+  it("normalizes v0.2 output, critique, rank, and provider-limit fields", () => {
+    expect(
+      normalizeExternalConfig({
+        model_output_tokens: { generation: 3000, mutation: 3001, judge: 800, finalizer: 3002 },
+        critique_limits: { aggregate_chars: 12000 },
+        rank: { mode: "k-regular", k: 8, seed: 42, max_calls: 4000 },
+        provider_max_concurrency: 16
+      })
+    ).toMatchObject({
+      modelOutputTokens: { generation: 3000, mutation: 3001, judge: 800, finalizer: 3002 },
+      critiqueLimits: { aggregateChars: 12000 },
+      rank: { mode: "k-regular", k: 8, seed: 42, maxCalls: 4000 },
+      providerMaxConcurrency: 16
+    });
+    expect(
+      normalizeExternalConfig({
+        modelOutputTokens: { judge: 900 },
+        critiqueLimits: { aggregateChars: 10000 },
+        rank: { mode: "all-pairs", maxCalls: 91 },
+        providerMaxConcurrency: 7
+      })
+    ).toMatchObject({
+      modelOutputTokens: { judge: 900 },
+      critiqueLimits: { aggregateChars: 10000 },
+      rank: { mode: "all-pairs", maxCalls: 91 },
+      providerMaxConcurrency: 7
+    });
+  });
+
+  it("rejects invalid v0.2 config values and alias conflicts", () => {
+    for (const value of [
+      { model_output_tokens: { judge: 0 } },
+      { critique_limits: { aggregate_chars: 255 } },
+      { rank: { mode: "dense" } },
+      { rank: { mode: "k-regular", k: 0 } },
+      { provider_max_concurrency: 0 }
+    ]) {
+      expect(() => normalizeExternalConfig(value)).toThrow(expect.objectContaining({ code: "config.invalid_value" }));
+    }
+    expect(() =>
+      normalizeExternalConfig({ provider_max_concurrency: 8, providerMaxConcurrency: 4 })
+    ).toThrow(expect.objectContaining({ code: "config.alias_conflict" }));
+  });
 });

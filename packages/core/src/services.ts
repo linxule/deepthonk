@@ -2,6 +2,7 @@ import { z } from "zod";
 import { fitBradleyTerry } from "./bradleyTerry.js";
 import { ConfigError } from "./errors.js";
 import { parseJsonObject } from "./json.js";
+import { makeKRegularPairs, type Pair } from "./pairScheduler.js";
 import { runLimitedPhase } from "./phaseRunner.js";
 import { comparePrompt, mutatePrompt } from "./prompts.js";
 import { createRng, type Rng } from "./rng.js";
@@ -21,6 +22,12 @@ export interface RankCandidatesOptions {
   lambda?: number;
   concurrency?: number;
   seed?: number;
+  mode?: "all-pairs" | "k-regular";
+  k?: number;
+  maxCalls?: number;
+  rank?: RunConfig["rank"];
+  signal?: AbortSignal;
+  maxOutputTokens?: number;
   promptStyle?: RunConfig["promptStyle"];
   promptOverrides?: Pick<PromptOverrides, "compare">;
 }
@@ -39,6 +46,8 @@ export interface MutateCandidateOptions {
   driver: ModelDriver;
   mutatorModel: string;
   temperature?: number;
+  signal?: AbortSignal;
+  maxOutputTokens?: number;
   promptStyle?: RunConfig["promptStyle"];
   promptOverrides?: Pick<PromptOverrides, "mutate">;
 }
@@ -70,14 +79,22 @@ export async function rankCandidates(options: RankCandidatesOptions): Promise<Ra
       fix: "Supply at least two candidates with unique IDs."
     });
   }
-  const jobs: Array<() => Promise<Comparison>> = [];
+  const rankConfig = {
+    mode: options.mode ?? options.rank?.mode,
+    k: options.k ?? options.rank?.k,
+    seed: options.seed ?? options.rank?.seed ?? 0,
+    maxCalls: options.maxCalls ?? options.rank?.maxCalls
+  };
+  const pairSpecs = rankPairSpecs(candidates, rankConfig);
   const presentationBalance = new Map(candidates.map((candidate) => [candidate.id, 0]));
-  const rng = createRng(options.seed ?? 0);
-
-  for (let i = 0; i < candidates.length; i += 1) {
-    for (let j = i + 1; j < candidates.length; j += 1) {
-      const [candidateA, candidateB] = balancedPresentation(candidates[i], candidates[j], presentationBalance, rng);
-      jobs.push(async () => {
+  const rng = createRng(rankConfig.seed);
+  const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+  function* jobs(): Generator<(signal: AbortSignal) => Promise<Comparison>> {
+    for (const [pairIndex, pair] of pairSpecs.entries()) {
+      const left = byId.get(pair.a)!;
+      const right = byId.get(pair.b)!;
+      const [candidateA, candidateB] = balancedPresentation(left, right, presentationBalance, rng);
+      yield async (signal) => {
         const prompt = comparePrompt(options.task, candidateA, candidateB, options.rubric, options.promptStyle, options.promptOverrides?.compare);
         const result = await options.driver.compare({
           task: options.task,
@@ -86,7 +103,9 @@ export async function rankCandidates(options: RankCandidatesOptions): Promise<Ra
           temperature: options.temperature ?? 0,
           candidateA,
           candidateB,
-          prompt
+          prompt,
+          signal,
+          maxOutputTokens: options.maxOutputTokens ?? 1_024
         });
         let parsed: z.infer<typeof compareOutputSchema> | undefined;
         try {
@@ -96,7 +115,7 @@ export async function rankCandidates(options: RankCandidatesOptions): Promise<Ra
         }
         if (!parsed) {
           throw new ConfigError(
-            `Judge produced invalid-JSON output for rank comparison rank-${i}-${j}. Refusing to synthesize a tie and pollute the ranking.`,
+            `Judge produced invalid-JSON output for rank comparison rank-${pairIndex}. Refusing to synthesize a tie and pollute the ranking.`,
             {
               code: "judge.persistent_invalid_json",
               retryable: false,
@@ -105,7 +124,7 @@ export async function rankCandidates(options: RankCandidatesOptions): Promise<Ra
           );
         }
         return {
-          id: `rank-${i}-${j}`,
+          id: `rank-${pairIndex}`,
           runId: options.runId ?? "rank",
           generation: options.generation ?? "final",
           candidateAId: candidateA.id,
@@ -124,11 +143,11 @@ export async function rankCandidates(options: RankCandidatesOptions): Promise<Ra
             provider_retry_count: result.retryCount || undefined
           })
         };
-      });
+      };
     }
   }
 
-  const comparisons = await runLimitedPhase(jobs, options.concurrency ?? 1);
+  const comparisons = await runLimitedPhase(jobs(), options.concurrency ?? 1, { signal: options.signal });
   return {
     candidates,
     comparisons,
@@ -145,9 +164,70 @@ export async function mutateCandidate(options: MutateCandidateOptions): Promise<
     temperature: options.temperature ?? 0.6,
     candidate,
     critique: options.critique,
-    prompt: mutatePrompt(options.task, candidate, options.critique, options.rubric, options.promptStyle, options.promptOverrides?.mutate)
+    prompt: mutatePrompt(options.task, candidate, options.critique, options.rubric, options.promptStyle, options.promptOverrides?.mutate),
+    signal: options.signal,
+    maxOutputTokens: options.maxOutputTokens ?? 4_096
   });
   return { mutated: result.text, model: result.model, provider: result.provider, usage: result.usage };
+}
+
+function rankPairSpecs(
+  candidates: Candidate[],
+  config: { mode?: "all-pairs" | "k-regular"; k?: number; seed: number; maxCalls?: number }
+): Pair[] {
+  const allPairCount = (candidates.length * (candidates.length - 1)) / 2;
+  let mode = config.mode;
+  if (!mode) {
+    if (allPairCount <= 100 || (config.maxCalls !== undefined && config.maxCalls >= allPairCount)) mode = "all-pairs";
+    else if (config.k !== undefined) mode = "k-regular";
+    else {
+      throw new ConfigError(
+        `Ranking ${candidates.length} candidates requires ${allPairCount} all-pairs calls, above the default limit of 100.`,
+        {
+          code: "rank.explicit_schedule_required",
+          retryable: false,
+          fix: "Set maxCalls high enough for all-pairs, or select k-regular mode with an explicit k."
+        }
+      );
+    }
+  }
+  let pairs: Pair[];
+  if (mode === "all-pairs") {
+    if (allPairCount > 100 && (config.maxCalls === undefined || config.maxCalls < allPairCount)) {
+      throw new ConfigError(`All-pairs ranking requires explicit maxCalls >= ${allPairCount}.`, {
+        code: "rank.max_calls_required",
+        retryable: false,
+        fix: "Raise maxCalls or use k-regular ranking."
+      });
+    }
+    pairs = [];
+    for (let left = 0; left < candidates.length; left += 1) {
+      for (let right = left + 1; right < candidates.length; right += 1) {
+        pairs.push({ a: candidates[left].id, b: candidates[right].id });
+      }
+    }
+    pairs = createRng(config.seed).shuffle(pairs);
+  } else {
+    if (config.k === undefined) {
+      throw new ConfigError("k-regular ranking requires an explicit k.", {
+        code: "rank.k_required",
+        retryable: false
+      });
+    }
+    pairs = makeKRegularPairs(
+      candidates.map((candidate) => candidate.id),
+      config.k,
+      createRng(config.seed)
+    );
+  }
+  if (config.maxCalls !== undefined && pairs.length > config.maxCalls) {
+    throw new ConfigError(`Ranking schedule requires ${pairs.length} calls, exceeding maxCalls ${config.maxCalls}.`, {
+      code: "rank.max_calls_exceeded",
+      retryable: false,
+      fix: "Raise maxCalls or reduce k."
+    });
+  }
+  return pairs;
 }
 
 export function normalizeCandidates(candidates: CandidateInput[]): Candidate[] {

@@ -2,6 +2,29 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
+## [0.2.0] — 2026-07-10
+
+### Added
+
+- Trace schema v2 with deterministic per-item manifests, atomically written output/usage receipts, phase commits, and crash-safe reuse of completed generation, judging, mutation, and finalization calls.
+- Standalone and final-run ranking schedules with seeded `all-pairs` or `k-regular` modes, explicit degree/call caps, and a safe default ceiling of 100 all-pairs calls.
+- Per-role model output caps (`generation`, `mutation`, `judge`, `finalizer`), bounded deduplicated critique aggregation, and caller-configurable shared provider concurrency ceilings.
+- Blocking MCP Sampling over the stateful Streamable HTTP transport, verified through an official SDK client round trip.
+
+### Changed
+
+- Phase execution pulls work lazily, propagates cancellation through `AbortSignal`, and bounds memory by active concurrency instead of the total job count.
+- Matching provider routes share a FIFO adaptive limiter. Direct routes start at 8 and Sampling routes at 4; a 429 halves the active ceiling, while 32 successful logical calls restore one slot up to the configured maximum.
+- Resume reuses valid incomplete-phase receipts without repeating provider calls, restores their call/token/USD accounting exactly once, and retains conservative whole-phase replay for trace-v1 runs.
+- HTTP background admission limits are configurable through `serve-mcp`; defaults remain 2 active and 32 queued. Sampling stays blocking-only over HTTP, so `deepthonk.start` rejects Sampling there.
+- Rendered prompts are content-addressed when prompt capture is enabled, and trace rows are batch-appended with durability flushes at lifecycle boundaries.
+
+### Fixed
+
+- Large standalone rankings no longer allocate an unbounded all-pairs workload by default; unsafe schedules fail before dispatch.
+- Completed trace-v2 phases fail closed when manifests, receipts, usage, comparisons, populations, scores, or their canonical commit bindings are missing, duplicated, or changed.
+- Critique aggregation now removes duplicate feedback and enforces a deterministic 16,000-character default cap before mutation prompts are rendered.
+
 ## [0.1.5] — 2026-07-10
 
 ### Added

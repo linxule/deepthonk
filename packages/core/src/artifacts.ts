@@ -67,6 +67,17 @@ export async function exportRun(runDir: string, format: RunExportFormat): Promis
 }
 
 export async function detectResumeState(runDir: string): Promise<ResumeStatus> {
+  const status = await readStatusArtifact(runDir);
+  if (await runLockExists(runDir)) {
+    return {
+      status: "running",
+      message: "Run lock is still held; terminal artifacts are not safe to report until the owner releases it.",
+      run_id: status?.run_id,
+      phase: status?.phase,
+      generation: status?.generation,
+      safe_to_continue: false
+    };
+  }
   try {
     const summary = await readRunSummary(runDir);
     return {
@@ -76,7 +87,6 @@ export async function detectResumeState(runDir: string): Promise<ResumeStatus> {
       safe_to_continue: false
     };
   } catch {
-    const status = await readStatusArtifact(runDir);
     if (status) {
       if ((status.state === "running" || status.state === "pending") && isLiveWorker(status.worker_pid)) {
         return {
@@ -125,6 +135,15 @@ export async function detectResumeState(runDir: string): Promise<ResumeStatus> {
     } catch {
       return { status: "missing", message: "No DeepThonk trace found in run directory.", safe_to_continue: false };
     }
+  }
+}
+
+async function runLockExists(runDir: string): Promise<boolean> {
+  try {
+    await readFile(join(runDir, runArtifactFiles.lock), "utf8");
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
 }
 

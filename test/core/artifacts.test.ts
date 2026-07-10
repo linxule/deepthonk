@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, unlink, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -16,6 +16,17 @@ describe("run artifacts", () => {
     expect(await exportRun(runDir, "json")).toMatchObject({ run_id: "run_1" });
     expect(await exportRun(runDir, "jsonl")).toMatchObject({ jsonl: expect.stringContaining("run.started") });
     expect(await exportRun(runDir, "markdown")).toMatchObject({ markdown: expect.stringContaining("DeepThonk Run run_1") });
+  });
+
+  it("does not report terminal summary artifacts while run.lock is held", async () => {
+    const runDir = await mkdtemp(join(tmpdir(), "deepthonk-artifacts-terminal-lock-"));
+    await writeFile(join(runDir, "summary.json"), JSON.stringify({ run_id: "run_locked" }), "utf8");
+    await writeFile(join(runDir, "status.json"), JSON.stringify({ state: "completed", phase: "summary", run_id: "run_locked" }), "utf8");
+    await writeFile(join(runDir, "run.lock"), "held\n", "utf8");
+
+    expect(await detectResumeState(runDir)).toMatchObject({ status: "running", run_id: "run_locked", safe_to_continue: false });
+    await unlink(join(runDir, "run.lock"));
+    expect(await detectResumeState(runDir)).toMatchObject({ status: "completed", run_id: "run_locked" });
   });
 
   it("lists indexed absolute run directories", async () => {

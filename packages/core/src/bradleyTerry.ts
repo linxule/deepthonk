@@ -27,7 +27,12 @@ export function fitBradleyTerry(
     ])
   );
 
-  for (const comparison of comparisons) {
+  // Trace rows are appended in provider completion order, which is intentionally
+  // nondeterministic under concurrency. Floating-point summation is order
+  // sensitive, so canonicalize before fitting to make live and replayed scores
+  // byte-for-byte stable.
+  const canonicalComparisons = canonicalizeComparisons(comparisons);
+  for (const comparison of canonicalComparisons) {
     const a = comparison.presentedAOriginalId;
     const b = comparison.presentedBOriginalId;
     const i = index.get(a);
@@ -243,7 +248,29 @@ function vectorNorm(values: number[]): number {
 }
 
 function finite(value: number): number {
-  return Number.isFinite(value) ? value : 0;
+  return Number.isFinite(value) && !Object.is(value, -0) ? value : 0;
+}
+
+export function canonicalizeComparisons(comparisons: readonly Comparison[]): Comparison[] {
+  return [...comparisons].sort(compareComparisons);
+}
+
+function compareComparisons(left: Comparison, right: Comparison): number {
+  const leftKey = JSON.stringify([
+    left.id,
+    left.presentedAOriginalId,
+    left.presentedBOriginalId,
+    left.winner,
+    left.generation
+  ]);
+  const rightKey = JSON.stringify([
+    right.id,
+    right.presentedAOriginalId,
+    right.presentedBOriginalId,
+    right.winner,
+    right.generation
+  ]);
+  return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
 }
 
 function inferGeneration(comparisons: Comparison[]): number | "final" {

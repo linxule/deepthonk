@@ -2,6 +2,7 @@ export * from "./bradleyTerry.js";
 export * from "./artifacts.js";
 export * from "./budget.js";
 export * from "./budgetTracker.js";
+export * from "./checkpointStore.js";
 export * from "./critique.js";
 export * from "./errors.js";
 export * from "./json.js";

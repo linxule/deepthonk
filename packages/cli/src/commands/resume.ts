@@ -38,9 +38,12 @@ async function resumeDriverFromRunConfig(
   const replay = parseProviderReplay(isRecord(raw) ? raw.providerReplay : undefined);
   const provider = providerOverride ?? replay?.provider ?? config.provider;
   const providerConfig = replay
-    ? providerConfigFromReplay({ ...replay, provider }, config.retry)
+    ? providerConfigFromReplay({ ...replay, provider }, config.retry, {
+        providerMaxConcurrency: config.providerMaxConcurrency
+      })
     : resolveProviderConfig({
         provider,
+        providerMaxConcurrency: config.providerMaxConcurrency,
         models: {
           generator: config.generatorModel,
           mutator: config.mutatorModel,

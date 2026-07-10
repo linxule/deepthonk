@@ -94,6 +94,20 @@ const providerNameSchema = z
   .describe("Provider label. Built-ins include fake, deepseek, openrouter, and openai-compatible; custom labels require base_url.")
   .default("fake");
 
+const modelOutputTokensArgsSchema = z.object({
+  generation: z.number().int().min(1).optional(),
+  mutation: z.number().int().min(1).optional(),
+  judge: z.number().int().min(1).optional(),
+  finalizer: z.number().int().min(1).optional()
+}).strict();
+
+const rankControlArgsSchema = z.object({
+  mode: z.enum(["all-pairs", "k-regular"]),
+  k: z.number().int().min(1).optional(),
+  seed: z.number().int().optional(),
+  max_calls: z.number().int().min(1).optional()
+}).strict();
+
 export const runArgsSchema = z.object({
   task: z.string().min(1).describe("Task text to solve. MCP tools do not read task files."),
   run_id: runIdSchema.optional().describe("Optional stable caller-supplied run ID."),
@@ -121,6 +135,10 @@ export const runArgsSchema = z.object({
   max_output_tokens: z.number().int().min(1).optional().describe("Maximum recorded output tokens before the run stops at a phase boundary."),
   max_usd: z.number().min(0).optional().describe("Maximum estimated USD spend; requires matching budget.prices in config."),
   request_timeout_ms: z.number().int().min(1).optional().describe("Logical provider-call deadline in milliseconds, including body reads and retry waits."),
+  provider_max_concurrency: z.number().int().min(1).max(1_024).optional().describe("Process-shared maximum concurrent calls to this provider route."),
+  model_output_tokens: modelOutputTokensArgsSchema.optional().describe("Per-role model output token caps."),
+  critique_limits: z.object({ aggregate_chars: z.number().int().min(256).optional() }).strict().optional().describe("Critique aggregation bounds."),
+  rank: rankControlArgsSchema.optional().describe("Final ranking mode, degree, seed, and logical-call limit."),
   n: z.number().int().min(2).optional().describe("Population size override. Defaults to the profile's n."),
   k: z.number().int().min(1).optional().describe("Comparisons per candidate per mutation-generation round."),
   t: z.number().int().min(0).optional().describe("Number of mutation generations (t=0 disables mutation rounds)."),
@@ -194,7 +212,9 @@ const providerArgsSchema = z.object({
   mutator_model: z.string().optional().describe("Model used for critique-guided mutation."),
   judge_model: z.string().optional().describe("Model used for pairwise judging."),
   finalizer_model: z.string().optional().describe("Optional model used to polish the winning candidate."),
-  request_timeout_ms: z.number().int().optional().describe("Per-request provider timeout in milliseconds."),
+  request_timeout_ms: z.number().int().min(1).optional().describe("Logical provider-call deadline in milliseconds."),
+  provider_max_concurrency: z.number().int().min(1).max(1_024).optional().describe("Process-shared maximum concurrent calls to this provider route."),
+  model_output_tokens: modelOutputTokensArgsSchema.optional().describe("Per-role model output token caps for one-shot operations."),
   sampling_model_hints: z.array(z.string()).optional().describe("Optional MCP Sampling model hints."),
   sampling_cost_priority: z.number().min(0).max(1).optional().describe("MCP Sampling model preference for lower cost, from 0 to 1."),
   sampling_speed_priority: z.number().min(0).max(1).optional().describe("MCP Sampling model preference for speed, from 0 to 1."),
@@ -207,6 +227,7 @@ export const rankArgsSchema = providerArgsSchema.extend({
   candidates: z.array(z.union([z.string(), z.object({ id: z.string().optional(), content: z.string() })])).min(2).describe("Candidate texts or {id, content} objects."),
   judge_temperature: z.number().min(0).optional().describe("Temperature for pairwise judging."),
   lambda: z.number().min(0).optional().describe("Bradley-Terry L2 regularization."),
+  rank: rankControlArgsSchema.optional().describe("Pair scheduling mode, degree, seed, and logical-call limit."),
   concurrency: z.number().int().min(1).optional().describe("Maximum concurrent pairwise comparisons."),
   prompt_style: z.enum(["general", "paper-programming"]).optional(),
   prompts: z.object({
@@ -338,6 +359,7 @@ export interface McpSamplingContext {
   getClientCapabilities(): ClientCapabilities | undefined;
   createMessage: SamplingTransport;
   transport?: "stdio" | "http";
+  backgroundJobManager?: BackgroundJobManager;
 }
 
 interface BackgroundJobReservation {
@@ -361,7 +383,10 @@ export class BackgroundJobManager {
   constructor(
     private readonly maxActive = 2,
     private readonly maxQueued = 32
-  ) {}
+  ) {
+    if (!Number.isInteger(maxActive) || maxActive < 1) throw new Error("maxActive must be a positive integer.");
+    if (!Number.isInteger(maxQueued) || maxQueued < 0) throw new Error("maxQueued must be a non-negative integer.");
+  }
 
   reserve(): BackgroundJobReservation | undefined {
     if (this.active + this.queue.length + this.reservations.size >= this.maxActive + this.maxQueued) return undefined;
@@ -411,9 +436,11 @@ export class BackgroundJobManager {
 const backgroundJobs = new BackgroundJobManager();
 
 export async function deepthonkStart(argsInput: unknown, context?: McpSamplingContext): Promise<Record<string, unknown>> {
-  const reservation = backgroundJobs.reserve();
+  const jobManager = context?.backgroundJobManager ?? backgroundJobs;
+  const reservation = jobManager.reserve();
   if (!reservation) {
-    throw new ConfigError("The MCP background job queue is full (2 active, 32 queued).", {
+    const limits = jobManager.stats();
+    throw new ConfigError(`The MCP background job queue is full (${limits.maxActive} active, ${limits.maxQueued} queued).`, {
       code: "mcp.job_queue_full",
       retryable: true,
       fix: "Retry after a running background job completes, or use blocking deepthonk.run."
@@ -454,7 +481,7 @@ export async function deepthonkStart(argsInput: unknown, context?: McpSamplingCo
       await safeReleaseRunLock(runConfig.runDir, claimed.claimId);
       throw error;
     }
-    backgroundJobs.schedule(reservation, () => runBackgroundJob(runConfig, providerConfig, jobId, now, claimed));
+    jobManager.schedule(reservation, () => runBackgroundJob(runConfig, providerConfig, jobId, now, claimed));
     scheduled = true;
     const resources = jobArtifactResources(jobId, runConfig.runDir);
     return {
@@ -466,7 +493,7 @@ export async function deepthonkStart(argsInput: unknown, context?: McpSamplingCo
       artifact_resources: resources
     };
   } finally {
-    if (!scheduled) backgroundJobs.release(reservation);
+    if (!scheduled) jobManager.release(reservation);
   }
 }
 
@@ -616,7 +643,6 @@ export async function deepthonkCancel(argsInput: unknown): Promise<Record<string
 
 export async function deepthonkRun(argsInput: unknown, context?: McpSamplingContext): Promise<Record<string, unknown>> {
   const { runConfig, providerConfig } = await resolveMcpRun(argsInput, context);
-  rejectHttpBlockingSamplingForPatch(providerConfig, context);
   const result = await runDeepThonk(runConfig, createDriver(providerConfig), {
     shouldCancel: () => isRunCancelRequested(runConfig.runDir)
   });
@@ -651,7 +677,7 @@ async function resolveMcpRun(argsInput: unknown, context?: McpSamplingContext): 
   });
   return {
     runConfig: {
-      runId: args.run_id,
+      runId: args.run_id ?? config.runId,
       task: args.task,
       rubric: args.rubric,
       promptStyle: args.prompt_style ?? config.prompt_style ?? (profileName === "paper" ? "paper-programming" : "general"),
@@ -665,6 +691,10 @@ async function resolveMcpRun(argsInput: unknown, context?: McpSamplingContext): 
       mutatorModel: models.mutator,
       judgeModel: models.judge,
       finalizerModel: models.finalizer,
+      modelOutputTokens: mergeModelOutputTokens(config.modelOutputTokens, args.model_output_tokens),
+      critiqueLimits: mergeCritiqueLimits(config.critiqueLimits, args.critique_limits),
+      rank: mergeRankControls(config.rank, args.rank),
+      providerMaxConcurrency: args.provider_max_concurrency ?? config.providerMaxConcurrency,
       concurrency,
       retry: {
         httpRetries: config.retry?.httpRetries ?? 2,
@@ -693,7 +723,6 @@ export async function deepthonkRank(argsInput: unknown, context?: McpSamplingCon
   const providerConfig = oneShot.providerConfig;
   assertSupportedSamplingRoutes(providerConfig);
   assertSamplingCapability(providerConfig, context);
-  rejectHttpBlockingSamplingForPatch(providerConfig, context);
   const models = providerConfig.models;
   const driver = createDriver(providerConfig);
   const candidates: CandidateInput[] = args.candidates;
@@ -706,6 +735,11 @@ export async function deepthonkRank(argsInput: unknown, context?: McpSamplingCon
     runId: "mcp-rank",
     temperature: args.judge_temperature ?? oneShot.profile.judgeTemperature,
     lambda: args.lambda ?? oneShot.profile.lambda,
+    seed: oneShot.rank?.seed,
+    mode: oneShot.rank?.mode,
+    k: oneShot.rank?.k,
+    maxCalls: oneShot.rank?.maxCalls,
+    maxOutputTokens: oneShot.modelOutputTokens?.judge,
     concurrency: capOneShotConcurrency(providerConfig.provider, args.concurrency ?? oneShot.concurrency.judge),
     promptStyle: oneShot.promptStyle,
     promptOverrides: oneShot.promptOverrides?.compare ? { compare: oneShot.promptOverrides.compare } : undefined
@@ -729,6 +763,7 @@ export async function deepthonkMutate(argsInput: unknown, context?: McpSamplingC
       driver: createDriver(providerConfig),
       mutatorModel: models.mutator,
       temperature: args.mutate_temperature ?? oneShot.profile.mutateTemperature,
+      maxOutputTokens: oneShot.modelOutputTokens?.mutation,
       critique: args.critique,
       promptStyle: oneShot.promptStyle,
       promptOverrides: oneShot.promptOverrides?.mutate ? { mutate: oneShot.promptOverrides.mutate } : undefined
@@ -742,7 +777,10 @@ export async function deepthonkResume(argsInput: unknown, context?: McpSamplingC
     const raw = JSON.parse(await readFile(join(args.run_dir, "config.json"), "utf8")) as unknown;
     const config = runConfigSchema.parse(raw);
     const replayedProvider = config.providerReplay
-      ? providerConfigFromReplay(parseProviderReplay(config.providerReplay)!, config.retry)
+      ? providerConfigFromReplay(parseProviderReplay(config.providerReplay)!, config.retry, {
+          providerMaxConcurrency: config.providerMaxConcurrency,
+          samplingTransport: config.providerReplay.provider === "sampling" ? context?.createMessage : undefined
+        })
       : resolveProviderConfig({
           provider: config.provider,
           models: {
@@ -752,15 +790,17 @@ export async function deepthonkResume(argsInput: unknown, context?: McpSamplingC
             finalizer: config.finalizerModel
           },
           retry: config.retry,
+          providerMaxConcurrency: config.providerMaxConcurrency,
           samplingTransport: config.provider === "sampling" ? context?.createMessage : undefined
         });
-    const providerConfig = replayedProvider.provider === "sampling"
-      ? { ...replayedProvider, samplingTransport: context?.createMessage }
-      : replayedProvider;
+    const providerConfig = replayedProvider;
     assertSupportedSamplingRoutes(providerConfig);
     assertSamplingCapability(providerConfig, context);
-    rejectHttpBlockingSamplingForPatch(providerConfig, context);
-    const result = await resumeDeepThonk(args.run_dir, createDriver(providerConfig), { provider: providerConfig.provider });
+    const result = await resumeDeepThonk(
+      args.run_dir,
+      createDriver(providerConfig),
+      { provider: providerConfig.provider }
+    );
     if ("winner" in result) {
       return {
         status: "completed",
@@ -792,6 +832,7 @@ async function resolveMcpOneShot(
   args: z.infer<typeof providerArgsSchema> & {
     prompt_style?: Parameters<typeof runDeepThonk>[0]["promptStyle"];
     prompts?: McpPromptOverrides;
+    rank?: z.infer<typeof rankControlArgsSchema>;
   },
   raw: Record<string, unknown>,
   samplingTransport?: SamplingTransport
@@ -801,6 +842,8 @@ async function resolveMcpOneShot(
   promptStyle: Parameters<typeof runDeepThonk>[0]["promptStyle"];
   promptOverrides?: Parameters<typeof runDeepThonk>[0]["promptOverrides"];
   concurrency: Parameters<typeof runDeepThonk>[0]["concurrency"];
+  modelOutputTokens?: Parameters<typeof runDeepThonk>[0]["modelOutputTokens"];
+  rank?: Parameters<typeof runDeepThonk>[0]["rank"];
 }> {
   const config = await readMcpConfig(args.config_path, args.profile_name);
   const profileName = (raw.profile ?? config.profile ?? args.profile) as BuiltInProfileName;
@@ -811,6 +854,8 @@ async function resolveMcpOneShot(
     profile,
     promptStyle: args.prompt_style ?? config.prompt_style ?? (profileName === "paper" ? "paper-programming" : "general"),
     promptOverrides: mergePromptOverrides(config.prompts, args.prompts),
+    modelOutputTokens: mergeModelOutputTokens(config.modelOutputTokens, args.model_output_tokens),
+    rank: mergeRankControls(config.rank, args.rank),
     concurrency: capSamplingConcurrency(providerConfig.provider, profile, {
       generate: config.concurrency?.generate ?? profile.n,
       judge: config.concurrency?.judge ?? Math.max(1, (profile.n * Math.max(profile.k, profile.m)) / 2),
@@ -834,6 +879,7 @@ function resolveMcpProviderConfig(
     baseUrl: args.base_url ?? (isolateFileRoute ? undefined : config.base_url),
     apiKeyEnv: args.api_key_env ?? (isolateFileRoute ? undefined : config.api_key_env),
     supportsJsonMode: args.supports_json_mode ?? (isolateFileRoute ? undefined : config.supports_json_mode),
+    providerMaxConcurrency: args.provider_max_concurrency ?? config.providerMaxConcurrency,
     models: {
       generator: args.generator_model ?? (isolateFileRoute ? undefined : config.models?.generator),
       mutator: args.mutator_model ?? (isolateFileRoute ? undefined : config.models?.mutator),
@@ -878,15 +924,6 @@ function assertSamplingCapability(providerConfig: ProviderConfig, context?: McpS
       fix: "Use an MCP client that supports sampling, or choose a direct provider such as deepseek, openrouter, or openai-compatible."
     });
   }
-}
-
-function rejectHttpBlockingSamplingForPatch(providerConfig: ProviderConfig, context?: McpSamplingContext): void {
-  if (context?.transport !== "http" || !providerConfigUsesSampling(providerConfig)) return;
-  throw new ConfigError("Blocking MCP Sampling over Streamable HTTP is not enabled in the v0.1 patch line.", {
-    code: "mcp.http_sampling_requires_v0_2",
-    retryable: false,
-    fix: "Use stdio Sampling, use a direct provider over HTTP, or upgrade to DeepThonk v0.2.0."
-  });
 }
 
 function assertSupportedSamplingRoutes(providerConfig: ProviderConfig): void {
@@ -1046,6 +1083,45 @@ function normalizeRoleProviders(
     };
   }
   return Object.keys(normalized).length ? normalized : undefined;
+}
+
+function mergeModelOutputTokens(
+  fileValue: Parameters<typeof runDeepThonk>[0]["modelOutputTokens"],
+  inlineValue: z.infer<typeof modelOutputTokensArgsSchema> | undefined
+): Parameters<typeof runDeepThonk>[0]["modelOutputTokens"] {
+  if (!fileValue && !inlineValue) return undefined;
+  return { ...(fileValue ?? {}), ...(inlineValue ?? {}) };
+}
+
+function mergeCritiqueLimits(
+  fileValue: Parameters<typeof runDeepThonk>[0]["critiqueLimits"],
+  inlineValue: { aggregate_chars?: number } | undefined
+): Parameters<typeof runDeepThonk>[0]["critiqueLimits"] {
+  if (!fileValue && !inlineValue) return undefined;
+  return {
+    ...(fileValue ?? {}),
+    ...definedValues({ aggregateChars: inlineValue?.aggregate_chars })
+  };
+}
+
+function mergeRankControls(
+  fileValue: Parameters<typeof runDeepThonk>[0]["rank"],
+  inlineValue: z.infer<typeof rankControlArgsSchema> | undefined
+): Parameters<typeof runDeepThonk>[0]["rank"] {
+  if (!inlineValue) return fileValue;
+  return {
+    ...(fileValue ?? {}),
+    ...definedValues({
+      mode: inlineValue.mode,
+      k: inlineValue.k,
+      seed: inlineValue.seed,
+      maxCalls: inlineValue.max_calls
+    })
+  } as Parameters<typeof runDeepThonk>[0]["rank"];
+}
+
+function definedValues<T extends Record<string, unknown>>(value: T): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as Partial<T>;
 }
 
 function mergeBudget(

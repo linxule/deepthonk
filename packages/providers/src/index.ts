@@ -8,5 +8,6 @@ export * from "./openaiCompatible.js";
 export * from "./pricing.js";
 export * from "./providerReplay.js";
 export * from "./registry.js";
+export * from "./routeLimiter.js";
 export * from "./sampling.js";
 export * from "./types.js";

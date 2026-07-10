@@ -24,6 +24,12 @@ export function registerRank(program: Command): void {
     .option("--judge-temperature <number>", "Temperature for pairwise judging")
     .option("--lambda <number>", "Bradley-Terry L2 regularization")
     .option("--concurrency <number>", "Maximum concurrent pairwise comparisons")
+    .option("--rank-mode <mode>", "all-pairs|k-regular")
+    .option("--rank-k <number>", "Degree for k-regular ranking")
+    .option("--rank-seed <number>", "Seed for pair scheduling and A/B presentation")
+    .option("--max-calls <number>", "Explicit logical judge-call cap")
+    .option("--judge-output-tokens <number>", "Per-judge model output cap (default 1024)")
+    .option("--provider-max-concurrency <number>", "Maximum process-shared concurrency for this provider route")
     .option("--prompt-style <style>", "general|paper-programming")
     .option("--prompts <yaml>", "YAML file with per-phase prompt overrides")
     .option("--prompts-json <json>", "Inline JSON object with a compare prompt override")
@@ -38,6 +44,7 @@ export function registerRank(program: Command): void {
           return { id: parsed.id ?? `candidate-${index + 1}`, content: parsed.content };
         });
       const resolved = await resolveOneShotConfig(options);
+      const maxCalls = numberOption(options.maxCalls, "--max-calls", { integer: true, min: 1 });
       const result = await rankCandidates({
         task,
         rubric,
@@ -47,6 +54,11 @@ export function registerRank(program: Command): void {
         temperature: resolved.profile.judgeTemperature,
         lambda: resolved.profile.lambda,
         concurrency: numberOption(options.concurrency, "--concurrency", { integer: true, min: 1 }) ?? resolved.concurrency.judge,
+        mode: resolved.rank?.mode,
+        k: resolved.rank?.k,
+        seed: resolved.rank?.seed,
+        maxCalls: maxCalls ?? resolved.rank?.maxCalls,
+        maxOutputTokens: resolved.modelOutputTokens?.judge,
         promptStyle: resolved.promptStyle,
         promptOverrides: resolved.promptOverrides?.compare ? { compare: resolved.promptOverrides.compare } : undefined
       });

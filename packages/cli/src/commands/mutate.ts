@@ -20,6 +20,8 @@ export function registerMutate(program: Command): void {
     .option("--supports-json-mode <true|false>", "Whether the base OpenAI-compatible provider supports response_format JSON mode")
     .option("--mutator-model <model>")
     .option("--request-timeout-ms <number>")
+    .option("--mutation-output-tokens <number>", "Per-mutation model output cap (default 4096)")
+    .option("--provider-max-concurrency <number>", "Maximum process-shared concurrency for this provider route")
     .option("--mutate-temperature <number>", "Temperature for mutation")
     .option("--prompt-style <style>", "general|paper-programming")
     .option("--prompts <yaml>", "YAML file with per-phase prompt overrides")
@@ -40,6 +42,7 @@ export function registerMutate(program: Command): void {
         driver: createDriver(resolved.providerConfig),
         mutatorModel: resolved.models.mutator,
         temperature: resolved.profile.mutateTemperature,
+        maxOutputTokens: resolved.modelOutputTokens?.mutation,
         critique,
         promptStyle: resolved.promptStyle,
         promptOverrides: resolved.promptOverrides?.mutate ? { mutate: resolved.promptOverrides.mutate } : undefined

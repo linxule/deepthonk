@@ -86,17 +86,23 @@ export function parseProviderReplay(value: unknown): ProviderReplay | undefined 
   return parsed.data;
 }
 
-export function providerConfigFromReplay(replay: ProviderReplay, retry?: ProviderConfig["retry"]): ProviderConfig {
+export function providerConfigFromReplay(
+  replay: ProviderReplay,
+  retry?: ProviderConfig["retry"],
+  options: { providerMaxConcurrency?: number; samplingTransport?: ProviderConfig["samplingTransport"] } = {}
+): ProviderConfig {
   assertProviderReplayFingerprint(replay);
   return resolveProviderConfig({
     provider: replay.provider,
     routeFingerprint: replay.routeFingerprint,
+    providerMaxConcurrency: options.providerMaxConcurrency,
     baseUrl: replay.baseUrl,
     apiKeyEnv: replay.apiKeyEnv,
     supportsJsonMode: replay.supportsJsonMode,
     models: replay.models,
     roleProviders: replay.roleProviders,
     retry,
+    samplingTransport: options.samplingTransport,
     modelHints: replay.samplingPreferences?.modelHints,
     costPriority: replay.samplingPreferences?.costPriority,
     speedPriority: replay.samplingPreferences?.speedPriority,

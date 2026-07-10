@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OpenAiCompatibleDriver } from "@deepthonk/providers";
+import { OpenAiCompatibleDriver, resetSharedRouteLimiters } from "@deepthonk/providers";
 
 describe("OpenAiCompatibleDriver", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    resetSharedRouteLimiters();
     delete process.env.TEST_PROVIDER_KEY;
   });
 
@@ -39,6 +40,28 @@ describe("OpenAiCompatibleDriver", () => {
     expect(result.usage?.inputCacheMissTokens).toBe(0);
     expect(fetchMock).toHaveBeenCalledWith("https://example.test/v1/chat/completions", expect.any(Object));
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ max_tokens: 4096 });
+  });
+
+  it("honors per-call maxOutputTokens from the core driver contract", async () => {
+    process.env.TEST_PROVIDER_KEY = "secret";
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: "answer" } }] }), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = new OpenAiCompatibleDriver({
+      provider: "openai-compatible",
+      baseUrl: "https://example.test/v1",
+      apiKeyEnv: "TEST_PROVIDER_KEY",
+      models: { generator: "m", mutator: "m", judge: "m" }
+    });
+    await driver.generate({
+      task: "x",
+      model: "m",
+      temperature: 0,
+      maxOutputTokens: 777,
+      prompt: { system: "s", user: "u" }
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ max_tokens: 777 });
   });
 
   it("reports retry count after retryable provider errors", async () => {
@@ -276,6 +299,46 @@ describe("OpenAiCompatibleDriver", () => {
     } as Parameters<typeof driver.generate>[0]);
     controller.abort();
     await expect(request).rejects.toMatchObject({ code: "provider.aborted", retryable: false });
+  });
+
+  it("releases 429 retries and reacquires them under the reduced route ceiling", async () => {
+    let initialCalls = 0;
+    let releaseInitial!: () => void;
+    const initialBarrier = new Promise<void>((resolve) => {
+      releaseInitial = resolve;
+    });
+    let activeRetries = 0;
+    let peakRetries = 0;
+    const fetchMock = vi.fn(async () => {
+      if (initialCalls < 4) {
+        initialCalls += 1;
+        if (initialCalls === 4) releaseInitial();
+        await initialBarrier;
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "0" } });
+      }
+      activeRetries += 1;
+      peakRetries = Math.max(peakRetries, activeRetries);
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      activeRetries -= 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "answer" } }] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = new OpenAiCompatibleDriver({
+      provider: "openai-compatible",
+      baseUrl: "https://retry-ceiling.example/v1",
+      apiKey: "shared-secret",
+      models: { generator: "m", mutator: "m", judge: "m" },
+      providerMaxConcurrency: 4,
+      retry: { httpRetries: 1, maxRetryDelayMs: 1 }
+    });
+
+    await Promise.all(
+      Array.from({ length: 4 }, () =>
+        driver.generate({ task: "x", model: "m", temperature: 0, prompt: { system: "", user: "u" } })
+      )
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+    expect(peakRetries).toBe(1);
   });
 });
 

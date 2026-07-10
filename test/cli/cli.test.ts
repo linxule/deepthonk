@@ -262,6 +262,50 @@ describe("deepthonk CLI", () => {
     expect(changedEndpoint.providerConfig.supportsJsonMode).toBeUndefined();
   });
 
+  it("wires v0.2 provider, output, critique, and rank config into dry-run state", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-v02-config-"));
+    const configPath = join(configDir, "v02.yaml");
+    await writeFile(
+      configPath,
+      [
+        "profile: quick",
+        "provider: fake",
+        "provider_max_concurrency: 6",
+        "model_output_tokens:",
+        "  generation: 3000",
+        "  mutation: 3001",
+        "  judge: 800",
+        "  finalizer: 3002",
+        "critique_limits:",
+        "  aggregate_chars: 12000",
+        "rank:",
+        "  mode: k-regular",
+        "  k: 2",
+        "  seed: 9",
+        "  max_calls: 20"
+      ].join("\n")
+    );
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      cli,
+      "run",
+      "--config",
+      configPath,
+      "--task",
+      "toy",
+      "--dry-run"
+    ]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig).toMatchObject({
+      modelOutputTokens: { generation: 3000, mutation: 3001, judge: 800, finalizer: 3002 },
+      critiqueLimits: { aggregateChars: 12000 },
+      rank: { mode: "k-regular", k: 2, seed: 9, maxCalls: 20 },
+      providerMaxConcurrency: 6
+    });
+    expect(parsed.providerConfig.providerMaxConcurrency).toBe(6);
+  });
+
   it("rejects invalid numeric and boolean CLI options", async () => {
     await expect(
       execFileAsync(process.execPath, ["--import", "tsx", cli, "run", "--provider", "fake", "--task", "toy", "--n", "3.5", "--dry-run"])
@@ -389,6 +433,61 @@ describe("deepthonk CLI", () => {
     expect(JSON.parse(mutated.stdout).mutated).toContain("FAKE_QUALITY:8");
   });
 
+  it("maps one-shot rank --max-calls to the ranking schedule", async () => {
+    const configDir = await mkdtemp(join(tmpdir(), "deepthonk-rank-max-calls-"));
+    const candidatesPath = join(configDir, "candidates.jsonl");
+    await writeFile(
+      candidatesPath,
+      [1, 2, 3, 4].map((quality) => JSON.stringify({ id: `c${quality}`, content: `FAKE_QUALITY:${quality}` })).join("\n")
+    );
+    const baseArgs = [
+      "--import",
+      "tsx",
+      cli,
+      "rank",
+      "--provider",
+      "fake",
+      "--task",
+      "toy",
+      "--candidates",
+      candidatesPath,
+      "--rank-mode",
+      "k-regular",
+      "--rank-k",
+      "1"
+    ];
+    const { stdout } = await execFileAsync(process.execPath, [...baseArgs, "--max-calls", "2"]);
+    expect(JSON.parse(stdout)).toHaveLength(4);
+    await expect(execFileAsync(process.execPath, [...baseArgs, "--max-calls", "1"])).rejects.toMatchObject({
+      stderr: expect.stringContaining("exceeding maxCalls 1")
+    });
+  });
+
+  it("keeps full-run budget and rank call caps separate", async () => {
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      cli,
+      "run",
+      "--provider",
+      "fake",
+      "--task",
+      "toy",
+      "--max-calls",
+      "30",
+      "--rank-mode",
+      "k-regular",
+      "--rank-k",
+      "2",
+      "--rank-max-calls",
+      "4",
+      "--dry-run"
+    ]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.runConfig.budget.maxCalls).toBe(30);
+    expect(parsed.runConfig.rank).toEqual({ mode: "k-regular", k: 2, maxCalls: 4 });
+  });
+
   it("resolves one-shot command defaults from config/profile before inline overrides", async () => {
     const configDir = await mkdtemp(join(tmpdir(), "deepthonk-one-shot-defaults-"));
     const configPath = join(configDir, "config.yaml");
@@ -408,6 +507,15 @@ describe("deepthonk CLI", () => {
         "  judge_temperature: 0.3",
         "retry:",
         "  requestTimeoutMs: 1234",
+        "provider_max_concurrency: 6",
+        "model_output_tokens:",
+        "  mutation: 3000",
+        "  judge: 700",
+        "rank:",
+        "  mode: k-regular",
+        "  k: 2",
+        "  seed: 8",
+        "  max_calls: 20",
         "prompts:",
         "  compare:",
         "    system: Config judge",
@@ -420,6 +528,7 @@ describe("deepthonk CLI", () => {
       config: configPath,
       requestTimeoutMs: "5678",
       judgeTemperature: "0.5",
+      judgeOutputTokens: "800",
       promptsJson: JSON.stringify({ compare: { system: "Inline judge" } })
     });
 
@@ -430,6 +539,10 @@ describe("deepthonk CLI", () => {
     expect(resolved.promptStyle).toBe("paper-programming");
     expect(resolved.promptOverrides?.compare?.system).toBe("Inline judge");
     expect(resolved.promptOverrides?.mutate?.system).toBe("Config mutate");
+    expect(resolved.modelOutputTokens).toEqual({ mutation: 3000, judge: 800 });
+    expect(resolved.rank).toEqual({ mode: "k-regular", k: 2, seed: 8, maxCalls: 20 });
+    expect(resolved.providerMaxConcurrency).toBe(6);
+    expect(resolved.providerConfig.providerMaxConcurrency).toBe(6);
   });
 
   it("writes redacted providerReplay into run config", async () => {

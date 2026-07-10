@@ -38,6 +38,9 @@ export interface ResolvedOneShotConfig extends ResolvedProviderConfig {
   promptStyle: RunConfig["promptStyle"];
   promptOverrides?: RunConfig["promptOverrides"];
   concurrency: RunConfig["concurrency"];
+  modelOutputTokens?: RunConfig["modelOutputTokens"];
+  rank?: RunConfig["rank"];
+  providerMaxConcurrency?: number;
 }
 
 export interface ResolvedPlanConfig {
@@ -56,6 +59,7 @@ interface ProviderSelection {
   supportsJsonMode?: boolean;
   roleProviders?: Parameters<typeof resolveProviderConfig>[0]["roleProviders"];
   inheritProviderDefaults: boolean;
+  providerMaxConcurrency?: number;
 }
 
 export { defaultConfigPath, defaultEnvPath, loadDeepThonkEnv };
@@ -83,6 +87,7 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
     models,
     roleProviders: selection.roleProviders,
     inheritProviderDefaults: selection.inheritProviderDefaults,
+    providerMaxConcurrency: selection.providerMaxConcurrency,
     retry
   });
   const budget = mergeBudget(fileConfig.budget, {
@@ -111,6 +116,10 @@ export async function resolveRunConfig(options: Record<string, unknown>): Promis
     mutatorModel: models.mutator,
     judgeModel: models.judge,
     finalizerModel: models.finalizer,
+    modelOutputTokens: resolveModelOutputTokens(options, fileConfig),
+    critiqueLimits: resolveCritiqueLimits(options, fileConfig),
+    rank: resolveRankConfig(options, fileConfig),
+    providerMaxConcurrency: selection.providerMaxConcurrency,
     concurrency: resolveRunConcurrency(profile, fileConfig, options, maxConcurrency),
     retry,
     budget,
@@ -146,6 +155,7 @@ export async function resolveOneShotConfig(options: Record<string, unknown>): Pr
     models,
     roleProviders: selection.roleProviders,
     inheritProviderDefaults: selection.inheritProviderDefaults,
+    providerMaxConcurrency: selection.providerMaxConcurrency,
     retry
   });
   return {
@@ -158,7 +168,10 @@ export async function resolveOneShotConfig(options: Record<string, unknown>): Pr
       fileConfig.prompt_style ??
       defaultPromptStyle(profileName),
     promptOverrides: await loadPromptOverrides(options, fileConfig),
-    concurrency: resolveRunConcurrency(profile, fileConfig, options)
+    concurrency: resolveRunConcurrency(profile, fileConfig, options),
+    modelOutputTokens: resolveModelOutputTokens(options, fileConfig),
+    rank: resolveRankConfig(options, fileConfig),
+    providerMaxConcurrency: selection.providerMaxConcurrency
   };
 }
 
@@ -201,8 +214,69 @@ function resolveProviderSelection(options: Record<string, unknown>, fileConfig: 
     apiKeyEnv: stringOption(options.apiKeyEnv) ?? (isolateFileRoute ? undefined : fileConfig.api_key_env),
     supportsJsonMode,
     roleProviders: isolateFileRoute ? undefined : normalizeRoleProviders(fileConfig.providers),
-    inheritProviderDefaults: !baseUrlChanged
+    inheritProviderDefaults: !baseUrlChanged,
+    providerMaxConcurrency:
+      numberOption(options.providerMaxConcurrency, "--provider-max-concurrency", { integer: true, min: 1, max: 1_024 }) ??
+      fileConfig.providerMaxConcurrency
   };
+}
+
+function resolveModelOutputTokens(
+  options: Record<string, unknown>,
+  fileConfig: RawConfigFile
+): RunConfig["modelOutputTokens"] {
+  const resolved = {
+    generation:
+      numberOption(options.generationOutputTokens, "--generation-output-tokens", { integer: true, min: 1 }) ??
+      fileConfig.modelOutputTokens?.generation,
+    mutation:
+      numberOption(options.mutationOutputTokens, "--mutation-output-tokens", { integer: true, min: 1 }) ??
+      fileConfig.modelOutputTokens?.mutation,
+    judge:
+      numberOption(options.judgeOutputTokens, "--judge-output-tokens", { integer: true, min: 1 }) ??
+      fileConfig.modelOutputTokens?.judge,
+    finalizer:
+      numberOption(options.finalizerOutputTokens, "--finalizer-output-tokens", { integer: true, min: 1 }) ??
+      fileConfig.modelOutputTokens?.finalizer
+  };
+  const compact = compactDefined(resolved);
+  return Object.keys(compact).length ? compact : undefined;
+}
+
+function resolveCritiqueLimits(options: Record<string, unknown>, fileConfig: RawConfigFile): RunConfig["critiqueLimits"] {
+  const aggregateChars =
+    numberOption(options.maxCritiqueChars, "--max-critique-chars", { integer: true, min: 256 }) ??
+    fileConfig.critiqueLimits?.aggregateChars;
+  return aggregateChars === undefined ? undefined : { aggregateChars };
+}
+
+function resolveRankConfig(options: Record<string, unknown>, fileConfig: RawConfigFile): RunConfig["rank"] {
+  const mode = stringOption(options.rankMode) ?? fileConfig.rank?.mode;
+  const k = numberOption(options.rankK, "--rank-k", { integer: true, min: 1 }) ?? fileConfig.rank?.k;
+  const seed = numberOption(options.rankSeed, "--rank-seed", { integer: true }) ?? fileConfig.rank?.seed;
+  const maxCalls = numberOption(options.rankMaxCalls, "--rank-max-calls", { integer: true, min: 1 }) ?? fileConfig.rank?.maxCalls;
+  if (mode === undefined) {
+    if (k !== undefined || seed !== undefined || maxCalls !== undefined) {
+      throw new ConfigError("Rank tuning requires rank.mode or --rank-mode.", {
+        code: "config.rank_mode_required",
+        retryable: false,
+        fix: "Set rank.mode to all-pairs or k-regular."
+      });
+    }
+    return undefined;
+  }
+  if (mode !== "all-pairs" && mode !== "k-regular") {
+    throw new ConfigError(`--rank-mode must be all-pairs or k-regular. Received '${mode}'.`, {
+      code: "config.invalid_cli_option",
+      retryable: false,
+      fix: "Pass --rank-mode all-pairs or --rank-mode k-regular."
+    });
+  }
+  return { mode, k, seed, maxCalls };
+}
+
+function compactDefined<T extends object>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
 }
 
 export function profileFromOptions(options: Record<string, unknown>): Profile {

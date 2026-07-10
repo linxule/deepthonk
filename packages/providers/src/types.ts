@@ -17,6 +17,7 @@ export interface RoleProviderConfig {
   apiKeyEnv?: string;
   apiKey?: string;
   model: string;
+  providerMaxConcurrency?: number;
   retry?: {
     httpRetries?: number;
     requestTimeoutMs?: number;
@@ -29,6 +30,7 @@ export interface RoleProviderConfig {
 export interface BaseProviderConfig extends SamplingDriverConfig {
   provider: "fake" | "openai-compatible" | "deepseek" | string;
   routeFingerprint?: string;
+  providerMaxConcurrency?: number;
   baseUrl?: string;
   apiKeyEnv?: string;
   apiKey?: string;

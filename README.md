@@ -31,7 +31,7 @@ deepthonk plan --profile paper
 
 The paper profile plans 285 model calls and 8 sequential rounds. Confirm budget and provider pricing before pointing it at paid models. The short alias `dt` is installed alongside `deepthonk`. Develop from source: see [Development](#development).
 
-> v0.1 scope: an independent TypeScript reimplementation of the OpenDeepThink algorithm as a CLI + MCP server. The published algorithm is the load-bearing part; this release is a practical integration layer with explicit limits documented below. Cost guarantees rely on provider pricing being present in config; resume inspects trace state by default and can replay from validated phase boundaries with `--continue` / MCP `continue: true`; the MCP HTTP transport is loopback-only. The included acceptance smoke uses the deterministic fake provider and a toy task — it is not a CF-73 / HLE reproduction; see `docs/` and [Acknowledgments](#acknowledgments) for the canonical paper and Python reference.
+> DeepThonk is an independent TypeScript reimplementation and practical integration layer; the published algorithm is the load-bearing part. Cost guarantees rely on provider pricing being present in config. Trace-v2 resume can reuse validated per-item receipts after a crash, while older traces replay an incomplete phase wholesale. The MCP HTTP transport remains loopback-only. The included acceptance smoke uses the deterministic fake provider and a toy task — it is not a CF-73 / HLE reproduction; see `docs/` and [Acknowledgments](#acknowledgments) for the canonical paper and Python reference.
 
 ## Setup
 
@@ -86,7 +86,7 @@ deepthonk run \
   --judge-model strong-model
 ```
 
-The driver calls `POST {base_url}/chat/completions` and requests JSON mode for comparisons when supported. If a provider returns a `400` with a body that mentions `response_format` or `json`, the driver retries without JSON mode and uses robust JSON extraction on the plain text response. Providers that reject JSON mode with a different status code (e.g. `422`) surface as a normal provider error — set `supportsJsonMode: false` in YAML to disable JSON mode up front.
+The driver calls `POST {base_url}/chat/completions` and requests JSON mode for comparisons when supported. If a provider returns `400` or `422` with a body that mentions `response_format` or `json`, the driver retries without JSON mode, coordinates that capability probe across concurrent calls, and remembers the result for the process. Set `supports_json_mode: false` in YAML to disable JSON mode up front.
 
 Provider names are flexible. For a custom OpenAI-compatible endpoint, use any provider label with `--base-url`, `--api-key-env`, and role-specific model flags. For OpenRouter:
 
@@ -111,7 +111,7 @@ The MCP server exposes the same engine the CLI runs. Once wired into an MCP host
 
 Provider API keys come from the host process's environment, not from DeepThonk's config alone. Each host handles env passthrough slightly differently — see the concrete patterns below.
 
-MCP Sampling is supported over stdio as `provider: "sampling"` when the connected host advertises the MCP sampling capability. The v0.1 patch line rejects Sampling over Streamable HTTP and all mixed Sampling/direct role routes; use a direct provider there. Sampling is not available from standalone CLI runs.
+MCP Sampling is supported as `provider: "sampling"` when the connected host advertises the MCP sampling capability. Blocking `run`, `rank`, and `mutate` work over stdio and stateful Streamable HTTP. HTTP background `start` rejects Sampling because nested Sampling must remain attached to the initiating request; stdio background runs and direct-provider HTTP background runs remain available. Sampling is not available from standalone CLI runs.
 
 ### Claude Code
 
@@ -174,7 +174,8 @@ with the relevant provider env vars set on the process. If you'd rather install 
 For local web hosts, or when stdio isn't available:
 
 ```bash
-deepthonk serve-mcp --transport http --port 3333
+deepthonk serve-mcp --transport http --port 3333 \
+  --max-active-jobs 2 --max-queued-jobs 32
 ```
 
 The server binds `127.0.0.1:3333` only and exposes stateful `POST`, `GET`, and `DELETE` at `http://127.0.0.1:3333/mcp`. Sessions use cryptographic IDs, expire after 30 idle minutes when no request is active, and are capped at 64. DNS rebinding protection is on (CVE-2025-66414): requests with `Host` headers outside `127.0.0.1:3333` / `localhost:3333` are rejected. The wrapper also rejects non-JSON POSTs, non-loopback `Origin` headers, and `Sec-Fetch-Site: cross-site` before reading the body. It has no bearer auth. Do not expose this port through a reverse proxy without re-evaluating that trust boundary.
@@ -211,8 +212,11 @@ All tools accept inline provider/model fields, or `config_path` pointing at a De
 - `deepthonk://runs/{run_id}/population/{generation}` — population snapshot for a generation (JSON).
 - `deepthonk://runs/{run_id}/{winner|final}` — text artifacts.
 - `deepthonk://runs/{run_id}/status` — run state (JSON).
+- `deepthonk://runs/{run_id}/prompts/{sha256}` — verified content-addressed rendered prompt (JSON).
+- `deepthonk://runs/{run_id}/trace-v2` — bounded phase index; follow its manifest, commit, checkpoint-index, and checkpoint URIs to inspect every receipt.
 - `deepthonk://jobs/{job_id}/{status|result|config|candidates|comparisons|scores|usage|trace|final|winner}?run_dir=...` — job-scoped lookup; the `run_dir` query param is required.
 - `deepthonk://jobs/{job_id}/population/{generation}?run_dir=...` — job-scoped population snapshots before or after completion.
+- Job results also include `prompt_template` and `trace_v2_template` for the job-scoped equivalents.
 - `deepthonk://runs/{run_id}/{resource}/page/{cursor}` and job equivalents — opaque bounded pages. Whole reads are limited to 1 MiB; pages contain at most 1,000 records and 1 MiB.
 
 ### Prompts
@@ -221,7 +225,7 @@ Four templates mirror the core loop: `deepthonk/generate`, `deepthonk/compare`, 
 
 ### Limits
 
-`deepthonk.resume` reports trace state by default. With `continue: true`, it validates phase order, artifacts, run/provider/model identity, scores, usage, and deterministic pair schedules before replaying a complete phase boundary. MCP Sampling model hints are preferences, token usage may be unavailable, and stdio Sampling concurrency is capped at 4. Streamable HTTP in v0.1 supports direct providers only.
+`deepthonk.resume` reports trace state by default. With `continue: true`, it validates phase order, artifacts, run/provider/model identity, scores, usage, deterministic pair schedules, trace-v2 receipts, and phase commits. Valid incomplete-phase receipts are reused without another provider call. MCP Sampling model hints are preferences and token usage may be unavailable. Its shared adaptive limiter starts at 4; direct providers start at 8.
 
 ## Customization
 
@@ -232,6 +236,10 @@ Every algorithm dimension is reachable through MCP arguments and CLI flags:
 - **Prompt style**: `general` or `paper-programming`.
 - **Per-phase prompt templates**: override `generate`, `compare`, `mutate`, or `finalize` with custom system/user templates and variable substitution (`{task}`, `{rubric}`, `{candidate}`, `{candidateA}`, `{candidateB}`, `{critique}`). CLI supports `--prompts <yaml>` and `--prompts-json <json>`; MCP supports inline `prompts`. Unknown variables throw a fail-fast error at run-start.
 - **Concurrency**: per-phase caps for `generate`, `judge`, `mutate`.
+- **Provider backpressure**: `provider_max_concurrency` sets the recovery ceiling for the shared adaptive provider-route limiter.
+- **Per-call output bounds**: independent generation, mutation, judge, and finalizer token caps.
+- **Final ranking schedule**: seeded `all-pairs` or `k-regular`, with an explicit logical call cap.
+- **Critique bound**: deterministic deduplication and a configurable aggregate-character cap before mutation.
 
 Example agent call (MCP), no YAML file required:
 
@@ -269,18 +277,22 @@ runs/{run_id}/
   usage.jsonl
   population-0.json
   population-{generation}.json
+  manifests/*.json
+  checkpoints/*/*.json
+  commits/*.json
   summary.json
   artifacts/winner.txt
   artifacts/final.txt
+  artifacts/prompts/<sha256>.json  # only when prompt capture is enabled
 ```
 
 `status.json` is written when the run is launched through MCP `deepthonk.start` (so async clients can poll). `cancel.json` is written only when cancellation is requested. A `run.lock` file is held for the duration of the run.
 
-JSONL writes are streamed as each candidate / comparison / call completes, and all appends go through a per-trace serialization queue. If a run is killed mid-tournament, completed pairs are durable on disk and the JSONL files remain readable.
+Trace rows are batch-appended through a single writer and flushed before lifecycle boundaries. Per-item output and usage receipts are written atomically before a phase commit. If a run is killed mid-tournament, trace-v2 resume validates and reuses completed receipts, re-materializes their JSONL rows, and calls the provider only for missing or invalid work.
 
 `usage.jsonl` carries one row per provider call (generator, judge, mutator, finalizer) with phase/role/provider/model/token/USD/latency/retry. It contains no prompt content. `jq` over `usage.jsonl` is the simplest way to break a run's cost down by role.
 
-Prompts and raw model outputs are off by default. API keys are never written. Candidate answers, critiques, scores, and final artifacts are trace data and are stored/exported by design, so do not use a shared run directory for sensitive tasks unless that is acceptable.
+Prompts and raw model outputs are off by default. When prompt capture is enabled, candidate/comparison rows carry a `promptRef` and identical rendered prompts share one content-addressed blob under `artifacts/prompts/`; the full prompt is not repeated in every JSONL row or receipt. API keys are never written. Candidate answers, critiques, scores, and final artifacts are trace data and are stored/exported by design, so do not use a shared run directory for sensitive tasks unless that is acceptable.
 
 ## Development
 
@@ -297,8 +309,8 @@ Release publishing is tag-triggered through npm Trusted Publishing. See [docs/re
 
 Known limits for this release:
 
-- Conservative v1 resume replays an interrupted phase wholesale, preserves its usage accounting, and only reuses validated completed phase boundaries.
-- MCP Sampling is stdio-host-only in v0.1. Standalone CLI and Streamable HTTP runs need a direct provider.
+- Trace-v1 resume replays an interrupted phase wholesale; per-item reuse requires a trace-v2 run created by DeepThonk v0.2.
+- HTTP Sampling is blocking-only. Use stdio or a direct provider for background `deepthonk.start` work.
 - `maxUsd` requires known model pricing; add explicit prices in YAML for custom providers and model IDs. Optional fields `longContextThresholdTokens`, `inputUsdPerMillionLong`, and `outputUsdPerMillionLong` enable tiered pricing for models with a long-context surcharge (e.g., Gemini at 200K input tokens). Cache hit/miss rates remain flat.
 
 ## Acknowledgments

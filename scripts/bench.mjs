@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import { resolve } from "node:path";
-import { fitBradleyTerry } from "../packages/core/dist/index.js";
+import { fitBradleyTerry, runLimitedPhase } from "../packages/core/dist/index.js";
 
 const ci = process.argv.includes("--ci");
 const cli = resolve("packages/cli/dist/index.js");
@@ -14,7 +14,8 @@ const result = {
   samples,
   cli_version_ms: benchmarkCli(["--version"]),
   cli_plan_ms: benchmarkCli(["plan", "--profile", "paper"]),
-  bradley_terry_sparse_ms: benchmarkBradleyTerry()
+  bradley_terry_sparse_ms: benchmarkBradleyTerry(),
+  scheduler_100k: await benchmarkScheduler()
 };
 
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -24,6 +25,9 @@ if (ci) {
   if (result.cli_version_ms.p95 > 250) failures.push(`CLI --version p95 ${result.cli_version_ms.p95}ms exceeds 250ms`);
   if (result.cli_plan_ms.p95 > 350) failures.push(`CLI plan p95 ${result.cli_plan_ms.p95}ms exceeds 350ms`);
   if (result.bradley_terry_sparse_ms.p95 > 500) failures.push(`Bradley-Terry p95 ${result.bradley_terry_sparse_ms.p95}ms exceeds 500ms`);
+  if (result.scheduler_100k.peak_heap_delta_mb > 64) failures.push(`Scheduler peak heap delta ${result.scheduler_100k.peak_heap_delta_mb}MiB exceeds 64MiB`);
+  if (result.scheduler_100k.max_active > result.scheduler_100k.concurrency) failures.push("Scheduler exceeded configured concurrency");
+  if (result.scheduler_100k.pulled !== result.scheduler_100k.jobs) failures.push("Scheduler did not pull every job exactly once");
   if (failures.length > 0) {
     process.stderr.write(`${failures.join("\n")}\n`);
     process.exitCode = 1;
@@ -74,6 +78,42 @@ function benchmarkBradleyTerry() {
     durations.push(performance.now() - started);
   }
   return { candidates: candidateCount, comparisons: comparisons.length, ...summarize(durations) };
+}
+
+async function benchmarkScheduler() {
+  const jobCount = 100_000;
+  const concurrency = 8;
+  let pulled = 0;
+  let active = 0;
+  let maxActive = 0;
+  globalThis.gc?.();
+  const baselineHeap = process.memoryUsage().heapUsed;
+  let peakHeap = baselineHeap;
+  function* jobs() {
+    for (let index = 0; index < jobCount; index += 1) {
+      pulled += 1;
+      yield async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (index % 1_000 === 0) peakHeap = Math.max(peakHeap, process.memoryUsage().heapUsed);
+        await Promise.resolve();
+        active -= 1;
+        return index;
+      };
+    }
+  }
+  const started = performance.now();
+  const values = await runLimitedPhase(jobs(), concurrency);
+  peakHeap = Math.max(peakHeap, process.memoryUsage().heapUsed);
+  return {
+    jobs: jobCount,
+    concurrency,
+    pulled,
+    results: values.length,
+    max_active: maxActive,
+    elapsed_ms: round(performance.now() - started),
+    peak_heap_delta_mb: round(Math.max(0, peakHeap - baselineHeap) / (1024 * 1024))
+  };
 }
 
 function summarize(values) {

@@ -56,6 +56,7 @@ import {
   profileShowOutputSchema,
   toolError,
   toolResult,
+  BackgroundJobManager,
   type McpSamplingContext
 } from "./tools.js";
 import { jobResourceMimeType, jobResourceName, listRunResources, readJobResource, readRunResource, runResourceMimeType } from "./resources.js";
@@ -65,7 +66,30 @@ const packageVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import
 
 const MAX_SAMPLING_RESPONSE_BYTES = 1_000_000;
 
-export function createDeepThonkMcpServer(options: { transport?: "stdio" | "http" } = {}): McpServer {
+const boundedRunResourceTemplates = [
+  ["prompt", "deepthonk://runs/{run_id}/prompts/{sha256}"],
+  ["prompt-page", "deepthonk://runs/{run_id}/prompts/{sha256}/page/{cursor}"],
+  ["trace-v2-index", "deepthonk://runs/{run_id}/trace-v2"],
+  ["trace-v2-index-page", "deepthonk://runs/{run_id}/trace-v2/page/{cursor}"],
+  ["trace-v2-manifest", "deepthonk://runs/{run_id}/trace-v2/manifests/{phase_id}"],
+  ["trace-v2-manifest-page", "deepthonk://runs/{run_id}/trace-v2/manifests/{phase_id}/page/{cursor}"],
+  ["trace-v2-commit", "deepthonk://runs/{run_id}/trace-v2/commits/{phase_id}"],
+  ["trace-v2-commit-page", "deepthonk://runs/{run_id}/trace-v2/commits/{phase_id}/page/{cursor}"],
+  ["trace-v2-checkpoint-index", "deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}"],
+  ["trace-v2-checkpoint-index-page", "deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}/page/{cursor}"],
+  ["trace-v2-checkpoint", "deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}/{checkpoint_id}"],
+  ["trace-v2-checkpoint-page", "deepthonk://runs/{run_id}/trace-v2/checkpoints/{phase_id}/{checkpoint_id}/page/{cursor}"]
+] as const;
+
+const boundedJobResourceTemplates = boundedRunResourceTemplates.map(([name, template]) => [
+  name,
+  template.replace("deepthonk://runs/{run_id}", "deepthonk://jobs/{job_id}")
+] as const);
+
+export function createDeepThonkMcpServer(options: {
+  transport?: "stdio" | "http";
+  backgroundJobManager?: BackgroundJobManager;
+} = {}): McpServer {
   const server = new McpServer({
     name: "deepthonk",
     version: packageVersion.version
@@ -79,7 +103,8 @@ export function createDeepThonkMcpServer(options: { transport?: "stdio" | "http"
       }
       return result;
     },
-    transport: options.transport ?? "stdio"
+    transport: options.transport ?? "stdio",
+    backgroundJobManager: options.backgroundJobManager
   };
 
   server.registerTool(
@@ -335,6 +360,23 @@ export function createDeepThonkMcpServer(options: { transport?: "stdio" | "http"
     async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: await readJobResource(uri.href) }] })
   );
 
+  for (const [name, template] of boundedRunResourceTemplates) {
+    server.registerResource(
+      `deepthonk-run-${name}`,
+      new ResourceTemplate(template, { list: undefined }),
+      { title: `DeepThonk run ${name}`, mimeType: "application/json" },
+      async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: await readRunResource(uri.href) }] })
+    );
+  }
+  for (const [name, template] of boundedJobResourceTemplates) {
+    server.registerResource(
+      `deepthonk-job-${name}`,
+      new ResourceTemplate(template, { list: undefined }),
+      { title: `DeepThonk job ${name}`, mimeType: "application/json" },
+      async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: await readJobResource(uri.href) }] })
+    );
+  }
+
   registerPrompt(server, "deepthonk/generate", { task: z.string().min(1), rubric: z.string().optional() });
   registerPrompt(server, "deepthonk/compare", {
     task: z.string().min(1),
@@ -412,12 +454,19 @@ async function safeTool<T extends ReturnType<typeof toolResult> | ReturnType<typ
   }
 }
 
-export async function serveMcp(options: { transport: "stdio" | "http"; port?: number }): Promise<void> {
+export async function serveMcp(options: {
+  transport: "stdio" | "http";
+  port?: number;
+  maxActiveJobs?: number;
+  maxQueuedJobs?: number;
+}): Promise<void> {
   if (options.transport === "http") {
-    await serveHttp(options.port ?? 3333);
+    await serveHttp(options.port ?? 3333, options.maxActiveJobs, options.maxQueuedJobs);
     return;
   }
-  const server = createDeepThonkMcpServer();
+  const server = createDeepThonkMcpServer({
+    backgroundJobManager: new BackgroundJobManager(options.maxActiveJobs ?? 2, options.maxQueuedJobs ?? 32)
+  });
   await server.connect(new StdioServerTransport());
 }
 
@@ -432,6 +481,8 @@ export interface McpHttpServerOptions {
   port: number;
   sessionIdleMs?: number;
   maxSessions?: number;
+  maxActiveJobs?: number;
+  maxQueuedJobs?: number;
   now?: () => number;
 }
 
@@ -440,6 +491,7 @@ export function createMcpHttpServer(options: McpHttpServerOptions): HttpServer {
   const sessionIdleMs = options.sessionIdleMs ?? 30 * 60_000;
   const maxSessions = options.maxSessions ?? 64;
   const now = options.now ?? Date.now;
+  const backgroundJobManager = new BackgroundJobManager(options.maxActiveJobs ?? 2, options.maxQueuedJobs ?? 32);
   let pendingSessions = 0;
   let evicting = false;
 
@@ -498,7 +550,7 @@ export function createMcpHttpServer(options: McpHttpServerOptions): HttpServer {
       }
       pendingSessions += 1;
       isNew = true;
-      const server = createDeepThonkMcpServer({ transport: "http" });
+      const server = createDeepThonkMcpServer({ transport: "http", backgroundJobManager });
       const created: HttpSession = {
         server,
         transport: undefined as unknown as StreamableHTTPServerTransport,
@@ -605,8 +657,8 @@ export function createMcpHttpServer(options: McpHttpServerOptions): HttpServer {
   return httpServer;
 }
 
-async function serveHttp(port: number): Promise<void> {
-  const httpServer = createMcpHttpServer({ port });
+async function serveHttp(port: number, maxActiveJobs?: number, maxQueuedJobs?: number): Promise<void> {
+  const httpServer = createMcpHttpServer({ port, maxActiveJobs, maxQueuedJobs });
   httpServer.listen(port, "127.0.0.1");
   await new Promise<void>((resolve, reject) => {
     httpServer.once("listening", resolve);

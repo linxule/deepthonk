@@ -25,4 +25,8 @@ For profiles where `n` is not divisible by four, DeepThonk avoids creating extra
 
 The optional `finalizerModel` post-processing step is a DeepThonk extension, not part of the paper's Algorithm 1. The paper returns the Bradley-Terry top of the final population directly as the answer. When `finalizerModel` is set, DeepThonk performs one additional model call to post-process the ranked winner; leave it unset to mirror the paper exactly.
 
+DeepThonk v0.2 can replace the profile's final `m` schedule with an explicit seeded `all-pairs` or `k-regular` rank block. This is an integration/runtime option, not a change to the paper's algorithm. All-pairs schedules above 100 computed judge calls require an explicit sufficient call cap so an accidental large candidate set does not fan out quadratically.
+
+Trace schema v2 records a deterministic work manifest and atomic output/usage receipt for every provider call. A phase commit binds those receipts to the materialized population, comparisons, scores, and usage. After a crash, valid receipts from the incomplete phase can be reused without asking the provider to repeat the call; trace-v1 runs still replay the whole incomplete phase.
+
 Note: the BT score normalization in `packages/core/src/bradleyTerry.ts` z-scores the output to match the reference Python implementation's logging convention. The paper specifies raw L2-regularized MLE; both transforms produce identical rankings, but absolute score magnitudes will match the reference repo, not the paper.

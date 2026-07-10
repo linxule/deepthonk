@@ -34,6 +34,10 @@ The generic driver sends chat completions requests to:
 It reads the API key from the configured environment variable and does not write that value into traces.
 Provider HTTP errors are sanitized by default; normal CLI/MCP errors do not include raw upstream response bodies. The driver retries retryable 429/5xx failures, respects `Retry-After` when present, and supports `requestTimeoutMs` from CLI flags or YAML `retry`.
 
+Calls to the same provider, normalized endpoint, and credential identity share one FIFO limiter in the process. Direct routes start at 8 concurrent logical calls. HTTP 429 halves the live ceiling (minimum 1), and every 32 successful logical calls restores one slot up to `provider_max_concurrency`. Waiting calls honor cancellation. Credential identity uses a salted, process-local HMAC of the resolved key, so the same credential shares a route even when supplied through different environment-variable names while key values never enter limiter keys or logs.
+
+The request timeout is one logical deadline covering limiter queue time, network/body reads, provider retries, and bounded `Retry-After` waits. A direct 429 releases its permit before sleeping and must reacquire under the reduced ceiling before retrying. Sampling applies the same deadline to its limiter wait and nested `sampling/createMessage` call.
+
 You can use any OpenAI-compatible provider by setting `provider`, `base_url`, `api_key_env`, and the role-specific model names:
 
 ```yaml
@@ -46,6 +50,7 @@ models:
   judge: strong-judge-model
 retry:
   requestTimeoutMs: 60000
+provider_max_concurrency: 12
 ```
 
 Unknown provider names are treated as OpenAI-compatible when a `base_url` is provided. This keeps traces labeled with the provider identity you chose instead of forcing every custom endpoint to appear as `openai-compatible`.

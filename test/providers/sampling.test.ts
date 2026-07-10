@@ -1,10 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getEventListeners } from "node:events";
 import { ConfigError, ProviderError } from "@deepthonk/core";
-import { SamplingDriver, buildModelPreferences, createDriver } from "@deepthonk/providers";
+import { SamplingDriver, buildModelPreferences, createDriver, resetSharedRouteLimiters } from "@deepthonk/providers";
 import type { CreateMessageRequestParamsBase, CreateMessageResult } from "@modelcontextprotocol/sdk/types.js";
 
 describe("SamplingDriver", () => {
+  afterEach(() => {
+    resetSharedRouteLimiters();
+    vi.restoreAllMocks();
+  });
   it("calls createMessage for generate, compare, mutate, and finalize with prompt messages and temperature", async () => {
     const createMessage = vi.fn(async () => textResult("answer"));
     const driver = new SamplingDriver(createMessage);
@@ -60,6 +64,19 @@ describe("SamplingDriver", () => {
     expect(buildModelPreferences(undefined, {})).toBeUndefined();
   });
 
+  it("honors per-call maxOutputTokens from the core driver contract", async () => {
+    const createMessage = vi.fn(async () => textResult("answer"));
+    const driver = new SamplingDriver(createMessage);
+    await driver.generate({
+      task: "task",
+      model: "m",
+      temperature: 0,
+      maxOutputTokens: 777,
+      prompt: { system: "", user: "u" }
+    });
+    expect(createMessage.mock.calls[0]?.[0].maxTokens).toBe(777);
+  });
+
   it("normalizes noisy comparison JSON before returning text", async () => {
     const createMessage = vi.fn(async () => textResult('prefix\n```json\n{"winner":"A","feedback_a":"ok","feedback_b":"no"}\n```\nsuffix'));
     const driver = new SamplingDriver(createMessage);
@@ -111,6 +128,52 @@ describe("SamplingDriver", () => {
       retryable: false
     });
     expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  it("includes route-limiter queue wait in the Sampling request deadline", async () => {
+    let unblockFirst!: () => void;
+    const firstBlocked = new Promise<CreateMessageResult>((resolve) => {
+      unblockFirst = () => resolve(textResult("first"));
+    });
+    const firstTransport = vi.fn(() => firstBlocked);
+    const waitingTransport = vi.fn(async () => textResult("second"));
+    const firstDriver = new SamplingDriver(firstTransport, { requestTimeoutMs: 500, providerMaxConcurrency: 1 });
+    const waitingDriver = new SamplingDriver(waitingTransport, { requestTimeoutMs: 30, providerMaxConcurrency: 1 });
+
+    const first = firstDriver.generate({ task: "t", model: "m", temperature: 0, prompt: { system: "", user: "first" } });
+    await vi.waitFor(() => expect(firstTransport).toHaveBeenCalledTimes(1));
+    await expect(
+      waitingDriver.generate({ task: "t", model: "m", temperature: 0, prompt: { system: "", user: "second" } })
+    ).rejects.toMatchObject({ code: "provider.sampling_timeout" });
+    expect(waitingTransport).not.toHaveBeenCalled();
+    unblockFirst();
+    await expect(first).resolves.toMatchObject({ text: "first" });
+  });
+
+  it("passes only the remaining logical deadline to createMessage after queueing", async () => {
+    let unblockFirst!: () => void;
+    const firstBlocked = new Promise<CreateMessageResult>((resolve) => {
+      unblockFirst = () => resolve(textResult("first"));
+    });
+    const firstDriver = new SamplingDriver(() => firstBlocked, { requestTimeoutMs: 500, providerMaxConcurrency: 1 });
+    let observedTimeout: number | undefined;
+    const secondDriver = new SamplingDriver(
+      async (_params, options) => {
+        observedTimeout = options?.timeout;
+        return textResult("second");
+      },
+      { requestTimeoutMs: 200, providerMaxConcurrency: 1 }
+    );
+
+    const first = firstDriver.generate({ task: "t", model: "m", temperature: 0, prompt: { system: "", user: "first" } });
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    const second = secondDriver.generate({ task: "t", model: "m", temperature: 0, prompt: { system: "", user: "second" } });
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    unblockFirst();
+    await expect(first).resolves.toMatchObject({ text: "first" });
+    await expect(second).resolves.toMatchObject({ text: "second" });
+    expect(observedTimeout).toBeGreaterThan(0);
+    expect(observedTimeout).toBeLessThan(190);
   });
 
   it("rejects oversized host responses before returning model text", async () => {

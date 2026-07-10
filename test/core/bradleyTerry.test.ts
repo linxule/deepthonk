@@ -44,4 +44,20 @@ describe("fitBradleyTerry", () => {
     expect(scores.map((score) => score.tieGroup)).toEqual([1, 1]);
     expect(scores.map((score) => score.tieBreakerRank)).toEqual([1, 2]);
   });
+
+  it("is exactly replayable across comparison completion orders and JSON round trips", () => {
+    const comparisons = [
+      comparison("A", "B", "A"),
+      comparison("B", "C", "A"),
+      comparison("C", "D", "A"),
+      comparison("D", "E", "A"),
+      comparison("E", "F", "A"),
+      comparison("F", "A", "A")
+    ];
+    const forward = fitBradleyTerry(["A", "B", "C", "D", "E", "F"], comparisons);
+    const completionOrder = fitBradleyTerry(["A", "B", "C", "D", "E", "F"], [...comparisons].reverse());
+
+    expect(completionOrder).toEqual(forward);
+    expect(JSON.parse(JSON.stringify(forward))).toEqual(forward);
+  });
 });

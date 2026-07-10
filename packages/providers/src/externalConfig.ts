@@ -1,4 +1,4 @@
-import { ConfigError, type BuiltInProfileName, type RunConfig } from "@deepthonk/core";
+import { ConfigError, maxPhaseConcurrency, type BuiltInProfileName, type RunConfig } from "@deepthonk/core";
 import { z } from "zod";
 import type { ProviderRole } from "./types.js";
 
@@ -18,6 +18,10 @@ export interface ExternalConfigFile {
   prompt_style?: RunConfig["promptStyle"];
   algorithm?: ExternalAlgorithmOverrides;
   prompts?: ExternalPromptOverrides;
+  modelOutputTokens?: RunConfig["modelOutputTokens"];
+  critiqueLimits?: RunConfig["critiqueLimits"];
+  rank?: RunConfig["rank"];
+  providerMaxConcurrency?: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -108,6 +112,20 @@ const externalConfigSchema = z
       prices: z.array(priceSchema).optional()
     }).strict().optional(),
     output: z.object({ includeRawModelOutputs: z.boolean().optional(), includePrompts: z.boolean().optional() }).strict().optional(),
+    modelOutputTokens: z.object({
+      generation: z.number().int().min(1).optional(),
+      mutation: z.number().int().min(1).optional(),
+      judge: z.number().int().min(1).optional(),
+      finalizer: z.number().int().min(1).optional()
+    }).strict().optional(),
+    critiqueLimits: z.object({ aggregateChars: z.number().int().min(256).optional() }).strict().optional(),
+    rank: z.object({
+      mode: z.enum(["all-pairs", "k-regular"]),
+      k: z.number().int().min(1).optional(),
+      seed: z.number().int().optional(),
+      maxCalls: z.number().int().min(1).optional()
+    }).strict().optional(),
+    providerMaxConcurrency: z.number().int().min(1).max(maxPhaseConcurrency).optional(),
     prompt_style: z.enum(["general", "paper-programming"]).optional(),
     algorithm: z.object({
       n: z.number().int().min(2).optional(),
@@ -132,7 +150,8 @@ export function normalizeExternalConfig(value: unknown, source = "config"): Exte
     [
       "profile", "run_id", "runId", "provider", "base_url", "baseUrl", "api_key_env", "apiKeyEnv",
       "supports_json_mode", "supportsJsonMode", "models", "providers", "concurrency", "retry", "budget",
-      "output", "prompt_style", "promptStyle", "algorithm", "prompts", "metadata"
+      "output", "prompt_style", "promptStyle", "algorithm", "prompts", "model_output_tokens", "modelOutputTokens",
+      "critique_limits", "critiqueLimits", "rank", "provider_max_concurrency", "providerMaxConcurrency", "metadata"
     ],
     source
   );
@@ -152,6 +171,16 @@ export function normalizeExternalConfig(value: unknown, source = "config"): Exte
     prompt_style: aliased(root, "prompt_style", "promptStyle", source) as ExternalConfigFile["prompt_style"],
     algorithm: normalizeAlgorithm(root.algorithm, `${source}.algorithm`),
     prompts: normalizePrompts(root.prompts, `${source}.prompts`),
+    modelOutputTokens: normalizeModelOutputTokens(
+      aliased(root, "model_output_tokens", "modelOutputTokens", source),
+      `${source}.model_output_tokens`
+    ),
+    critiqueLimits: normalizeCritiqueLimits(
+      aliased(root, "critique_limits", "critiqueLimits", source),
+      `${source}.critique_limits`
+    ),
+    rank: normalizeRank(root.rank, `${source}.rank`),
+    providerMaxConcurrency: aliased(root, "provider_max_concurrency", "providerMaxConcurrency", source) as number | undefined,
     metadata: root.metadata === undefined ? undefined : configRecord(root.metadata, `${source}.metadata`)
   };
   const compact = compactConfig(normalized);
@@ -288,6 +317,39 @@ function normalizePrompts(value: unknown, path: string): ExternalConfigFile["pro
     prompts[phase] = compactConfig({ system: prompt.system as string | undefined, user: prompt.user as string | undefined });
   }
   return prompts;
+}
+
+function normalizeModelOutputTokens(value: unknown, path: string): ExternalConfigFile["modelOutputTokens"] {
+  if (value === undefined) return undefined;
+  const record = configRecord(value, path);
+  assertKnownKeys(record, ["generation", "mutation", "judge", "finalizer"], path);
+  return compactConfig({
+    generation: record.generation as number | undefined,
+    mutation: record.mutation as number | undefined,
+    judge: record.judge as number | undefined,
+    finalizer: record.finalizer as number | undefined
+  });
+}
+
+function normalizeCritiqueLimits(value: unknown, path: string): ExternalConfigFile["critiqueLimits"] {
+  if (value === undefined) return undefined;
+  const record = configRecord(value, path);
+  assertKnownKeys(record, ["aggregate_chars", "aggregateChars"], path);
+  return compactConfig({
+    aggregateChars: aliased(record, "aggregate_chars", "aggregateChars", path) as number | undefined
+  });
+}
+
+function normalizeRank(value: unknown, path: string): ExternalConfigFile["rank"] {
+  if (value === undefined) return undefined;
+  const record = configRecord(value, path);
+  assertKnownKeys(record, ["mode", "k", "seed", "max_calls", "maxCalls"], path);
+  return compactConfig({
+    mode: record.mode as "all-pairs" | "k-regular",
+    k: record.k as number | undefined,
+    seed: record.seed as number | undefined,
+    maxCalls: aliased(record, "max_calls", "maxCalls", path) as number | undefined
+  });
 }
 
 function configRecord(value: unknown, path: string): Record<string, unknown> {

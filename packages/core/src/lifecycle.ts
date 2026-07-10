@@ -334,6 +334,7 @@ export type CallRole = "generator" | "judge" | "mutator" | "finalizer";
 
 export interface UsageRecord {
   schema_version: 1;
+  usage_id?: string;
   ts: string;
   phase: string;
   role: CallRole;

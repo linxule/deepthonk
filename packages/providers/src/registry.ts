@@ -134,6 +134,7 @@ function roleProviderToConfig(config: RoleProviderConfig): ProviderConfig {
       judge: config.model,
       finalizer: config.model
     },
+    providerMaxConcurrency: config.providerMaxConcurrency,
     retry: config.retry,
     supportsJsonMode: config.supportsJsonMode
   };
