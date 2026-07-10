@@ -2,6 +2,29 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
+## [Unreleased]
+
+### Changed — BREAKING
+
+- **Zod 3 → 4** across all four published packages. `packages/core` re-exports its schemas (`runConfigSchema`, `profileSchema`, `candidateSchema`, …), so the published type surface and the runtime `ZodError` class both change. Consumers composing these schemas with their own Zod 3 must upgrade in step. This must ship as `0.3.0`, not a patch.
+- Validation error text now follows Zod 4's wording (e.g. `Too big: expected number to be <=1024` rather than `Number must be less than or equal to 1024`). This reaches MCP tool error strings through `formatZodIssues`. The `{ code, message, retryable, fix }` error shape is unchanged.
+- `deepthonk` (CLI) now declares `"engines": { "node": ">=22.13" }`. Commander 15 requires Node ≥ 22.12; previously nothing stopped installation on an unsupported Node.
+
+### Fixed
+
+- External provider config (`providers:` in `config.yaml`) kept accepting partial role maps. Zod 4 makes enum-keyed `z.record` **exhaustive**, which would have silently required all four of `generator`/`mutator`/`judge`/`finalizer` in every config. Switched to `z.partialRecord`, preserving Zod 3 behavior. This type-checked cleanly and was caught only by tests.
+
+### Removed
+
+- `p-limit` from `@deepthonk/core`'s runtime dependencies. It had zero imports; `phaseRunner.ts` implements its own worker pool. Consumers stop installing it transitively.
+- `zod-to-json-schema` (dev). Replaced by Zod 4's built-in `z.toJSONSchema`; the package does not support v4 schemas.
+
+### Internal
+
+- TypeScript 5.8 → 7.0.2. Declaration output across all 61 `.d.ts` files is semantically identical; three files differ only in object-property and union-member ordering.
+- Vitest 3 → 4, tsx 4.19 → 4.23. `@types/node` deliberately held at `^22` to track the supported runtime floor.
+- Dependabot no longer groups npm majors into a single PR.
+
 ## [0.2.1] — 2026-07-10
 
 Packaging release. There are **no runtime or algorithm changes** to any package; the version bump exists because npm versions are immutable and the MCP Registry requires an `mcpName` field inside the published manifest, which could not be added to `0.2.0` after the fact.

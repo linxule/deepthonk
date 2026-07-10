@@ -193,7 +193,7 @@ export const lockReclaimOutputSchema = z.object({
 const repairBudgetPath = /^budget\.(?:maxCalls|maxInputTokens|maxOutputTokens)$|^budget\.prices\.\d+\.longContextThresholdTokens$/;
 export const repairBudgetArgsSchema = z.object({
   run_dir: z.string().min(1),
-  replacements: z.record(z.number().int().positive()).refine(
+  replacements: z.record(z.string(), z.number().int().positive()).refine(
     (value) => Object.keys(value).length > 0 && Object.keys(value).every((path) => repairBudgetPath.test(path)),
     "Replacement keys must be exact legacy-redacted budget paths."
   )
@@ -272,7 +272,7 @@ export const startOutputSchema = z.object({
   state: z.string(),
   status_resource: z.string(),
   result_resource: z.string(),
-  artifact_resources: z.record(z.string())
+  artifact_resources: z.record(z.string(), z.string())
 });
 
 export const statusOutputSchema = z.object({
@@ -1208,9 +1208,9 @@ export const profileSaveArgsSchema = z.object({
     judge: z.string().optional(),
     finalizer: z.string().optional()
   }).optional(),
-  providers: z.record(z.unknown()).optional(),
-  algorithm: z.record(z.unknown()).optional(),
-  prompts: z.record(z.object({ system: z.string().optional(), user: z.string().optional() })).optional(),
+  providers: z.record(z.string(), z.unknown()).optional(),
+  algorithm: z.record(z.string(), z.unknown()).optional(),
+  prompts: z.record(z.string(), z.object({ system: z.string().optional(), user: z.string().optional() })).optional(),
   budget: z.unknown().optional(),
   concurrency: z.unknown().optional(),
   retry: z.unknown().optional(),

@@ -77,7 +77,7 @@ const priceSchema = z
       price.outputUsdPerMillionLong === undefined
     ) {
       context.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         message: "Long-context pricing requires threshold and complete flat/long input/output rates."
       });
     }
@@ -92,7 +92,10 @@ const externalConfigSchema = z
     api_key_env: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional(),
     supports_json_mode: z.boolean().optional(),
     models: z.object({ generator: nonEmptyString.optional(), mutator: nonEmptyString.optional(), judge: nonEmptyString.optional(), finalizer: nonEmptyString.optional() }).strict().optional(),
-    providers: z.record(
+    // partialRecord, not record: zod 4 made enum-keyed records EXHAUSTIVE (every
+    // role required), while zod 3 treated them as partial. Plain z.record here
+    // type-checks but silently rejects every config that omits a role.
+    providers: z.partialRecord(
       z.enum(["generator", "mutator", "judge", "finalizer"]),
       z.object({
         provider: nonEmptyString.optional(),
@@ -138,7 +141,7 @@ const externalConfigSchema = z
       judge_temperature: z.number().min(0).optional()
     }).strict().optional(),
     prompts: z.object({ generate: promptBlockSchema.optional(), compare: promptBlockSchema.optional(), mutate: promptBlockSchema.optional(), finalize: promptBlockSchema.optional() }).strict().optional(),
-    metadata: z.record(z.unknown()).optional()
+    metadata: z.record(z.string(), z.unknown()).optional()
   })
   .strict();
 

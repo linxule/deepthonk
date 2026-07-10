@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { z } from "zod";
 import { describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -983,8 +983,8 @@ describe("MCP helpers", () => {
   });
 });
 
-function promptPhaseDescription(schema: Parameters<typeof zodToJsonSchema>[0], phase: string): unknown {
-  const jsonSchema = zodToJsonSchema(schema, { $refStrategy: "none" }) as JsonObject;
+function promptPhaseDescription(schema: Parameters<typeof z.toJSONSchema>[0], phase: string): unknown {
+  const jsonSchema = z.toJSONSchema(schema) as JsonObject;
   const prompts = jsonSchema.properties?.prompts as JsonObject | undefined;
   const promptProperties = prompts?.properties as Record<string, JsonObject> | undefined;
   return promptProperties?.[phase]?.description;
