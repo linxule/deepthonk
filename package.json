@@ -28,10 +28,10 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@types/node": "^22.15.21",
-    "tsx": "^4.19.4",
-    "typescript": "^5.8.3",
-    "vitest": "^3.1.4",
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10",
     "zod-to-json-schema": "^3.25.2"
   }
 }
