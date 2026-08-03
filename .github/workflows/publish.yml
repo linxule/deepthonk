@@ -43,11 +43,11 @@ jobs:
       # pnpm version is read from package.json "packageManager" (pnpm@11.8.0).
       # pnpm 11+ is required for native OIDC trusted publishing. Do NOT also set
       # a `version:` here — action-setup errors on a mismatch with packageManager.
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@v6.0.9
         with:
           run_install: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
