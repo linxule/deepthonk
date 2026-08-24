@@ -27,11 +27,11 @@
     "smoke:dist": "pnpm run build && node packages/cli/dist/index.js plan --profile paper"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@types/node": "^22.20.1",
-    "tsx": "^4.23.0",
+    "tsx": "^4.23.12",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10",
+    "vitest": "^4.1.11",
     "zod": "^4.4.3"
   }
 }
