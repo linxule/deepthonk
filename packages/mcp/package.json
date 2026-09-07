@@ -39,8 +39,8 @@
   "dependencies": {
     "@deepthonk/core": "workspace:*",
     "@deepthonk/providers": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "yaml": "^2.7.1",
-    "zod": "^4.4.3"
+    "zod": "^4.5.4"
   }
 }
