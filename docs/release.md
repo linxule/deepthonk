@@ -125,7 +125,7 @@ Reference: https://docs.npmjs.com/trusted-publishers/
 
 ## Failure Handling
 
-- If the workflow fails before publish, fix the issue, commit, delete the failed local tag if needed, recreate it on the fixed commit, and push the tag again.
+- If the workflow fails before publish, fix the issue and commit. Keep any already-pushed tag immutable; prepare a new unused version and tag for the corrected release.
 - If one package publishes and a later package fails, do not reuse the same version for the already-published package. Fix forward with a new version for all four packages.
 - If npm returns an auth-like `404`, verify the Trusted Publisher settings exactly match owner `linxule`, repo `deepthonk`, and workflow file `publish.yml` for the package that failed.
 - Do not manually publish with `npm publish` from this workspace. This repo relies on `pnpm publish` so `workspace:*` dependencies are rewritten correctly.

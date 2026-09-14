@@ -2,6 +2,14 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
+## [0.3.1] — 2026-09-14
+
+### Changed
+
+- Refresh the stable MCP SDK to 1.30 and align Zod 4.6.4 across the published workspace. The CLI, MCP tools, and reasoning engine keep their existing behavior and contracts.
+- Update transitive dependencies to resolve known security advisories, including the SDK's Hono dependency. CI now audits the full dependency tree.
+- Update development tooling and GitHub Actions within the supported Node 22/24 toolchain.
+
 ## [0.3.0] — 2026-07-10
 
 ### Changed — BREAKING
