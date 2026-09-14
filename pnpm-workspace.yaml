@@ -3,4 +3,5 @@ packages:
 allowBuilds:
   esbuild: true
 overrides:
-  hono: 4.12.28
+  hono: 4.13.7
+  vite: 7.3.6
