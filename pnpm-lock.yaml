@@ -49,14 +49,14 @@ importers:
         specifier: ^2.7.1
         version: 2.9.0
       zod:
-        specifier: ^4.5.4
-        version: 4.5.4
+        specifier: ^4.6.4
+        version: 4.6.4
 
   packages/core:
     dependencies:
       zod:
-        specifier: ^4.5.4
-        version: 4.5.4
+        specifier: ^4.6.4
+        version: 4.6.4
 
   packages/mcp:
     dependencies:
@@ -68,13 +68,13 @@ importers:
         version: link:../providers
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
-        version: 1.30.0(zod@4.5.4)
+        version: 1.30.0(zod@4.6.4)
       yaml:
         specifier: ^2.7.1
         version: 2.9.0
       zod:
-        specifier: ^4.5.4
-        version: 4.5.4
+        specifier: ^4.6.4
+        version: 4.6.4
 
   packages/providers:
     dependencies:
@@ -83,13 +83,13 @@ importers:
         version: link:../core
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
-        version: 1.30.0(zod@4.5.4)
+        version: 1.30.0(zod@4.6.4)
       yaml:
         specifier: ^2.7.1
         version: 2.9.0
       zod:
-        specifier: ^4.5.4
-        version: 4.5.4
+        specifier: ^4.6.4
+        version: 4.6.4
 
 packages:
 
@@ -1135,9 +1135,6 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
-  zod@4.5.4:
-    resolution: {integrity: sha512-sC95tT5iHHH9gtpj6A81kh+NEaRAUFN+qlUPDUbRfOMvNf5QCBqsb3WgvnpVtK5Y+4UfA6KqufotuTvMGiTlsA==}
-
   zod@4.6.4:
     resolution: {integrity: sha512-AXSD6hvGdvRjajG/l1cC+d6IrhH+sjmPKtYeQdJIK8MFJl3LyClzS+o/YsVC+zQZPupAaeH5skwwm8YqYH7BqA==}
 
@@ -1226,28 +1223,6 @@ snapshots:
       hono: 4.13.7
 
   '@jridgewell/sourcemap-codec@1.6.0': {}
-
-  '@modelcontextprotocol/sdk@1.30.0(zod@4.5.4)':
-    dependencies:
-      '@hono/node-server': 2.1.1(hono@4.13.7)
-      ajv: 8.20.0
-      ajv-formats: 3.0.1(ajv@8.20.0)
-      content-type: 1.0.5
-      cors: 2.8.6
-      cross-spawn: 7.0.6
-      eventsource: 3.0.7
-      eventsource-parser: 3.1.1
-      express: 5.2.1
-      express-rate-limit: 8.7.0(express@5.2.1)
-      hono: 4.13.7
-      jose: 6.2.12
-      json-schema-typed: 8.0.2
-      pkce-challenge: 5.0.1
-      raw-body: 3.0.2
-      zod: 4.5.4
-      zod-to-json-schema: 3.25.2(zod@4.5.4)
-    transitivePeerDependencies:
-      - supports-color
 
   '@modelcontextprotocol/sdk@1.30.0(zod@4.6.4)':
     dependencies:
@@ -2034,14 +2009,8 @@ snapshots:
 
   yaml@2.9.0: {}
 
-  zod-to-json-schema@3.25.2(zod@4.5.4):
-    dependencies:
-      zod: 4.5.4
-
   zod-to-json-schema@3.25.2(zod@4.6.4):
     dependencies:
       zod: 4.6.4
-
-  zod@4.5.4: {}
 
   zod@4.6.4: {}

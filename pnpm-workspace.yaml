@@ -3,5 +3,6 @@ packages:
 allowBuilds:
   esbuild: true
 overrides:
+  # Security floors for the SDK and Vitest dependency trees.
   hono: 4.13.7
   vite: 7.3.6
