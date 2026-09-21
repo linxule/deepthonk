@@ -56,7 +56,7 @@
     "@deepthonk/mcp": "workspace:*",
     "@deepthonk/providers": "workspace:*",
     "commander": "^15.0.0",
-    "yaml": "^2.7.1",
-    "zod": "^4.6.4"
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5"
   }
 }
