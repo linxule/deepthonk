@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { ClientCapabilities } from "@modelcontextprotocol/sdk/types.js";
+import type { ClientCapabilities } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import YAML from "yaml";
 import {

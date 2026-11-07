@@ -1,12 +1,13 @@
 # MCP
 
-DeepThonk uses the stable official TypeScript SDK package:
+DeepThonk uses the official MCP TypeScript SDK v2 packages:
 
 ```txt
-@modelcontextprotocol/sdk
+@modelcontextprotocol/server   # McpServer, stdio transport, protocol types
+@modelcontextprotocol/node     # Streamable HTTP transport for node:http
 ```
 
-The newer split `@modelcontextprotocol/server` package was alpha at implementation time, so this project uses the stable v1 SDK.
+Tests drive the server with `@modelcontextprotocol/client`. The server connects its transports with `server.connect(...)`, so it negotiates the 2025-era protocol revisions (up to 2025-11-25).
 
 ## Tools
 

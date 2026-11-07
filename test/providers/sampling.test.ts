@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { getEventListeners } from "node:events";
 import { ConfigError, ProviderError } from "@deepthonk/core";
 import { SamplingDriver, buildModelPreferences, createDriver, resetSharedRouteLimiters } from "@deepthonk/providers";
-import type { CreateMessageRequestParamsBase, CreateMessageResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CreateMessageRequestParamsBase, CreateMessageResult } from "@modelcontextprotocol/server";
 
 describe("SamplingDriver", () => {
   afterEach(() => {
