@@ -2,6 +2,18 @@
 
 All notable changes to DeepThonk are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses semantic versioning.
 
+## [0.4.0] — 2026-11-07
+
+### Changed — BREAKING
+
+- **MCP TypeScript SDK v1 → v2.** `@deepthonk/mcp` now depends on `@modelcontextprotocol/server` and `@modelcontextprotocol/node`, and `@deepthonk/providers` on `@modelcontextprotocol/server`, replacing the v1 `@modelcontextprotocol/sdk`. SDK types appear in the published surface (`createDeepThonkMcpServer()` returns a v2 `McpServer`; `SamplingTransport` uses v2 sampling and request-option types), so consumers that pass SDK objects across that boundary must move to the v2 packages in step.
+- Wire-visible changes that come from the SDK itself: tool `inputSchema`/`outputSchema` now declare JSON Schema 2020-12 instead of draft-07; the experimental `execution.taskSupport` field is gone from `tools/list`; calling an unknown tool returns a JSON-RPC `-32602` error rather than an `isError` result; relayed error text no longer starts with `MCP error <code>:`; and the `deepthonk/mutate` prompt now correctly advertises `critique` (which has a default) as optional. Apart from the `$schema` line, every tool schema is unchanged.
+- The server still negotiates the 2025-era protocol revisions (up to 2025-11-25). The Streamable HTTP transport keeps DNS rebinding protection and the exact Host/Origin/Sec-Fetch-Site checks.
+
+### Security
+
+- Dropping the v1 SDK removes Express and its transitive advisories (`proxy-addr`, `body-parser`, `qs`, `ip-address`, `fast-uri`) from the tree. Hono, Vite, Vitest, `source-map-js` and Zod (4.6.7, same `^4.6.4` range) move to patched versions; `pnpm audit` reports no known vulnerabilities.
+
 ## [0.3.1] — 2026-09-14
 
 ### Changed
