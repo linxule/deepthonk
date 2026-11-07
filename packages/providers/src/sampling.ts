@@ -8,8 +8,7 @@ import {
   type MutateInput,
   type PromptMessages
 } from "@deepthonk/core";
-import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { CreateMessageRequestParamsBase, CreateMessageResult, ModelPreferences } from "@modelcontextprotocol/sdk/types.js";
+import type { RequestOptions, CreateMessageRequestParamsBase, CreateMessageResult, ModelPreferences } from "@modelcontextprotocol/server";
 import { extractJsonObjectText } from "./jsonExtract.js";
 import { getSharedRouteLimiter, type AdaptiveRouteLimiter } from "./routeLimiter.js";
 import type { ProviderConfig } from "./types.js";

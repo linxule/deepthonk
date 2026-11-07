@@ -3,9 +3,9 @@ import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import {
   deepthonkExport,
@@ -112,7 +112,7 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Plan DeepThonk Budget",
       description: "Estimate model calls for a DeepThonk profile.",
-      inputSchema: planArgsSchema.shape,
+      inputSchema: z.object(planArgsSchema.shape),
       outputSchema: z.object({}).passthrough().describe("Budget plan with total calls and sequential rounds.")
     },
     async (args) => safeTool(async () => toolResult(args.config_path || args.profile_name ? await deepthonkPlanAsync(args) : deepthonkPlan(args)))
@@ -123,8 +123,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Start DeepThonk Job",
       description: "Start DeepThonk in the background and persist status in the run directory.",
-      inputSchema: runArgsSchema.shape,
-      outputSchema: startOutputSchema.shape
+      inputSchema: z.object(runArgsSchema.shape),
+      outputSchema: z.object(startOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkStart(args, samplingContext)), args.run_dir)
   );
@@ -134,8 +134,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "DeepThonk Job Status",
       description: "Read persisted job/run status from a run directory.",
-      inputSchema: jobArgsSchema.shape,
-      outputSchema: statusOutputSchema.shape
+      inputSchema: z.object(jobArgsSchema.shape),
+      outputSchema: z.object(statusOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkStatus(args)), args.run_dir)
   );
@@ -145,8 +145,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "DeepThonk Job Result",
       description: "Return final summary/resource URIs when a background job is complete.",
-      inputSchema: jobArgsSchema.shape,
-      outputSchema: resultOutputSchema.shape
+      inputSchema: z.object(jobArgsSchema.shape),
+      outputSchema: z.object(resultOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkResult(args)), args.run_dir)
   );
@@ -156,8 +156,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Cancel DeepThonk Job",
       description: "Request cancellation for a running job by writing cancel.json in the run directory.",
-      inputSchema: jobArgsSchema.shape,
-      outputSchema: cancelOutputSchema.shape
+      inputSchema: z.object(jobArgsSchema.shape),
+      outputSchema: z.object(cancelOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkCancel(args)), args.run_dir)
   );
@@ -167,8 +167,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Inspect DeepThonk Run Lock",
       description: "Inspect run.lock and return its exact fingerprint without mutating it.",
-      inputSchema: lockInspectArgsSchema.shape,
-      outputSchema: lockInspectOutputSchema.shape
+      inputSchema: z.object(lockInspectArgsSchema.shape),
+      outputSchema: z.object(lockInspectOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkLockInspect(args)), args.run_dir)
   );
@@ -178,8 +178,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Reclaim DeepThonk Run Lock",
       description: "Reclaim run.lock only when its current bytes match the inspected fingerprint exactly.",
-      inputSchema: lockReclaimArgsSchema.shape,
-      outputSchema: lockReclaimOutputSchema.shape
+      inputSchema: z.object(lockReclaimArgsSchema.shape),
+      outputSchema: z.object(lockReclaimOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkLockReclaim(args)), args.run_dir)
   );
@@ -189,8 +189,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Repair Legacy Budget Config",
       description: "Replace only legacy [redacted] numeric budget fields with explicit original values.",
-      inputSchema: repairBudgetArgsSchema.shape,
-      outputSchema: repairBudgetOutputSchema.shape
+      inputSchema: z.object(repairBudgetArgsSchema.shape),
+      outputSchema: z.object(repairBudgetOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkRepairBudget(args)), args.run_dir)
   );
@@ -200,8 +200,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Run DeepThonk",
       description: "Run DeepThonk through the shared core engine.",
-      inputSchema: runArgsSchema.shape,
-      outputSchema: runOutputSchema.shape
+      inputSchema: z.object(runArgsSchema.shape),
+      outputSchema: z.object(runOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkRun(args, samplingContext)), args.run_dir)
   );
@@ -211,8 +211,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Rank Candidates",
       description: "Rank supplied candidates with pairwise judging and Bradley-Terry aggregation.",
-      inputSchema: rankArgsSchema.shape,
-      outputSchema: rankOutputSchema.shape
+      inputSchema: z.object(rankArgsSchema.shape),
+      outputSchema: z.object(rankOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkRank(args, samplingContext)))
   );
@@ -222,8 +222,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Mutate Candidate",
       description: "Mutate one supplied candidate with critique.",
-      inputSchema: mutateArgsSchema.shape,
-      outputSchema: mutateOutputSchema.shape
+      inputSchema: z.object(mutateArgsSchema.shape),
+      outputSchema: z.object(mutateOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkMutate(args, samplingContext)))
   );
@@ -233,8 +233,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Resume Run",
       description: "Detect resume state (default) or replay an interrupted run with continue: true.",
-      inputSchema: resumeArgsSchema.shape,
-      outputSchema: resumeOutputSchema.shape
+      inputSchema: z.object(resumeArgsSchema.shape),
+      outputSchema: z.object(resumeOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkResume(args, samplingContext)), args.run_dir)
   );
@@ -244,7 +244,7 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Export Run",
       description: "Export a run summary or trace.",
-      inputSchema: exportArgsSchema.shape,
+      inputSchema: z.object(exportArgsSchema.shape),
       outputSchema: z.object({}).passthrough().describe("Exported run data in the requested format.")
     },
     async (args) => safeTool(async () => toolResult(await deepthonkExport(args)), args.run_dir)
@@ -401,8 +401,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "List DeepThonk Profiles",
       description: "List saved named profiles.",
-      inputSchema: profileListArgsSchema.shape,
-      outputSchema: profileListOutputSchema.shape
+      inputSchema: z.object(profileListArgsSchema.shape),
+      outputSchema: z.object(profileListOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkProfileList(args)))
   );
@@ -412,8 +412,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Show DeepThonk Profile",
       description: "Show a saved named profile; manually edited secret-shaped values are rejected on load.",
-      inputSchema: profileNameArgsSchema.shape,
-      outputSchema: profileShowOutputSchema.shape
+      inputSchema: z.object(profileNameArgsSchema.shape),
+      outputSchema: z.object(profileShowOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkProfileShow(args)))
   );
@@ -423,8 +423,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Save DeepThonk Profile",
       description: "Save a reusable named profile bundle.",
-      inputSchema: profileSaveArgsSchema.shape,
-      outputSchema: profileSaveOutputSchema.shape
+      inputSchema: z.object(profileSaveArgsSchema.shape),
+      outputSchema: z.object(profileSaveOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkProfileSave(args)))
   );
@@ -434,8 +434,8 @@ export function createDeepThonkMcpServer(options: {
     {
       title: "Delete DeepThonk Profile",
       description: "Delete a saved named profile.",
-      inputSchema: profileNameArgsSchema.shape,
-      outputSchema: profileDeleteOutputSchema.shape
+      inputSchema: z.object(profileNameArgsSchema.shape),
+      outputSchema: z.object(profileDeleteOutputSchema.shape)
     },
     async (args) => safeTool(async () => toolResult(await deepthonkProfileDelete(args)))
   );
@@ -472,7 +472,7 @@ export async function serveMcp(options: {
 
 interface HttpSession {
   server: McpServer;
-  transport: StreamableHTTPServerTransport;
+  transport: NodeStreamableHTTPServerTransport;
   lastActive: number;
   inFlight: number;
 }
@@ -553,11 +553,11 @@ export function createMcpHttpServer(options: McpHttpServerOptions): HttpServer {
       const server = createDeepThonkMcpServer({ transport: "http", backgroundJobManager });
       const created: HttpSession = {
         server,
-        transport: undefined as unknown as StreamableHTTPServerTransport,
+        transport: undefined as unknown as NodeStreamableHTTPServerTransport,
         lastActive: now(),
         inFlight: 0
       };
-      const transport = new StreamableHTTPServerTransport({
+      const transport = new NodeStreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (initializedId) => {
           created.lastActive = now();
@@ -722,7 +722,7 @@ function registerPrompt(server: McpServer, name: string, argsSchema: z.ZodRawSha
     {
       title: name,
       description: "DeepThonk prompt template.",
-      argsSchema
+      argsSchema: z.object(argsSchema)
     },
     (args) => ({
       messages: [

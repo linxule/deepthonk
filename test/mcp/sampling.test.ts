@@ -3,9 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createMcpHttpServer, deepthonkMutate, deepthonkRank, deepthonkResume, deepthonkRun, deepthonkStart, type McpSamplingContext } from "@deepthonk/mcp";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { CreateMessageRequestSchema, type CreateMessageRequestParamsBase, type CreateMessageResult } from "@modelcontextprotocol/sdk/types.js";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import type { CreateMessageRequestParamsBase, CreateMessageResult } from "@modelcontextprotocol/client";
 
 describe("MCP Sampling provider", () => {
   it("runs deepthonk.run when the MCP client advertises sampling", async () => {
@@ -171,7 +170,7 @@ describe("MCP Sampling provider", () => {
       { name: "deepthonk-http-sampling-test", version: "1.0.0" },
       { capabilities: { sampling: {} } }
     );
-    client.setRequestHandler(CreateMessageRequestSchema, async (request) => textResult(responseFor(request.params)));
+    client.setRequestHandler("sampling/createMessage", async (request) => textResult(responseFor(request.params)));
     try {
       await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`)));
       const result = await client.callTool({
