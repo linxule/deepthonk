@@ -41,7 +41,7 @@
     "@deepthonk/providers": "workspace:*",
     "@modelcontextprotocol/node": "^2.1.2",
     "@modelcontextprotocol/server": "^2.4.0",
-    "yaml": "^2.7.1",
+    "yaml": "^2.9.1",
     "zod": "^4.6.4"
   }
 }
